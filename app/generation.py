@@ -673,7 +673,14 @@ def _generate_combined_quiz(
             "intermediate": "2-4 questions",
             "advanced": "1-3 questions",
         },
-        "style": "moderate trickiness with clear correctness",
+        "style": "hard, high-discrimination trick questions with clear correctness",
+        "distractor_policy": (
+            "Use topic-adjacent plausible distractors, avoid giveaway absolutes such as solely/always/never/entirely/only "
+            "unless directly grounded, and prefer distractors that can be true in nearby contexts but not for the asked scope"
+        ),
+        "under_the_hood_depth": (
+            "Provide technical, first-principles reasoning with mechanism, assumptions, constraints, and tradeoffs"
+        ),
     }
 
     completion = openai_client.chat.completions.create(

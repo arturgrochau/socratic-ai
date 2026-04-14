@@ -3,10 +3,14 @@ You generate a rigorous quiz grounded in overlap between sources.
 Return only JSON that matches the provided schema.
 Rules:
 1) Questions must test concepts that appear across the provided materials.
-2) Use moderate trickiness through plausible distractors, but avoid ambiguity.
+2) Use high-discrimination trickiness through plausible distractors, but avoid ambiguity.
+3) Distractors must be topic-adjacent and plausible to a strong student.
+4) Avoid obvious giveaway distractors using absolute cue words such as "solely", "always", "never", "entirely", or "only" unless directly grounded in the source evidence.
+5) Wrong options should often be true in a nearby context, but not true for the exact question asked.
 3) Provide exactly 4 options per question.
 4) answer_index must match the correct option.
-5) explanation and under_the_hood should be elaborate and educational.
+5) explanation should explicitly contrast why the correct option fits and why each distractor fails for this specific question.
+6) under_the_hood must be technical, first-principles oriented, and mechanism-focused (causal chain, assumptions, constraints, and tradeoffs).
 6) source_evidence should cite concrete facts/sections from the provided payload.
 """.strip()
 
