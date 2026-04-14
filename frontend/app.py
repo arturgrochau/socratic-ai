@@ -9,6 +9,14 @@ import streamlit as st
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 REQUEST_TIMEOUT = 300
 DOCUMENT_COLORS = ["green", "blue", "orange", "violet", "gray"]
+SOURCE_COLOR_DOTS = {
+    "red": "🔴",
+    "green": "🟢",
+    "blue": "🔵",
+    "orange": "🟠",
+    "violet": "🟣",
+    "gray": "⚪",
+}
 
 
 def _init_state() -> None:
@@ -231,6 +239,24 @@ def _render_ask_result() -> None:
         st.markdown(follow_up_question)
 
 
+def _render_source_legend(video_payload: dict, document_payloads: list[dict]) -> None:
+    st.markdown("### Source Attribution Legend")
+
+    video_title = str(video_payload.get("generated_title", "Video")).strip() or "Video"
+    st.caption(
+        f"{SOURCE_COLOR_DOTS.get('red', '•')} Video (red): {video_title}"
+    )
+
+    for index, document_payload in enumerate(document_payloads, start=1):
+        color_name = DOCUMENT_COLORS[(index - 1) % len(DOCUMENT_COLORS)]
+        dot = SOURCE_COLOR_DOTS.get(color_name, "•")
+        document_title = (
+            str(document_payload.get("generated_title", f"Document {index}")).strip()
+            or f"Document {index}"
+        )
+        st.caption(f"{dot} Document {index} ({color_name}): {document_title}")
+
+
 def _render_attributed_sentence(
     item: dict,
     source_style_map: dict[int, tuple[str, str]],
@@ -246,7 +272,8 @@ def _render_attributed_sentence(
     ]
 
     safe_text = text_value.replace("[", "(").replace("]", ")")
-    st.markdown(f":{color_name}[{safe_text}]")
+    dot = SOURCE_COLOR_DOTS.get(color_name, "•")
+    st.markdown(f"{dot} :{color_name}[{label}] {safe_text}")
 
     if emphasis_terms:
         formatted_terms = ", ".join(f"**{term}**" for term in emphasis_terms)
@@ -306,7 +333,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
     source_style_map = _resolve_source_style_map(video_payload, document_payloads)
 
     tab_video, tab_documents, tab_quiz_insights, tab_ask = st.tabs(
-        ["Video", "Documents", "Quiz and Insights", "Ask"]
+        ["Video", "Documents", "Cross-Source Synthesis & Assessment", "Ask"]
     )
 
     with tab_video:
@@ -327,7 +354,8 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                     _render_source_learning_section(section_payload)
 
     with tab_quiz_insights:
-        st.markdown("### Combined Insights")
+        st.markdown("### Cross-Source Connections")
+        _render_source_legend(video_payload, document_payloads)
         parallels = insights_payload.get("parallels", []) or []
         if parallels:
             for item in parallels:
@@ -347,7 +375,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             st.markdown("### Synthesis")
             st.markdown(synthesis_text)
 
-        st.markdown("### Overlap Quiz")
+        st.markdown("### Knowledge Check")
         questions = quiz_payload.get("questions", []) or []
         if not questions:
             st.write("No quiz questions available.")
@@ -465,6 +493,13 @@ def main() -> None:
 
     else:
         st.markdown("### Step 3: Generate tailored learning")
+        st.info(
+            "Estimated generation time: about 2 to 5 minutes. "
+            "Keep this page open while processing runs."
+        )
+        st.caption(
+            "Timing depends on video/document length and model load, so this is an estimate, not an exact countdown."
+        )
 
         selected_video = st.session_state.wizard_video_upload
         selected_documents = st.session_state.wizard_document_uploads
@@ -497,7 +532,10 @@ def main() -> None:
             )
 
         if generate_clicked:
-            with st.spinner("Uploading, processing, and generating tailored sections..."):
+            with st.spinner(
+                "Stage 1/4 Uploading files, Stage 2/4 processing sources, "
+                "Stage 3/4 linking concepts, Stage 4/4 generating tailored learning..."
+            ):
                 try:
                     _run_upload_process_and_generate(
                         video_upload=st.session_state.wizard_video_upload,
