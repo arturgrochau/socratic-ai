@@ -113,6 +113,10 @@ def _truncate_text(text_value: str, max_chars: int) -> str:
     return normalized[: max_chars - 3].rstrip() + "..."
 
 
+def _has_meaningful_text(value: str) -> bool:
+    return bool(value and value.strip() and value.strip() != "[None available]")
+
+
 def _is_broad_query(query: str) -> bool:
     lowered_query = query.lower().strip()
     if not lowered_query:
@@ -384,6 +388,52 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
     return _truncate_text(full_context, MAX_GENERATED_CONTEXT_CHARS)
 
 
+def _build_best_effort_answer(
+    *,
+    query: str,
+    source_summaries: list[dict[str, str | int]],
+    relationship_insights: list[str],
+    generated_learning_context: str,
+) -> str:
+    summary_fragments = [
+        _truncate_text(str(entry.get("summary_text") or ""), 220)
+        for entry in source_summaries[:2]
+        if _has_meaningful_text(str(entry.get("summary_text") or ""))
+    ]
+
+    first_principles_bits: list[str] = []
+    if summary_fragments:
+        first_principles_bits.append(" ".join(summary_fragments))
+    if _has_meaningful_text(generated_learning_context):
+        first_principles_bits.append(
+            _truncate_text(generated_learning_context, 420)
+        )
+
+    bridge_note = ""
+    if relationship_insights:
+        bridge_note = _truncate_text(relationship_insights[0].lstrip("- "), 220)
+
+    background_section = (
+        "**Background and first principles**\n"
+        f"From the available material related to '{query}', "
+        f"{_truncate_text(' '.join(first_principles_bits), 520) if first_principles_bits else 'the core relevant signals are limited but not empty.'}"
+    )
+
+    reflective_tail = "Focus on how the same mechanism behaves across source contexts and where assumptions change."
+    if bridge_note:
+        reflective_tail = (
+            f"A key cross-source bridge is: {bridge_note}. "
+            "Use that bridge to test what stays invariant versus what is context-specific."
+        )
+
+    reflective_section = (
+        "**Reflective synthesis**\n"
+        f"{reflective_tail}"
+    )
+
+    return f"{background_section}\n\n{reflective_section}".strip()
+
+
 def _run_unified_completion(
     query: str,
     retrieved_context: RetrievedContext,
@@ -514,10 +564,12 @@ def handle_user_query(
     retrieved_context: RetrievedContext | None = None
     source_summaries = _load_source_summaries(normalized_source_ids, user_id)
     generated_learning_context = _load_generated_learning_context(normalized_source_ids, user_id)
+    relationship_insights = _load_relationship_insights(normalized_source_ids, user_id)
     is_broad_query = _is_broad_query(normalized_query)
 
-    if is_broad_query and source_summaries:
-        relationship_insights = _load_relationship_insights(normalized_source_ids, user_id)
+    has_context_signal = bool(source_summaries) or _has_meaningful_text(generated_learning_context)
+
+    if is_broad_query and has_context_signal:
         model_output = _run_summary_completion(
             query=normalized_query,
             source_summaries=source_summaries,
@@ -537,8 +589,7 @@ def handle_user_query(
                 top_k=top_k,
             )
         except ValueError:
-            if source_summaries:
-                relationship_insights = _load_relationship_insights(normalized_source_ids, user_id)
+            if has_context_signal:
                 model_output = _run_summary_completion(
                     query=normalized_query,
                     source_summaries=source_summaries,
@@ -566,6 +617,15 @@ def handle_user_query(
 
     if not answer:
         answer = INSUFFICIENT_CONTEXT_ANSWER
+
+    if answer == INSUFFICIENT_CONTEXT_ANSWER and has_context_signal:
+        answer = _build_best_effort_answer(
+            query=normalized_query,
+            source_summaries=source_summaries,
+            relationship_insights=relationship_insights,
+            generated_learning_context=generated_learning_context,
+        )
+
     if not follow_up_question:
         follow_up_question = None
 

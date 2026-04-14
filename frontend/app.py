@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 import uuid
 from collections.abc import Callable
 
@@ -58,6 +59,8 @@ def _init_state() -> None:
         st.session_state.wizard_document_uploads = []
     if "generation_result" not in st.session_state:
         st.session_state.generation_result = None
+    if "dashboard_section" not in st.session_state:
+        st.session_state.dashboard_section = "Video"
 
 
 def _request_headers() -> dict[str, str]:
@@ -109,6 +112,7 @@ def _reset_builder() -> None:
     st.session_state.wizard_step = 1
     st.session_state.wizard_video_upload = None
     st.session_state.wizard_document_uploads = []
+    st.session_state.dashboard_section = "Video"
 
 
 def _run_upload_process_and_generate(
@@ -183,6 +187,7 @@ def _run_upload_process_and_generate(
     st.session_state.ask_messages = []
     st.session_state.generation_result = generation_payload
     st.session_state.wizard_step = 3
+    st.session_state.dashboard_section = "Cross-Source Synthesis & Assessment"
 
 
 def _resolve_source_style_map(video_payload: dict, document_payloads: list[dict]) -> dict[int, tuple[str, str]]:
@@ -248,11 +253,64 @@ def _render_reflection_points(reflection_points: list[dict] | list[str]) -> None
 
 
 def _render_source_learning_section(section_payload: dict) -> None:
-    st.subheader(section_payload.get("generated_title", "Untitled"))
-    st.markdown("### Summary")
-    st.markdown(str(section_payload.get("summary_text", "")).strip())
+    generated_title = str(section_payload.get("generated_title", "Untitled")).strip() or "Untitled"
 
-    deep_dive_text = str(section_payload.get("deep_dive_text", "")).strip()
+    def _normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    def _clean_block(raw_text: str, title_text: str, section_kind: str) -> str:
+        text_value = (raw_text or "").strip()
+        if not text_value:
+            return ""
+
+        title_norm = _normalize(title_text)
+        lines = text_value.splitlines()
+        cleaned_lines: list[str] = []
+
+        for line in lines:
+            candidate = line.strip()
+            if not candidate:
+                cleaned_lines.append("")
+                continue
+
+            candidate_norm = _normalize(candidate)
+            if not cleaned_lines:
+                if title_norm and candidate_norm == title_norm:
+                    continue
+                if section_kind == "summary" and (
+                    candidate_norm == "summary"
+                    or candidate_norm.startswith("summary of")
+                    or candidate_norm in {"video summary", "document summary"}
+                ):
+                    continue
+                if section_kind == "deep_dive" and (
+                    candidate_norm == "deep dive"
+                    or candidate_norm.startswith("deep dive")
+                ):
+                    continue
+
+            cleaned_lines.append(candidate)
+
+        cleaned_text = "\n".join(cleaned_lines).strip()
+        while cleaned_text.lower().startswith("summary\n"):
+            cleaned_text = cleaned_text.split("\n", 1)[1].strip()
+
+        return cleaned_text
+
+    st.subheader(generated_title)
+    st.markdown("### Summary")
+    summary_text = _clean_block(
+        str(section_payload.get("summary_text", "")),
+        generated_title,
+        "summary",
+    )
+    st.markdown(summary_text)
+
+    deep_dive_text = _clean_block(
+        str(section_payload.get("deep_dive_text", "")),
+        generated_title,
+        "deep_dive",
+    )
     if deep_dive_text:
         st.markdown("### Deep Dive")
         st.markdown(deep_dive_text)
@@ -378,6 +436,8 @@ def _render_ask_tab(has_user_id: bool) -> None:
     if not ask_query:
         return
 
+    st.session_state.dashboard_section = "Socratic Chatbox"
+
     st.session_state.ask_messages.append({"role": "user", "content": ask_query})
     with st.chat_message("user"):
         st.markdown(ask_query)
@@ -424,14 +484,25 @@ def _render_generation_tabs(has_user_id: bool) -> None:
     quiz_payload = generation_result.get("quiz", {})
     source_style_map = _resolve_source_style_map(video_payload, document_payloads)
 
-    tab_video, tab_documents, tab_quiz_insights, tab_ask = st.tabs(
-        ["Video", "Documents", "Cross-Source Synthesis & Assessment", "Socratic Chatbox"]
+    section_options = [
+        "Video",
+        "Documents",
+        "Cross-Source Synthesis & Assessment",
+        "Socratic Chatbox",
+    ]
+    st.radio(
+        "Dashboard Section",
+        options=section_options,
+        key="dashboard_section",
+        horizontal=True,
+        label_visibility="collapsed",
     )
+    selected_section = st.session_state.dashboard_section
 
-    with tab_video:
+    if selected_section == "Video":
         _render_source_learning_section(video_payload)
 
-    with tab_documents:
+    if selected_section == "Documents":
         if not document_payloads:
             st.info("No document sections available.")
         else:
@@ -445,7 +516,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                 with document_tab:
                     _render_source_learning_section(section_payload)
 
-    with tab_quiz_insights:
+    if selected_section == "Cross-Source Synthesis & Assessment":
         st.markdown("### Cross-Source Connections")
         _render_source_legend(video_payload, document_payloads)
 
@@ -535,7 +606,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             st.markdown("### Study Advice")
             st.markdown(study_advice)
 
-    with tab_ask:
+    if selected_section == "Socratic Chatbox":
         _render_ask_tab(has_user_id)
 
 
