@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 
 import requests
 import streamlit as st
@@ -101,7 +102,14 @@ def _reset_builder() -> None:
 def _run_upload_process_and_generate(
     video_upload: dict[str, str | bytes],
     document_uploads: list[dict[str, str | bytes]],
+    stage_callback: Callable[[str], None] | None = None,
 ) -> None:
+    def _set_stage(message: str) -> None:
+        if stage_callback is not None:
+            stage_callback(message)
+
+    _set_stage("Stage 1/4: Uploading files...")
+
     files = [
         (
             "video",
@@ -145,8 +153,14 @@ def _run_upload_process_and_generate(
         "video_source_id": video_source_id,
         "document_source_ids": document_source_ids,
     }
+
+    _set_stage("Stage 2/4: Processing sources and linking concepts...")
     _post_json("/process", process_payload)
+
+    _set_stage("Stage 3/4: Generating tailored learning...")
     generation_payload = _post_json("/generate-tailored-learning", process_payload)
+
+    _set_stage("Stage 4/4: Finalizing dashboard...")
 
     st.session_state.video_source_id = video_source_id
     st.session_state.document_source_ids = document_source_ids
@@ -493,13 +507,7 @@ def main() -> None:
 
     else:
         st.markdown("### Step 3: Generate tailored learning")
-        st.info(
-            "Estimated generation time: about 2 to 5 minutes. "
-            "Keep this page open while processing runs."
-        )
-        st.caption(
-            "Timing depends on video/document length and model load, so this is an estimate, not an exact countdown."
-        )
+        st.caption("Estimated generation time: about 2 to 5 minutes.")
 
         selected_video = st.session_state.wizard_video_upload
         selected_documents = st.session_state.wizard_document_uploads
@@ -532,18 +540,23 @@ def main() -> None:
             )
 
         if generate_clicked:
-            with st.spinner(
-                "Stage 1/4 Uploading files, Stage 2/4 processing sources, "
-                "Stage 3/4 linking concepts, Stage 4/4 generating tailored learning..."
-            ):
+            stage_placeholder = st.empty()
+
+            def _update_stage(message: str) -> None:
+                stage_placeholder.info(message)
+
+            with st.spinner("Working..."):
                 try:
                     _run_upload_process_and_generate(
                         video_upload=st.session_state.wizard_video_upload,
                         document_uploads=st.session_state.wizard_document_uploads,
+                        stage_callback=_update_stage,
                     )
                 except Exception as exc:
+                    stage_placeholder.empty()
                     st.error(str(exc))
                 else:
+                    stage_placeholder.success("Done. Your tailored learning dashboard is ready.")
                     st.success("Tailored Socratic learning generated successfully.")
 
     if st.session_state.pipeline_ready:
