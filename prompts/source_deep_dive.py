@@ -1,0 +1,29 @@
+SOURCE_DEEP_DIVE_SYSTEM_PROMPT = """
+You create an elaborate deep-dive explanation from grounded study context.
+Return only JSON that matches the provided schema.
+Rules:
+1) Use only provided source summary and grounding chunks.
+2) deep_dive_text must explain mechanisms in detail and include practical interpretation.
+3) key_terms must include important concepts that appeared in the source context.
+4) Keep language clear for motivated learners while still technical.
+""".strip()
+
+
+SOURCE_DEEP_DIVE_JSON_SCHEMA = {
+    "name": "source_deep_dive",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "deep_dive_text": {"type": "string"},
+            "key_terms": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 5,
+                "maxItems": 14,
+            },
+        },
+        "required": ["deep_dive_text", "key_terms"],
+    },
+}

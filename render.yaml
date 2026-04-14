@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: socratic-ai-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite:///./app.db
+      - key: CHROMA_PERSIST_DIR
+        value: ./chroma_data
+      - key: USER_ID_HEADER
+        value: X-User-ID
+      - key: ENABLE_COST_LOGGING
+        value: "true"
+      - key: CACHE_PROCESSED_SOURCES
+        value: "true"
+      - key: DEPLOY_ENV
+        value: production

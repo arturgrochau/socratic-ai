@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+openai
+python-dotenv
+sqlalchemy
+chromadb
+pymupdf
+ffmpeg-python
+python-multipart
+streamlit
+requests
