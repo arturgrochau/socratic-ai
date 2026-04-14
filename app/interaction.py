@@ -23,6 +23,7 @@ from prompts.interaction import (
 
 MAX_STORED_TURNS = 20
 MAX_PROMPT_TURNS = 4
+MAX_GENERATED_CONTEXT_CHARS = 3500
 INSUFFICIENT_CONTEXT_ANSWER = "I don't have enough information in the provided materials to answer that."
 INSUFFICIENT_CONTEXT_FOLLOW_UP = (
     "Which part of your uploaded lecture or notes should we inspect next?"
@@ -103,6 +104,13 @@ def _build_in_clause(values: list[int], prefix: str) -> tuple[str, dict[str, int
         keys.append(f":{key}")
 
     return ", ".join(keys), params
+
+
+def _truncate_text(text_value: str, max_chars: int) -> str:
+    normalized = " ".join(text_value.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
 
 
 def _is_broad_query(query: str) -> bool:
@@ -274,10 +282,113 @@ def _load_relationship_insights(source_ids: list[int], user_id: str) -> list[str
     ]
 
 
+def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str:
+    if not source_ids:
+        return ""
+
+    in_clause, params = _build_in_clause(source_ids, "source_id")
+    params["user_id"] = user_id
+
+    source_rows = []
+    with db_engine.connect() as connection:
+        source_rows = connection.execute(
+            text(
+                f"""
+                SELECT source_id, source_type, source_name, generated_title, summary_text, deep_dive_text, key_terms_json
+                FROM source_learning_sections
+                WHERE user_id = :user_id
+                  AND source_id IN ({in_clause})
+                ORDER BY source_type ASC, source_id ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+    source_blocks: list[str] = []
+    for row in source_rows:
+        key_terms = json.loads(str(row.get("key_terms_json") or "[]"))
+        key_terms_text = ", ".join(
+            str(term).strip() for term in key_terms[:6] if str(term).strip()
+        )
+        source_blocks.append(
+            (
+                f"Source {int(row['source_id'])} ({str(row['source_type'])}) "
+                f"[{str(row.get('source_name') or row.get('generated_title') or '').strip()}]\n"
+                f"Title: {str(row.get('generated_title') or '').strip()}\n"
+                f"Summary: {_truncate_text(str(row.get('summary_text') or ''), 380)}\n"
+                f"Deep dive: {_truncate_text(str(row.get('deep_dive_text') or ''), 420)}\n"
+                f"Key terms: {key_terms_text or 'n/a'}"
+            )
+        )
+
+    generated_sections = "\n\n".join(source_blocks)
+
+    combined_row = None
+    with db_engine.connect() as connection:
+        combined_candidates = connection.execute(
+            text(
+                """
+                SELECT video_source_id, document_source_ids_json, intersections_json, layman_bridge, synthesis_text, quiz_json
+                FROM combined_learning_sections
+                WHERE user_id = :user_id
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 20
+                """
+            ),
+            {"user_id": user_id},
+        ).mappings().all()
+
+    source_id_set = set(source_ids)
+    best_score = -1
+    for candidate in combined_candidates:
+        try:
+            candidate_doc_ids = {
+                int(value)
+                for value in json.loads(str(candidate.get("document_source_ids_json") or "[]"))
+            }
+        except Exception:
+            candidate_doc_ids = set()
+
+        candidate_video_id = int(candidate.get("video_source_id") or 0)
+        score = 0
+        if candidate_video_id in source_id_set:
+            score += 2
+        score += len(candidate_doc_ids.intersection(source_id_set))
+        if score > best_score:
+            best_score = score
+            combined_row = candidate
+
+    combined_block = ""
+    if combined_row is not None and best_score > 0:
+        intersections = json.loads(str(combined_row.get("intersections_json") or "[]"))
+        intersection_titles = []
+        for entry in intersections[:4]:
+            title = str(entry.get("intersection_title", "")).strip() if isinstance(entry, dict) else ""
+            if title:
+                intersection_titles.append(title)
+
+        quiz_payload = json.loads(str(combined_row.get("quiz_json") or "{}"))
+        study_advice = _truncate_text(str(quiz_payload.get("study_advice") or ""), 320)
+
+        combined_block = (
+            "Combined synthesis context\n"
+            f"Intersections: {', '.join(intersection_titles) if intersection_titles else 'n/a'}\n"
+            f"Layman bridge: {_truncate_text(str(combined_row.get('layman_bridge') or ''), 320)}\n"
+            f"Synthesis: {_truncate_text(str(combined_row.get('synthesis_text') or ''), 420)}\n"
+            f"Study advice: {study_advice or 'n/a'}"
+        )
+
+    full_context = "\n\n".join(part for part in [generated_sections, combined_block] if part).strip()
+    if not full_context:
+        return ""
+    return _truncate_text(full_context, MAX_GENERATED_CONTEXT_CHARS)
+
+
 def _run_unified_completion(
     query: str,
     retrieved_context: RetrievedContext,
     recent_turns: list[InteractionTurnRecord],
+    generated_learning_context: str,
     user_id: str,
 ) -> AskModelOutput:
     context_text = build_context_text(retrieved_context)
@@ -285,6 +396,7 @@ def _run_unified_completion(
 
     user_prompt = (
         f"User query:\n{query}\n\n"
+        f"Generated learning context:\n{generated_learning_context or '[None available]'}\n\n"
         f"Retrieved grounded context:\n{context_text}\n\n"
         f"Recent conversation turns JSON:\n{json.dumps(recent_turns_json, ensure_ascii=True)}"
     )
@@ -320,6 +432,7 @@ def _run_summary_completion(
     source_summaries: list[dict[str, str | int]],
     relationship_insights: list[str],
     recent_turns: list[InteractionTurnRecord],
+    generated_learning_context: str,
     user_id: str,
 ) -> AskModelOutput:
     summary_lines = [
@@ -335,6 +448,7 @@ def _run_summary_completion(
 
     user_prompt = (
         f"User query:\n{query}\n\n"
+        f"Generated learning context:\n{generated_learning_context or '[None available]'}\n\n"
         f"High-level source summaries:\n{summary_text}\n\n"
         f"Cross-source relationship insights:\n{relationship_text}\n\n"
         f"Recent conversation turns JSON:\n{json.dumps(recent_turns_json, ensure_ascii=True)}"
@@ -399,6 +513,7 @@ def handle_user_query(
     concept_ids: list[str] = []
     retrieved_context: RetrievedContext | None = None
     source_summaries = _load_source_summaries(normalized_source_ids, user_id)
+    generated_learning_context = _load_generated_learning_context(normalized_source_ids, user_id)
     is_broad_query = _is_broad_query(normalized_query)
 
     if is_broad_query and source_summaries:
@@ -408,6 +523,7 @@ def handle_user_query(
             source_summaries=source_summaries,
             relationship_insights=relationship_insights,
             recent_turns=recent_turns,
+            generated_learning_context=generated_learning_context,
             user_id=user_id,
         )
         answer = (model_output.answer or "").strip()
@@ -428,6 +544,7 @@ def handle_user_query(
                     source_summaries=source_summaries,
                     relationship_insights=relationship_insights,
                     recent_turns=recent_turns,
+                    generated_learning_context=generated_learning_context,
                     user_id=user_id,
                 )
                 answer = (model_output.answer or "").strip()
@@ -441,6 +558,7 @@ def handle_user_query(
                 query=normalized_query,
                 retrieved_context=retrieved_context,
                 recent_turns=recent_turns,
+                generated_learning_context=generated_learning_context,
                 user_id=user_id,
             )
             answer = (model_output.answer or "").strip()

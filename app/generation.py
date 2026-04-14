@@ -11,6 +11,7 @@ from app.models import (
     CombinedInsightSection,
     CombinedQuizSection,
     GenerateTailoredLearningResponse,
+    InsightIntersection,
     QuizQuestion,
     ReflectionPoint,
     SourceLearningSection,
@@ -33,7 +34,7 @@ from prompts.source_deep_dive import (
 from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 2
+GENERATION_SCHEMA_VERSION = 3
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 
@@ -76,6 +77,10 @@ def ensure_generation_tables() -> None:
             connection.execute(
                 text("ALTER TABLE source_learning_sections ADD COLUMN schema_version INTEGER DEFAULT 1")
             )
+        if "source_name" not in source_columns:
+            connection.execute(
+                text("ALTER TABLE source_learning_sections ADD COLUMN source_name TEXT DEFAULT ''")
+            )
 
         connection.execute(
             text(
@@ -117,6 +122,10 @@ def ensure_generation_tables() -> None:
         if "schema_version" not in combined_columns:
             connection.execute(
                 text("ALTER TABLE combined_learning_sections ADD COLUMN schema_version INTEGER DEFAULT 1")
+            )
+        if "intersections_json" not in combined_columns:
+            connection.execute(
+                text("ALTER TABLE combined_learning_sections ADD COLUMN intersections_json TEXT DEFAULT '[]'")
             )
 
         connection.execute(
@@ -383,6 +392,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     user_id,
                     source_id,
                     source_type,
+                    source_name,
                     generated_title,
                     summary_text,
                     reflection_points_json,
@@ -394,6 +404,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     :user_id,
                     :source_id,
                     :source_type,
+                    :source_name,
                     :generated_title,
                     :summary_text,
                     :reflection_points_json,
@@ -404,6 +415,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                 )
                 ON CONFLICT(user_id, source_id) DO UPDATE SET
                     source_type = excluded.source_type,
+                    source_name = excluded.source_name,
                     generated_title = excluded.generated_title,
                     summary_text = excluded.summary_text,
                     reflection_points_json = excluded.reflection_points_json,
@@ -418,6 +430,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                 "user_id": user_id,
                 "source_id": section.source_id,
                 "source_type": section.source_type,
+                "source_name": section.source_name,
                 "generated_title": section.generated_title,
                 "summary_text": section.summary_text,
                 "reflection_points_json": json.dumps(
@@ -440,6 +453,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
                 SELECT
                     source_id,
                     source_type,
+                    source_name,
                     generated_title,
                     summary_text,
                     reflection_points_json,
@@ -490,6 +504,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
     return SourceLearningSection(
         source_id=int(row["source_id"]),
         source_type=str(row["source_type"]),
+        source_name=str(row["source_name"] or row["generated_title"] or "Source").strip(),
         generated_title=str(row["generated_title"]),
         summary_text=str(row["summary_text"]),
         deep_dive_text=str(row["deep_dive_text"] or "").strip(),
@@ -501,7 +516,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
 
 
 def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearningSection:
-    source_type, _, _ = get_source_metadata(source_id, user_id)
+    source_type, source_name, _ = get_source_metadata(source_id, user_id)
 
     if CACHE_PROCESSED_SOURCES:
         cached = _load_cached_source_learning_section(source_id, user_id)
@@ -534,6 +549,7 @@ def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearni
     section = SourceLearningSection(
         source_id=source_id,
         source_type=source_type,
+        source_name=str(source_name).strip() or f"source-{source_id}",
         generated_title=generated_title,
         summary_text=summary_text,
         deep_dive_text=deep_dive_text,
@@ -544,6 +560,39 @@ def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearni
     )
     _store_source_learning_section(section, user_id)
     return section
+
+
+def _normalize_attributed_sentence(
+    raw_item: dict,
+    known_sources: dict[int, str],
+    fallback_source_id: int,
+) -> AttributedSentence | None:
+    source_id = int(raw_item.get("source_id", fallback_source_id))
+    if source_id not in known_sources:
+        source_id = fallback_source_id
+
+    source_type = str(raw_item.get("source_type", known_sources[source_id]))
+    if source_type not in {"video", "document"}:
+        source_type = known_sources[source_id]
+
+    emphasis_terms = [
+        str(term).strip()
+        for term in raw_item.get("emphasis_terms", [])
+        if str(term).strip()
+    ]
+    if not emphasis_terms:
+        emphasis_terms = ["key idea"]
+
+    text_value = str(raw_item.get("text", "")).strip()
+    if not text_value:
+        return None
+
+    return AttributedSentence(
+        text=text_value,
+        source_id=source_id,
+        source_type=source_type,
+        emphasis_terms=emphasis_terms,
+    )
 
 
 def _generate_combined_insights(
@@ -557,12 +606,14 @@ def _generate_combined_insights(
             "source_id": video_section.source_id,
             "source_type": "video",
             "title": video_section.generated_title,
+            "source_name": video_section.source_name,
         }
     ] + [
         {
             "source_id": section.source_id,
             "source_type": "document",
             "title": section.generated_title,
+            "source_name": section.source_name,
         }
         for section in document_sections
     ]
@@ -606,48 +657,101 @@ def _generate_combined_insights(
         **{section.source_id: "document" for section in document_sections},
     }
 
-    raw_parallels = payload.get("parallels", [])
+    raw_intersections = payload.get("intersections", [])
+    intersections: list[InsightIntersection] = []
     parallels: list[AttributedSentence] = []
-    for raw_item in raw_parallels:
-        source_id = int(raw_item.get("source_id", video_section.source_id))
-        if source_id not in known_sources:
-            source_id = video_section.source_id
 
-        source_type = str(raw_item.get("source_type", known_sources[source_id]))
-        if source_type not in {"video", "document"}:
-            source_type = known_sources[source_id]
-
-        emphasis_terms = [
-            str(term).strip()
-            for term in raw_item.get("emphasis_terms", [])
-            if str(term).strip()
-        ]
-        if not emphasis_terms:
-            emphasis_terms = ["key idea"]
-
-        text_value = str(raw_item.get("text", "")).strip()
-        if not text_value:
+    for raw_intersection in raw_intersections:
+        if not isinstance(raw_intersection, dict):
             continue
 
-        parallels.append(
-            AttributedSentence(
-                text=text_value,
-                source_id=source_id,
-                source_type=source_type,
-                emphasis_terms=emphasis_terms,
+        raw_sentences = raw_intersection.get("attributed_sentences", [])
+        attributed_sentences: list[AttributedSentence] = []
+        for raw_sentence in raw_sentences:
+            if not isinstance(raw_sentence, dict):
+                continue
+            normalized_sentence = _normalize_attributed_sentence(
+                raw_sentence,
+                known_sources,
+                video_section.source_id,
+            )
+            if normalized_sentence is not None:
+                attributed_sentences.append(normalized_sentence)
+
+        if len(attributed_sentences) < 2:
+            continue
+
+        intersection_title = str(raw_intersection.get("intersection_title", "")).strip()
+        why_it_matters = str(raw_intersection.get("why_it_matters", "")).strip()
+        integrated_explanation = str(raw_intersection.get("integrated_explanation", "")).strip()
+        if not intersection_title or not why_it_matters or not integrated_explanation:
+            continue
+
+        inferred_extension = raw_intersection.get("inferred_extension")
+        inferred_extension_text = (
+            str(inferred_extension).strip()
+            if inferred_extension is not None
+            else None
+        )
+        if inferred_extension_text == "":
+            inferred_extension_text = None
+
+        inference_label = raw_intersection.get("inference_label")
+        inference_label_value = (
+            "inferred_extension"
+            if inferred_extension_text and str(inference_label).strip() == "inferred_extension"
+            else None
+        )
+
+        intersections.append(
+            InsightIntersection(
+                intersection_title=intersection_title,
+                why_it_matters=why_it_matters,
+                integrated_explanation=integrated_explanation,
+                attributed_sentences=attributed_sentences,
+                inferred_extension=inferred_extension_text,
+                inference_label=inference_label_value,
             )
         )
+        parallels.extend(attributed_sentences)
+
+    if not intersections:
+        # Backward compatibility: handle legacy payload shape.
+        raw_parallels = payload.get("parallels", [])
+        legacy_sentences: list[AttributedSentence] = []
+        for raw_item in raw_parallels:
+            if not isinstance(raw_item, dict):
+                continue
+            normalized_sentence = _normalize_attributed_sentence(
+                raw_item,
+                known_sources,
+                video_section.source_id,
+            )
+            if normalized_sentence is not None:
+                legacy_sentences.append(normalized_sentence)
+
+        if len(legacy_sentences) >= 3:
+            intersections.append(
+                InsightIntersection(
+                    intersection_title="Core Cross-Source Intersection",
+                    why_it_matters="This overlap captures the strongest shared mechanism across your sources.",
+                    integrated_explanation="These attributed points connect what the video and documents reinforce, extend, or challenge.",
+                    attributed_sentences=legacy_sentences,
+                )
+            )
+            parallels.extend(legacy_sentences)
 
     layman_bridge = str(payload.get("layman_bridge", "")).strip()
     synthesis_text = str(payload.get("synthesis_text", "")).strip()
-    if len(parallels) < 3:
-        raise ValueError("Model returned too few cross-source parallels.")
+    if len(intersections) < 1:
+        raise ValueError("Model returned too few integrated cross-source intersections.")
     if not layman_bridge:
         raise ValueError("Model returned an empty layman bridge.")
     if not synthesis_text:
         raise ValueError("Model returned an empty synthesis text.")
 
     return CombinedInsightSection(
+        intersections=intersections,
         parallels=parallels,
         layman_bridge=layman_bridge,
         synthesis_text=synthesis_text,
@@ -742,6 +846,7 @@ def _store_combined_learning_sections(
                     user_id,
                     video_source_id,
                     document_source_ids_json,
+                    intersections_json,
                     parallels_json,
                     layman_bridge,
                     synthesis_text,
@@ -752,6 +857,7 @@ def _store_combined_learning_sections(
                     :user_id,
                     :video_source_id,
                     :document_source_ids_json,
+                    :intersections_json,
                     :parallels_json,
                     :layman_bridge,
                     :synthesis_text,
@@ -760,6 +866,7 @@ def _store_combined_learning_sections(
                     :model_name
                 )
                 ON CONFLICT(user_id, video_source_id, document_source_ids_json) DO UPDATE SET
+                    intersections_json = excluded.intersections_json,
                     parallels_json = excluded.parallels_json,
                     layman_bridge = excluded.layman_bridge,
                     synthesis_text = excluded.synthesis_text,
@@ -773,6 +880,10 @@ def _store_combined_learning_sections(
                 "user_id": user_id,
                 "video_source_id": video_source_id,
                 "document_source_ids_json": _serialize_ids(document_source_ids),
+                "intersections_json": json.dumps(
+                    [entry.model_dump() for entry in insights.intersections],
+                    ensure_ascii=True,
+                ),
                 "parallels_json": json.dumps(
                     [entry.model_dump() for entry in insights.parallels],
                     ensure_ascii=True,
@@ -797,6 +908,7 @@ def _load_cached_combined_learning_sections(
             text(
                 """
                 SELECT
+                    intersections_json,
                     parallels_json,
                     layman_bridge,
                     synthesis_text,
@@ -823,6 +935,14 @@ def _load_cached_combined_learning_sections(
     if int(row.get("schema_version") or 1) != GENERATION_SCHEMA_VERSION:
         return None
 
+    raw_intersections = json.loads(str(row.get("intersections_json") or "[]"))
+    intersections: list[InsightIntersection] = []
+    for entry in raw_intersections:
+        try:
+            intersections.append(InsightIntersection.model_validate(entry))
+        except Exception:
+            continue
+
     raw_parallels = json.loads(str(row["parallels_json"] or "[]"))
     parallels: list[AttributedSentence] = []
     for entry in raw_parallels:
@@ -831,7 +951,17 @@ def _load_cached_combined_learning_sections(
         except Exception:
             continue
 
-    if not parallels:
+    if not intersections and parallels:
+        intersections.append(
+            InsightIntersection(
+                intersection_title="Core Cross-Source Intersection",
+                why_it_matters="This overlap captures the strongest shared mechanism across your sources.",
+                integrated_explanation="These attributed points connect what the video and documents reinforce, extend, or challenge.",
+                attributed_sentences=parallels,
+            )
+        )
+
+    if not intersections:
         return None
 
     layman_bridge = str(row["layman_bridge"] or "").strip()
@@ -846,6 +976,7 @@ def _load_cached_combined_learning_sections(
         return None
 
     insights_section = CombinedInsightSection(
+        intersections=intersections,
         parallels=parallels,
         layman_bridge=layman_bridge,
         synthesis_text=synthesis_text,

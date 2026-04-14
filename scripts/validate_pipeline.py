@@ -164,6 +164,8 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
 
     if not str(video.get("generated_title", "")).strip():
         raise RuntimeError("Generation payload is missing video generated title.")
+    if not str(video.get("source_name", "")).strip():
+        raise RuntimeError("Generation payload is missing video source name.")
     video_summary_text = str(video.get("summary_text", "")).strip()
     if not video_summary_text:
         raise RuntimeError("Generation payload is missing video summary text.")
@@ -189,6 +191,8 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
     for document in documents:
         if not str(document.get("generated_title", "")).strip():
             raise RuntimeError("Generation payload has a document section without generated title.")
+        if not str(document.get("source_name", "")).strip():
+            raise RuntimeError("Generation payload has a document section without source name.")
         summary_text = str(document.get("summary_text", "")).strip()
         if not summary_text:
             raise RuntimeError("Generation payload has a document section without summary text.")
@@ -205,18 +209,42 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         if len(document.get("reflection_points") or []) < 4:
             raise RuntimeError("Generation payload has a document section with too few reflection points.")
 
-    parallels = insights.get("parallels") or []
-    if not parallels:
-        raise RuntimeError("Generation payload has no combined parallels.")
-    if len(parallels) < 5:
-        raise RuntimeError("Generation payload has too few combined parallels for elaborate mode.")
-    if not isinstance(parallels[0], dict):
-        raise RuntimeError("Generation payload parallels are missing source attribution objects.")
+    intersections = insights.get("intersections") or []
+    if not intersections:
+        raise RuntimeError("Generation payload has no integrated intersections.")
+    if len(intersections) < 3:
+        raise RuntimeError("Generation payload has too few integrated intersections for elaborate mode.")
 
-    required_parallel_fields = {"text", "source_id", "source_type", "emphasis_terms"}
-    for parallel in parallels:
-        if not required_parallel_fields.issubset(set(parallel.keys())):
-            raise RuntimeError("Generation payload has a malformed attributed parallel entry.")
+    required_intersection_fields = {
+        "intersection_title",
+        "why_it_matters",
+        "integrated_explanation",
+        "attributed_sentences",
+        "inferred_extension",
+        "inference_label",
+    }
+    required_sentence_fields = {"text", "source_id", "source_type", "emphasis_terms"}
+    attributed_sentence_count = 0
+    for intersection in intersections:
+        if not required_intersection_fields.issubset(set(intersection.keys())):
+            raise RuntimeError("Generation payload has a malformed intersection entry.")
+
+        attributed_sentences = intersection.get("attributed_sentences") or []
+        if len(attributed_sentences) < 3:
+            raise RuntimeError("Generation payload has an intersection with too few attributed sentences.")
+        attributed_sentence_count += len(attributed_sentences)
+
+        for sentence in attributed_sentences:
+            if not required_sentence_fields.issubset(set(sentence.keys())):
+                raise RuntimeError("Generation payload has a malformed attributed sentence entry.")
+
+        inferred_extension = intersection.get("inferred_extension")
+        inference_label = intersection.get("inference_label")
+        if inferred_extension and inference_label != "inferred_extension":
+            raise RuntimeError("Inferred extension exists without proper inference label.")
+
+    if attributed_sentence_count < 10:
+        raise RuntimeError("Generation payload has too few attributed sentence highlights across intersections.")
 
     if not str(insights.get("layman_bridge", "")).strip():
         raise RuntimeError("Generation payload has no layman bridge explanation.")
@@ -247,7 +275,8 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
     return {
         "video_title": str(video.get("generated_title", ""))[:120],
         "document_count": len(documents),
-        "parallel_count": len(parallels),
+        "intersection_count": len(intersections),
+        "attributed_sentence_count": attributed_sentence_count,
         "quiz_question_count": len(questions),
         "video_key_term_count": len(video_key_terms),
     }

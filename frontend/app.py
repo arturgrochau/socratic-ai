@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import uuid
 from collections.abc import Callable
 
@@ -17,6 +18,14 @@ SOURCE_COLOR_DOTS = {
     "orange": "🟠",
     "violet": "🟣",
     "gray": "⚪",
+}
+SOURCE_COLOR_HEX = {
+    "red": "#ef4444",
+    "green": "#22c55e",
+    "blue": "#3b82f6",
+    "orange": "#f97316",
+    "violet": "#8b5cf6",
+    "gray": "#9ca3af",
 }
 
 
@@ -37,6 +46,8 @@ def _init_state() -> None:
         st.session_state.ask_result = None
     if "ask_query" not in st.session_state:
         st.session_state.ask_query = ""
+    if "ask_messages" not in st.session_state:
+        st.session_state.ask_messages = []
     if "user_id" not in st.session_state:
         st.session_state.user_id = "demo-user"
     if "wizard_step" not in st.session_state:
@@ -92,6 +103,7 @@ def _reset_builder() -> None:
     st.session_state.document_source_ids = []
     st.session_state.ask_result = None
     st.session_state.ask_query = ""
+    st.session_state.ask_messages = []
     st.session_state.generation_result = None
     st.session_state.interaction_session_id = str(uuid.uuid4())
     st.session_state.wizard_step = 1
@@ -168,6 +180,7 @@ def _run_upload_process_and_generate(
     st.session_state.pipeline_ready = True
     st.session_state.interaction_session_id = str(uuid.uuid4())
     st.session_state.ask_result = None
+    st.session_state.ask_messages = []
     st.session_state.generation_result = generation_payload
     st.session_state.wizard_step = 3
 
@@ -177,14 +190,26 @@ def _resolve_source_style_map(video_payload: dict, document_payloads: list[dict]
 
     video_source_id = int(video_payload.get("source_id", 0) or 0)
     if video_source_id > 0:
-        style_map[video_source_id] = ("red", "Video")
+        video_label = (
+            str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
+            or "Video"
+        )
+        style_map[video_source_id] = ("red", video_label)
 
     for index, document_payload in enumerate(document_payloads, start=1):
         source_id = int(document_payload.get("source_id", 0) or 0)
         if source_id <= 0:
             continue
         color_name = DOCUMENT_COLORS[(index - 1) % len(DOCUMENT_COLORS)]
-        style_map[source_id] = (color_name, f"Document {index}")
+        document_label = (
+            str(
+                document_payload.get("source_name")
+                or document_payload.get("generated_title")
+                or f"Document {index}"
+            ).strip()
+            or f"Document {index}"
+        )
+        style_map[source_id] = (color_name, document_label)
 
     return style_map
 
@@ -256,19 +281,55 @@ def _render_ask_result() -> None:
 def _render_source_legend(video_payload: dict, document_payloads: list[dict]) -> None:
     st.markdown("### Source Attribution Legend")
 
-    video_title = str(video_payload.get("generated_title", "Video")).strip() or "Video"
-    st.caption(
-        f"{SOURCE_COLOR_DOTS.get('red', '•')} Video (red): {video_title}"
+    sources: list[tuple[str, str, str]] = []
+    video_name = (
+        str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
+        or "Video"
     )
+    sources.append(("Video", video_name, "red"))
 
     for index, document_payload in enumerate(document_payloads, start=1):
         color_name = DOCUMENT_COLORS[(index - 1) % len(DOCUMENT_COLORS)]
-        dot = SOURCE_COLOR_DOTS.get(color_name, "•")
-        document_title = (
-            str(document_payload.get("generated_title", f"Document {index}")).strip()
+        document_name = (
+            str(
+                document_payload.get("source_name")
+                or document_payload.get("generated_title")
+                or f"Document {index}"
+            ).strip()
             or f"Document {index}"
         )
-        st.caption(f"{dot} Document {index} ({color_name}): {document_title}")
+        sources.append((f"Document {index}", document_name, color_name))
+
+    columns = st.columns(min(3, max(1, len(sources))))
+    for index, (source_kind, source_name, color_name) in enumerate(sources):
+        color_hex = SOURCE_COLOR_HEX.get(color_name, "#9ca3af")
+        with columns[index % len(columns)]:
+            st.markdown(
+                (
+                    "<div style='border:1px solid #d1d5db;border-radius:10px;padding:10px;min-height:76px;'>"
+                    "<div style='display:flex;align-items:center;gap:8px;font-weight:600;'>"
+                    f"<span style='display:inline-block;width:12px;height:12px;background:{color_hex};border-radius:2px;'></span>"
+                    f"<span>{html.escape(source_kind)}</span>"
+                    "</div>"
+                    f"<div style='margin-top:6px;font-size:0.9rem;color:#4b5563;'>{html.escape(source_name)}</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+
+def _render_highlighted_sentence(sentence_text: str, color_name: str) -> None:
+    safe_text = html.escape(sentence_text)
+    color_hex = SOURCE_COLOR_HEX.get(color_name, "#9ca3af")
+    st.markdown(
+        (
+            "<div style='padding:8px 10px;margin:6px 0;border-radius:8px;"
+            f"background:{color_hex}1A;border-left:4px solid {color_hex};'>"
+            f"{safe_text}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def _render_attributed_sentence(
@@ -287,13 +348,13 @@ def _render_attributed_sentence(
 
     safe_text = text_value.replace("[", "(").replace("]", ")")
     dot = SOURCE_COLOR_DOTS.get(color_name, "•")
-    st.markdown(f"{dot} :{color_name}[{label}] {safe_text}")
+    _render_highlighted_sentence(safe_text, color_name)
 
     if emphasis_terms:
         formatted_terms = ", ".join(f"**{term}**" for term in emphasis_terms)
-        st.caption(f"Source: {label} | Keywords: {formatted_terms}")
+        st.caption(f"{dot} Source: {label} | Keywords: {formatted_terms}")
     else:
-        st.caption(f"Source: {label}")
+        st.caption(f"{dot} Source: {label}")
 
 
 def _render_ask_tab(has_user_id: bool) -> None:
@@ -302,23 +363,27 @@ def _render_ask_tab(has_user_id: bool) -> None:
         _render_ask_result()
         return
 
-    st.caption(
-        f"Ready for user={st.session_state.user_id}. source_ids={st.session_state.source_ids} | "
-        f"session_id={st.session_state.interaction_session_id}"
-    )
+    st.markdown("### Socratic Chatbox")
+    st.caption("Ask follow-up questions to deepen understanding across video, documents, and generated insights.")
 
-    ask_query = st.text_input(
-        "Ask anything about your material",
-        value=st.session_state.ask_query,
-    )
-    st.session_state.ask_query = ask_query
-    ask_clicked = st.button(
-        "Ask",
-        disabled=(not has_user_id or not ask_query.strip()),
-    )
+    for message in st.session_state.ask_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    try:
-        if ask_clicked:
+    if not has_user_id:
+        st.warning("Set a user ID in the sidebar to use the chatbox.")
+        return
+
+    ask_query = st.chat_input("Ask about concepts, intersections, or quiz reasoning...")
+    if not ask_query:
+        return
+
+    st.session_state.ask_messages.append({"role": "user", "content": ask_query})
+    with st.chat_message("user"):
+        st.markdown(ask_query)
+
+    with st.chat_message("assistant"):
+        try:
             st.session_state.ask_result = _post_json(
                 "/ask",
                 {
@@ -328,10 +393,23 @@ def _render_ask_tab(has_user_id: bool) -> None:
                     "top_k": 8,
                 },
             )
-    except Exception as exc:
-        st.error(str(exc))
-
-    _render_ask_result()
+            answer_text = str(st.session_state.ask_result.get("answer", "")).strip()
+            follow_up_question = str(
+                st.session_state.ask_result.get("follow_up_question") or ""
+            ).strip()
+            if follow_up_question:
+                assistant_text = (
+                    f"{answer_text}\n\n"
+                    f"**Socratic next question:** {follow_up_question}"
+                ).strip()
+            else:
+                assistant_text = answer_text
+            st.markdown(assistant_text)
+            st.session_state.ask_messages.append({"role": "assistant", "content": assistant_text})
+        except Exception as exc:
+            error_text = str(exc)
+            st.error(error_text)
+            st.session_state.ask_messages.append({"role": "assistant", "content": f"Error: {error_text}"})
 
 
 def _render_generation_tabs(has_user_id: bool) -> None:
@@ -347,7 +425,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
     source_style_map = _resolve_source_style_map(video_payload, document_payloads)
 
     tab_video, tab_documents, tab_quiz_insights, tab_ask = st.tabs(
-        ["Video", "Documents", "Cross-Source Synthesis & Assessment", "Ask"]
+        ["Video", "Documents", "Cross-Source Synthesis & Assessment", "Socratic Chatbox"]
     )
 
     with tab_video:
@@ -370,15 +448,44 @@ def _render_generation_tabs(has_user_id: bool) -> None:
     with tab_quiz_insights:
         st.markdown("### Cross-Source Connections")
         _render_source_legend(video_payload, document_payloads)
-        parallels = insights_payload.get("parallels", []) or []
-        if parallels:
-            for item in parallels:
-                if isinstance(item, dict):
-                    _render_attributed_sentence(item, source_style_map)
-                else:
-                    st.markdown(f"- {item}")
+
+        intersections = insights_payload.get("intersections", []) or []
+        if intersections:
+            for index, intersection in enumerate(intersections, start=1):
+                if not isinstance(intersection, dict):
+                    continue
+
+                title = str(intersection.get("intersection_title", f"Intersection {index}")).strip()
+                why_it_matters = str(intersection.get("why_it_matters", "")).strip()
+                integrated_explanation = str(intersection.get("integrated_explanation", "")).strip()
+
+                with st.container(border=True):
+                    st.markdown(f"#### {title or f'Intersection {index}'}")
+                    if why_it_matters:
+                        st.markdown(f"**Why it matters:** {why_it_matters}")
+                    if integrated_explanation:
+                        st.markdown(integrated_explanation)
+
+                    attributed_sentences = intersection.get("attributed_sentences", []) or []
+                    for item in attributed_sentences:
+                        if isinstance(item, dict):
+                            _render_attributed_sentence(item, source_style_map)
+
+                    inferred_extension = str(intersection.get("inferred_extension") or "").strip()
+                    inference_label = str(intersection.get("inference_label") or "").strip()
+                    if inferred_extension and inference_label == "inferred_extension":
+                        with st.expander("Inferred extension (conceptual deepening)"):
+                            st.markdown(inferred_extension)
         else:
-            st.write("No parallels available.")
+            parallels = insights_payload.get("parallels", []) or []
+            if parallels:
+                with st.container(border=True):
+                    st.markdown("#### Core Cross-Source Intersection")
+                    for item in parallels:
+                        if isinstance(item, dict):
+                            _render_attributed_sentence(item, source_style_map)
+            else:
+                st.write("No intersections available.")
 
         layman_bridge = str(insights_payload.get("layman_bridge", "")).strip()
         if layman_bridge:
@@ -556,8 +663,7 @@ def main() -> None:
                     stage_placeholder.empty()
                     st.error(str(exc))
                 else:
-                    stage_placeholder.success("Done. Your tailored learning dashboard is ready.")
-                    st.success("Tailored Socratic learning generated successfully.")
+                    stage_placeholder.success("Tailored Socratic learning generated successfully.")
 
     if st.session_state.pipeline_ready:
         st.header("Learning Dashboard")

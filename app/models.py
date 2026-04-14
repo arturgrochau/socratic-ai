@@ -194,13 +194,14 @@ class ReflectionPoint(BaseModel):
 class SourceLearningSection(BaseModel):
     source_id: int
     source_type: Literal["video", "document"]
+    source_name: str
     generated_title: str
     summary_text: str
     deep_dive_text: str
     key_terms: list[str]
     reflection_points: list[ReflectionPoint]
     model_name: str
-    schema_version: int = 2
+    schema_version: int = 3
 
 
 class AttributedSentence(BaseModel):
@@ -210,12 +211,22 @@ class AttributedSentence(BaseModel):
     emphasis_terms: list[str]
 
 
+class InsightIntersection(BaseModel):
+    intersection_title: str
+    why_it_matters: str
+    integrated_explanation: str
+    attributed_sentences: list[AttributedSentence]
+    inferred_extension: str | None = None
+    inference_label: Literal["inferred_extension"] | None = None
+
+
 class CombinedInsightSection(BaseModel):
-    parallels: list[AttributedSentence]
+    intersections: list[InsightIntersection]
+    parallels: list[AttributedSentence] = Field(default_factory=list)
     layman_bridge: str
     synthesis_text: str
     model_name: str
-    schema_version: int = 2
+    schema_version: int = 3
 
 
 class QuizQuestion(BaseModel):
