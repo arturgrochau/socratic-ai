@@ -182,6 +182,20 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
     if len(video_key_terms) < 5:
         raise RuntimeError("Generation payload has too few video key terms.")
 
+    video_under_surface = str(video.get("under_surface_explainer", "")).strip()
+    if not video_under_surface:
+        raise RuntimeError("Generation payload is missing video under-surface explainer text.")
+    if len(video_under_surface) < 600:
+        raise RuntimeError("Video under-surface explainer is too short for elaborate mode.")
+
+    video_diagnostic = video.get("diagnostic_checklist") or []
+    if len(video_diagnostic) < 4:
+        raise RuntimeError("Generation payload has too few video diagnostic checklist items.")
+
+    video_term_breakdown = video.get("key_term_explanations") or []
+    if len(video_term_breakdown) < 4:
+        raise RuntimeError("Generation payload has too few video key-term explanations.")
+
     if len(video.get("reflection_points") or []) < 4:
         raise RuntimeError("Generation payload has too few video reflection points.")
 
@@ -205,6 +219,20 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
 
         if len(document.get("key_terms") or []) < 5:
             raise RuntimeError("Generation payload has a document section with too few key terms.")
+
+        under_surface = str(document.get("under_surface_explainer", "")).strip()
+        if not under_surface:
+            raise RuntimeError("Generation payload has a document section without under-surface explainer text.")
+        if len(under_surface) < 500:
+            raise RuntimeError("Document under-surface explainer is too short for elaborate mode.")
+
+        diagnostic = document.get("diagnostic_checklist") or []
+        if len(diagnostic) < 4:
+            raise RuntimeError("Generation payload has a document section with too few diagnostic checklist items.")
+
+        term_breakdown = document.get("key_term_explanations") or []
+        if len(term_breakdown) < 4:
+            raise RuntimeError("Generation payload has a document section with too few key-term explanations.")
 
         if len(document.get("reflection_points") or []) < 4:
             raise RuntimeError("Generation payload has a document section with too few reflection points.")

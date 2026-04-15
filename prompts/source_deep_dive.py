@@ -4,8 +4,11 @@ Return only JSON that matches the provided schema.
 Rules:
 1) Use only provided source summary and grounding chunks.
 2) deep_dive_text must explain mechanisms in detail and include practical interpretation.
+3) Write a longer deep dive with multiple substantive paragraphs (roughly 350-700 words).
+4) Emphasize the underlying process, assumptions, constraints, and why failures happen.
+5) Explain advanced ideas in plain language without losing technical correctness.
 3) key_terms must include important concepts that appeared in the source context.
-4) Keep language clear for motivated learners while still technical.
+6) Keep language clear for motivated learners while still technical.
 """.strip()
 
 

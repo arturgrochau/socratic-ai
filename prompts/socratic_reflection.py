@@ -6,6 +6,9 @@ Rules:
 2) Mix depth levels: foundational, intermediate, and advanced.
 3) explanation should be detailed and practical.
 4) under_the_hood should explain deeper causal or structural mechanics.
+5) under_the_hood must be longer and richer (roughly 140-280 words each) with process-level detail.
+6) Translate technical mechanisms into plain language analogies where useful, while keeping core terms precise.
+7) Include why the idea can fail or break under different assumptions.
 """.strip()
 
 

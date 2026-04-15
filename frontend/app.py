@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import re
 import uuid
 from collections.abc import Callable
@@ -11,15 +10,8 @@ import streamlit as st
 
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 REQUEST_TIMEOUT = 300
-DOCUMENT_COLORS = ["green", "blue", "orange", "violet", "gray"]
-SOURCE_COLOR_HEX = {
-    "red": "#ef4444",
-    "green": "#22c55e",
-    "blue": "#3b82f6",
-    "orange": "#f97316",
-    "violet": "#8b5cf6",
-    "gray": "#9ca3af",
-}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
 
 
 def _init_state() -> None:
@@ -53,6 +45,16 @@ def _init_state() -> None:
         st.session_state.generation_result = None
     if "dashboard_section" not in st.session_state:
         st.session_state.dashboard_section = "Video"
+    if "ask_prefill" not in st.session_state:
+        st.session_state.ask_prefill = ""
+    if "socratic_chat_text" not in st.session_state:
+        st.session_state.socratic_chat_text = ""
+    if "pending_dashboard_section" not in st.session_state:
+        st.session_state.pending_dashboard_section = ""
+    if "wizard_replace_video" not in st.session_state:
+        st.session_state.wizard_replace_video = False
+    if "wizard_replace_documents" not in st.session_state:
+        st.session_state.wizard_replace_documents = False
 
 
 def _request_headers() -> dict[str, str]:
@@ -105,6 +107,32 @@ def _reset_builder() -> None:
     st.session_state.wizard_video_upload = None
     st.session_state.wizard_document_uploads = []
     st.session_state.dashboard_section = "Video"
+    st.session_state.ask_prefill = ""
+    st.session_state.socratic_chat_text = ""
+    st.session_state.pending_dashboard_section = ""
+    st.session_state.wizard_replace_video = False
+    st.session_state.wizard_replace_documents = False
+
+
+def _file_extension(filename: str) -> str:
+    lower = filename.lower().strip()
+    if "." not in lower:
+        return ""
+    return "." + lower.rsplit(".", 1)[1]
+
+
+def _is_supported_video_name(filename: str) -> bool:
+    return _file_extension(filename) in SUPPORTED_VIDEO_EXTENSIONS
+
+
+def _are_supported_document_names(filenames: list[str]) -> tuple[bool, list[str]]:
+    invalid = [name for name in filenames if _file_extension(name) not in SUPPORTED_DOCUMENT_EXTENSIONS]
+    return len(invalid) == 0, invalid
+
+
+def _queue_chat_navigation(prefill: str) -> None:
+    st.session_state.ask_prefill = prefill.strip()
+    st.session_state.pending_dashboard_section = "Socratic Chatbox"
 
 
 def _run_upload_process_and_generate(
@@ -182,8 +210,8 @@ def _run_upload_process_and_generate(
     st.session_state.dashboard_section = "Cross-Source Synthesis & Assessment"
 
 
-def _resolve_source_style_map(video_payload: dict, document_payloads: list[dict]) -> dict[int, tuple[str, str]]:
-    style_map: dict[int, tuple[str, str]] = {}
+def _resolve_source_label_map(video_payload: dict, document_payloads: list[dict]) -> dict[int, str]:
+    label_map: dict[int, str] = {}
 
     video_source_id = int(video_payload.get("source_id", 0) or 0)
     if video_source_id > 0:
@@ -191,13 +219,12 @@ def _resolve_source_style_map(video_payload: dict, document_payloads: list[dict]
             str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
             or "Video"
         )
-        style_map[video_source_id] = ("red", video_label)
+        label_map[video_source_id] = video_label
 
     for index, document_payload in enumerate(document_payloads, start=1):
         source_id = int(document_payload.get("source_id", 0) or 0)
         if source_id <= 0:
             continue
-        color_name = DOCUMENT_COLORS[(index - 1) % len(DOCUMENT_COLORS)]
         document_label = (
             str(
                 document_payload.get("source_name")
@@ -206,9 +233,9 @@ def _resolve_source_style_map(video_payload: dict, document_payloads: list[dict]
             ).strip()
             or f"Document {index}"
         )
-        style_map[source_id] = (color_name, document_label)
+        label_map[source_id] = document_label
 
-    return style_map
+    return label_map
 
 
 def _render_key_terms(key_terms: list[str]) -> None:
@@ -240,7 +267,7 @@ def _render_reflection_points(reflection_points: list[dict] | list[str]) -> None
         if explanation:
             st.write(explanation)
         if under_the_hood:
-            with st.expander(f"Under the hood for point {index}"):
+            with st.expander(f"Why this works under the surface (point {index})"):
                 st.write(under_the_hood)
 
 
@@ -290,7 +317,6 @@ def _render_source_learning_section(section_payload: dict) -> None:
         return cleaned_text
 
     st.subheader(generated_title)
-    st.markdown("### Summary")
     summary_text = _clean_block(
         str(section_payload.get("summary_text", "")),
         generated_title,
@@ -308,7 +334,30 @@ def _render_source_learning_section(section_payload: dict) -> None:
         st.markdown(deep_dive_text)
 
     key_terms = section_payload.get("key_terms", []) or []
-    _render_key_terms([str(term) for term in key_terms])
+    normalized_terms = [str(term) for term in key_terms]
+    _render_key_terms(normalized_terms)
+
+    under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
+    if under_surface_text:
+        with st.expander("Why this works under the surface"):
+            st.markdown(_bold_keywords_in_text(under_surface_text, normalized_terms))
+
+            diagnostic_checklist = section_payload.get("diagnostic_checklist", []) or []
+            if diagnostic_checklist:
+                st.markdown("**Diagnostic checklist**")
+                for item in diagnostic_checklist:
+                    st.markdown(f"- {item}")
+
+            key_term_explanations = section_payload.get("key_term_explanations", []) or []
+            if key_term_explanations:
+                st.markdown("**Key term breakdown**")
+                for entry in key_term_explanations:
+                    if not isinstance(entry, dict):
+                        continue
+                    term = str(entry.get("term") or "").strip()
+                    explanation = str(entry.get("explanation") or "").strip()
+                    if term and explanation:
+                        st.markdown(f"- **{term}**: {explanation}")
 
     reflection_points = section_payload.get("reflection_points", []) or []
     st.markdown("### Socratic Reflection Points")
@@ -326,46 +375,6 @@ def _render_ask_result() -> None:
     if follow_up_question:
         st.subheader("Follow-up Question")
         st.markdown(follow_up_question)
-
-
-def _render_source_legend(video_payload: dict, document_payloads: list[dict]) -> None:
-    st.markdown("### Source Attribution Legend")
-
-    sources: list[tuple[str, str, str]] = []
-    video_name = (
-        str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
-        or "Video"
-    )
-    sources.append(("Video", video_name, "red"))
-
-    for index, document_payload in enumerate(document_payloads, start=1):
-        color_name = DOCUMENT_COLORS[(index - 1) % len(DOCUMENT_COLORS)]
-        document_name = (
-            str(
-                document_payload.get("source_name")
-                or document_payload.get("generated_title")
-                or f"Document {index}"
-            ).strip()
-            or f"Document {index}"
-        )
-        sources.append((f"Document {index}", document_name, color_name))
-
-    columns = st.columns(min(3, max(1, len(sources))))
-    for index, (source_kind, source_name, color_name) in enumerate(sources):
-        color_hex = SOURCE_COLOR_HEX.get(color_name, "#9ca3af")
-        with columns[index % len(columns)]:
-            st.markdown(
-                (
-                    "<div style='border:1px solid #d1d5db;border-radius:10px;padding:10px;min-height:76px;'>"
-                    "<div style='display:flex;align-items:center;gap:8px;font-weight:600;'>"
-                    f"<span style='display:inline-block;width:12px;height:12px;background:{color_hex};border-radius:2px;'></span>"
-                    f"<span>{html.escape(source_kind)}</span>"
-                    "</div>"
-                    f"<div style='margin-top:6px;font-size:0.9rem;color:#4b5563;'>{html.escape(source_name)}</div>"
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
-            )
 
 
 def _collect_emphasis_terms(
@@ -407,42 +416,126 @@ def _bold_keywords_in_text(text_value: str, keywords: list[str]) -> str:
 
 def _render_grouped_evidence(
     attributed_sentences: list[dict],
-    source_style_map: dict[int, tuple[str, str]],
+    valid_source_ids: set[int],
 ) -> None:
-    grouped_quotes: dict[str, list[str]] = {}
-    seen_pairs: set[tuple[str, str]] = set()
+    evidence_quotes: list[str] = []
+    seen_quotes: set[str] = set()
 
     for item in attributed_sentences:
         if not isinstance(item, dict):
+            continue
+
+        source_id = int(item.get("source_id", 0) or 0)
+        if source_id <= 0 or source_id not in valid_source_ids:
             continue
 
         quote_text = " ".join(str(item.get("text", "")).split()).strip()
         if not quote_text:
             continue
 
-        source_id = int(item.get("source_id", 0) or 0)
-        _, source_label = source_style_map.get(source_id, ("gray", "Unknown source"))
-        pair_key = (source_label, quote_text)
-        if pair_key in seen_pairs:
+        quote_text = re.sub(r"\[?\s*source\s*#?\d+\s*\]?:?\s*", "", quote_text, flags=re.IGNORECASE)
+        quote_text = quote_text.strip()
+        if not quote_text:
             continue
-        seen_pairs.add(pair_key)
+
+        normalized = quote_text.lower()
+        if normalized in seen_quotes:
+            continue
+        seen_quotes.add(normalized)
 
         if len(quote_text) > 240:
             quote_text = quote_text[:237].rstrip() + "..."
 
-        grouped_quotes.setdefault(source_label, []).append(quote_text)
+        evidence_quotes.append(quote_text)
 
-    if not grouped_quotes:
+    if not evidence_quotes:
         return
 
     with st.expander("Show source-grounded evidence", expanded=False):
-        for source_label, quotes in grouped_quotes.items():
-            st.markdown(f"**{source_label}**")
-            for quote in quotes[:4]:
-                st.markdown(f"- \"{quote}\"")
-            hidden_count = len(quotes) - 4
-            if hidden_count > 0:
-                st.caption(f"+ {hidden_count} more supporting quote(s)")
+        for quote in evidence_quotes[:8]:
+            st.markdown(f"- \"{quote}\"")
+        hidden_count = len(evidence_quotes) - 8
+        if hidden_count > 0:
+            st.caption(f"+ {hidden_count} more supporting quote(s)")
+
+
+def _submit_chat_query(ask_query: str) -> None:
+    query_text = ask_query.strip()
+    if not query_text:
+        return
+
+    st.session_state.ask_messages.append({"role": "user", "content": query_text})
+    try:
+        with st.spinner("Thinking..."):
+            st.session_state.ask_result = _post_json(
+                "/ask",
+                {
+                    "session_id": st.session_state.interaction_session_id,
+                    "source_ids": st.session_state.source_ids,
+                    "query": query_text,
+                    "top_k": 8,
+                },
+            )
+
+        answer_text = str(st.session_state.ask_result.get("answer", "")).strip()
+        follow_up_question = str(
+            st.session_state.ask_result.get("follow_up_question") or ""
+        ).strip()
+        if follow_up_question:
+            assistant_text = (
+                f"{answer_text}\n\n"
+                f"**Socratic next question:** {follow_up_question}"
+            ).strip()
+        else:
+            assistant_text = answer_text or "I could not generate an answer this time. Please try rephrasing your question."
+        st.session_state.ask_messages.append({"role": "assistant", "content": assistant_text})
+    except Exception as exc:
+        error_text = str(exc)
+        st.session_state.ask_messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"I ran into an error while answering that request: {error_text}. "
+                    "Please try asking again with a more specific wording."
+                ),
+            }
+        )
+
+    st.rerun()
+
+
+def _build_intersection_chat_prefill(
+    *,
+    title: str,
+    why_it_matters: str,
+    emphasis_terms: list[str],
+    attributed_sentences: list[dict],
+) -> str:
+    quote_fragments: list[str] = []
+    seen: set[str] = set()
+    for item in attributed_sentences:
+        quote_text = " ".join(str(item.get("text", "")).split()).strip()
+        if not quote_text:
+            continue
+        quote_text = re.sub(r"\[?\s*source\s*#?\d+\s*\]?:?\s*", "", quote_text, flags=re.IGNORECASE).strip()
+        if not quote_text:
+            continue
+        normalized = quote_text.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        quote_fragments.append(quote_text)
+        if len(quote_fragments) >= 2:
+            break
+
+    keyword_text = ", ".join(emphasis_terms[:6])
+    quote_text = " | ".join(quote_fragments)
+    return (
+        f"In the intersection '{title}', help me understand this better: {why_it_matters}. "
+        f"Key concepts: {keyword_text or 'none listed'}. "
+        f"Evidence snippets: {quote_text or 'none provided'}. "
+        "Please answer my question directly first, then briefly connect the idea to how I should think about applying it."
+    ).strip()
 
 def _render_ask_tab(has_user_id: bool) -> None:
     if not st.session_state.pipeline_ready:
@@ -453,23 +546,49 @@ def _render_ask_tab(has_user_id: bool) -> None:
     st.markdown("### Socratic Chatbox")
     st.caption("Ask follow-up questions to deepen understanding across video, documents, and generated insights.")
 
-    for message in st.session_state.ask_messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    if st.session_state.ask_prefill.strip():
+        st.session_state.socratic_chat_text = st.session_state.ask_prefill.strip()
+        st.session_state.ask_prefill = ""
 
     if not has_user_id:
         st.warning("Set a user ID in the sidebar to use the chatbox.")
         return
 
+    for message in st.session_state.ask_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if st.session_state.ask_messages and st.session_state.ask_messages[-1]["role"] == "assistant":
+        col_elaborate, col_quiz = st.columns(2)
+        with col_elaborate:
+            if st.button("Elaborate further", key="quick_action_elaborate"):
+                _submit_chat_query(
+                    "Elaborate further on your previous answer with more technical depth explained in plain language."
+                )
+        with col_quiz:
+            if st.button("Quiz me on this", key="quick_action_quiz"):
+                _submit_chat_query(
+                    "Quiz me on what you just explained. Ask one challenging question first, then explain the answer."
+                )
+
     st.caption("Type your question below, then click Send.")
+    is_follow_up = bool(st.session_state.ask_messages)
+    input_label = "Ask follow-up" if is_follow_up else "Ask your first question"
+    input_placeholder = (
+        "Ask follow-up..."
+        if is_follow_up
+        else "Example: Explain the strongest intersection and how I could apply it in a real project."
+    )
+    input_height = 84 if is_follow_up else 130
+
     with st.form(key="socratic_chat_form", clear_on_submit=True):
         ask_query = st.text_area(
-            "Ask about concepts, intersections, quiz reasoning, or practical applications",
-            height=130,
+            input_label,
+            height=input_height,
             key="socratic_chat_text",
-            placeholder="Example: Explain the strongest intersection and how I could apply it in a real project.",
+            placeholder=input_placeholder,
         )
-        submitted = st.form_submit_button("Send")
+        submitted = st.form_submit_button("Send" if is_follow_up else "Ask")
 
     if not submitted:
         return
@@ -479,38 +598,7 @@ def _render_ask_tab(has_user_id: bool) -> None:
         st.warning("Enter a question before sending.")
         return
 
-    st.session_state.ask_messages.append({"role": "user", "content": ask_query})
-    with st.chat_message("user"):
-        st.markdown(ask_query)
-
-    with st.chat_message("assistant"):
-        try:
-            st.session_state.ask_result = _post_json(
-                "/ask",
-                {
-                    "session_id": st.session_state.interaction_session_id,
-                    "source_ids": st.session_state.source_ids,
-                    "query": ask_query.strip(),
-                    "top_k": 8,
-                },
-            )
-            answer_text = str(st.session_state.ask_result.get("answer", "")).strip()
-            follow_up_question = str(
-                st.session_state.ask_result.get("follow_up_question") or ""
-            ).strip()
-            if follow_up_question:
-                assistant_text = (
-                    f"{answer_text}\n\n"
-                    f"**Socratic next question:** {follow_up_question}"
-                ).strip()
-            else:
-                assistant_text = answer_text
-            st.markdown(assistant_text)
-            st.session_state.ask_messages.append({"role": "assistant", "content": assistant_text})
-        except Exception as exc:
-            error_text = str(exc)
-            st.error(error_text)
-            st.session_state.ask_messages.append({"role": "assistant", "content": f"Error: {error_text}"})
+    _submit_chat_query(ask_query)
 
 
 def _render_generation_tabs(has_user_id: bool) -> None:
@@ -523,7 +611,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
     document_payloads = generation_result.get("documents", []) or []
     insights_payload = generation_result.get("insights", {})
     quiz_payload = generation_result.get("quiz", {})
-    source_style_map = _resolve_source_style_map(video_payload, document_payloads)
+    source_label_map = _resolve_source_label_map(video_payload, document_payloads)
 
     section_options = [
         "Video",
@@ -531,6 +619,12 @@ def _render_generation_tabs(has_user_id: bool) -> None:
         "Cross-Source Synthesis & Assessment",
         "Socratic Chatbox",
     ]
+
+    pending_section = str(st.session_state.pending_dashboard_section or "").strip()
+    if pending_section in section_options:
+        st.session_state.dashboard_section = pending_section
+    st.session_state.pending_dashboard_section = ""
+
     st.radio(
         "Dashboard Section",
         options=section_options,
@@ -559,8 +653,6 @@ def _render_generation_tabs(has_user_id: bool) -> None:
 
     if selected_section == "Cross-Source Synthesis & Assessment":
         st.markdown("### Cross-Source Connections")
-        with st.expander("Source legend", expanded=False):
-            _render_source_legend(video_payload, document_payloads)
 
         intersections = insights_payload.get("intersections", []) or []
         if intersections:
@@ -579,6 +671,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         item
                         for item in (intersection.get("attributed_sentences", []) or [])
                         if isinstance(item, dict)
+                        and int(item.get("source_id", 0) or 0) in source_label_map
                     ]
                     emphasis_terms = _collect_emphasis_terms(attributed_sentences)
 
@@ -593,7 +686,24 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
                         st.caption(f"Key concepts: {concept_list}")
 
-                    _render_grouped_evidence(attributed_sentences, source_style_map)
+                    _render_grouped_evidence(
+                        attributed_sentences,
+                        valid_source_ids=set(source_label_map.keys()),
+                    )
+
+                    ask_about_intersection = st.button(
+                        "Ask about this intersection",
+                        key=f"ask_intersection_{index}",
+                        use_container_width=False,
+                    )
+                    if ask_about_intersection:
+                        _queue_chat_navigation(_build_intersection_chat_prefill(
+                            title=title or f"Intersection {index}",
+                            why_it_matters=why_it_matters,
+                            emphasis_terms=emphasis_terms,
+                            attributed_sentences=attributed_sentences,
+                        ))
+                        st.rerun()
 
                     inferred_extension = str(intersection.get("inferred_extension") or "").strip()
                     inference_label = str(intersection.get("inference_label") or "").strip()
@@ -605,12 +715,34 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             if parallels:
                 with st.container(border=True):
                     st.markdown("#### Core Cross-Source Intersection")
-                    normalized_parallels = [item for item in parallels if isinstance(item, dict)]
+                    normalized_parallels = [
+                        item
+                        for item in parallels
+                        if isinstance(item, dict)
+                        and int(item.get("source_id", 0) or 0) in source_label_map
+                    ]
                     emphasis_terms = _collect_emphasis_terms(normalized_parallels)
                     if emphasis_terms:
                         concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
                         st.caption(f"Key concepts: {concept_list}")
-                    _render_grouped_evidence(normalized_parallels, source_style_map)
+                    _render_grouped_evidence(
+                        normalized_parallels,
+                        valid_source_ids=set(source_label_map.keys()),
+                    )
+
+                    ask_about_core = st.button(
+                        "Ask about this intersection",
+                        key="ask_core_intersection",
+                        use_container_width=False,
+                    )
+                    if ask_about_core:
+                        _queue_chat_navigation(_build_intersection_chat_prefill(
+                            title="Core Cross-Source Intersection",
+                            why_it_matters="Help me understand the strongest overlap across my sources.",
+                            emphasis_terms=emphasis_terms,
+                            attributed_sentences=normalized_parallels,
+                        ))
+                        st.rerun()
             else:
                 st.write("No intersections available.")
 
@@ -677,7 +809,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         st.markdown("**Why this is correct**")
                         st.markdown(explanation)
                     if under_the_hood:
-                        st.markdown("**Under the hood**")
+                        st.markdown("**Why this works under the surface**")
                         st.markdown(under_the_hood)
                     if source_evidence:
                         st.markdown("**Source evidence**")
@@ -726,12 +858,23 @@ def main() -> None:
 
     if st.session_state.wizard_step == 1:
         st.markdown("### Step 1: Upload video")
-        video_file = st.file_uploader(
-            "Upload one video",
-            type=["mp4", "mov", "m4v", "avi", "mkv", "webm"],
-            accept_multiple_files=False,
-            key="wizard_video_uploader",
-        )
+
+        video_file = None
+        if st.session_state.wizard_video_upload is None or st.session_state.wizard_replace_video:
+            video_file = st.file_uploader(
+                "Upload one video",
+                accept_multiple_files=False,
+                key="wizard_video_uploader",
+                help="Supported formats: mp4, mov, m4v, avi, mkv, webm.",
+            )
+            if video_file is not None and not _is_supported_video_name(video_file.name):
+                st.warning("Unsupported video format. Use: mp4, mov, m4v, avi, mkv, or webm.")
+                video_file = None
+        else:
+            st.caption("A video is already selected. Use Replace video to choose another one.")
+            if st.button("Replace video", key="replace_video_button"):
+                st.session_state.wizard_replace_video = True
+                st.rerun()
 
         if st.session_state.wizard_video_upload is not None:
             st.success(f"Selected: {st.session_state.wizard_video_upload['name']}")
@@ -742,17 +885,36 @@ def main() -> None:
             else:
                 if video_file is not None:
                     st.session_state.wizard_video_upload = _pack_uploaded_file(video_file)
+                    st.session_state.wizard_replace_video = False
                 st.session_state.wizard_step = 2
                 st.rerun()
 
     elif st.session_state.wizard_step == 2:
         st.markdown("### Step 2: Upload source documents")
-        document_files = st.file_uploader(
-            "Upload one or more documents",
-            type=["pdf", "txt", "md"],
-            accept_multiple_files=True,
-            key="wizard_document_uploader",
-        )
+
+        document_files = []
+        if not st.session_state.wizard_document_uploads or st.session_state.wizard_replace_documents:
+            uploaded_files = st.file_uploader(
+                "Upload one or more documents",
+                accept_multiple_files=True,
+                key="wizard_document_uploader",
+                help="Supported formats: pdf, txt, md.",
+            )
+            document_files = list(uploaded_files or [])
+            if document_files:
+                valid_docs, invalid_docs = _are_supported_document_names([file.name for file in document_files])
+                if not valid_docs:
+                    st.warning(
+                        "Unsupported document format(s): "
+                        + ", ".join(invalid_docs)
+                        + ". Use: pdf, txt, md."
+                    )
+                    document_files = []
+        else:
+            st.caption("Documents are already selected. Use Replace documents to choose a new set.")
+            if st.button("Replace documents", key="replace_documents_button"):
+                st.session_state.wizard_replace_documents = True
+                st.rerun()
 
         if st.session_state.wizard_document_uploads:
             existing_names = [item["name"] for item in st.session_state.wizard_document_uploads]
@@ -772,6 +934,7 @@ def main() -> None:
                         st.session_state.wizard_document_uploads = [
                             _pack_uploaded_file(file) for file in document_files
                         ]
+                        st.session_state.wizard_replace_documents = False
                     st.session_state.wizard_step = 3
                     st.rerun()
 

@@ -191,6 +191,11 @@ class ReflectionPoint(BaseModel):
     depth_level: Literal["foundational", "intermediate", "advanced"]
 
 
+class KeyTermExplanation(BaseModel):
+    term: str
+    explanation: str
+
+
 class SourceLearningSection(BaseModel):
     source_id: int
     source_type: Literal["video", "document"]
@@ -199,9 +204,12 @@ class SourceLearningSection(BaseModel):
     summary_text: str
     deep_dive_text: str
     key_terms: list[str]
+    under_surface_explainer: str = ""
+    diagnostic_checklist: list[str] = Field(default_factory=list)
+    key_term_explanations: list[KeyTermExplanation] = Field(default_factory=list)
     reflection_points: list[ReflectionPoint]
     model_name: str
-    schema_version: int = 3
+    schema_version: int = 5
 
 
 class AttributedSentence(BaseModel):

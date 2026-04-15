@@ -23,7 +23,7 @@ from prompts.interaction import (
 
 MAX_STORED_TURNS = 20
 MAX_PROMPT_TURNS = 4
-MAX_GENERATED_CONTEXT_CHARS = 3500
+MAX_GENERATED_CONTEXT_CHARS = 2200
 INSUFFICIENT_CONTEXT_ANSWER = "I don't have enough information in the provided materials to answer that."
 INSUFFICIENT_CONTEXT_FOLLOW_UP = (
     "Which part of your uploaded lecture or notes should we inspect next?"
@@ -41,6 +41,15 @@ BROAD_QUERY_PATTERNS = [
     "high level",
     "how do these sources relate",
     "how are these sources related",
+]
+DEEPENING_QUERY_PATTERNS = [
+    "elaborate further",
+    "go deeper",
+    "expand on this",
+    "explain more",
+    "more detail",
+    "deepen this",
+    "tell me more",
 ]
 
 
@@ -141,6 +150,44 @@ def _is_broad_query(query: str) -> bool:
     return False
 
 
+def _should_include_generated_context(query: str) -> bool:
+    lowered = query.lower().strip()
+    if not lowered:
+        return False
+    if _is_broad_query(lowered):
+        return True
+    return any(
+        token in lowered
+        for token in ["intersection", "cross-source", "synthesis", "compare", "connection", "relationship"]
+    )
+
+
+def _is_deepening_query(query: str) -> bool:
+    lowered = query.lower().strip()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in DEEPENING_QUERY_PATTERNS)
+
+
+def _wants_long_form(query: str) -> bool:
+    lowered = query.lower().strip()
+    if _is_deepening_query(lowered):
+        return True
+    return any(token in lowered for token in ["how", "why", "mechanism", "under the hood", "first principles"]) and len(lowered) > 24
+
+
+def _expand_followup_query(query: str, recent_turns: list[InteractionTurnRecord]) -> str:
+    if not _is_deepening_query(query) or not recent_turns:
+        return query
+
+    last_turn = recent_turns[-1]
+    return (
+        f"{query}. Focus on the previous discussion topic. "
+        f"Previous user question: {last_turn.query}. "
+        f"Previous assistant answer (truncated): {_truncate_text(last_turn.answer, 820)}"
+    ).strip()
+
+
 def _scoped_session_key(user_id: str, session_id: str) -> str:
     return f"{user_id}:{session_id}"
 
@@ -218,6 +265,9 @@ def _build_learning_bridge(retrieved_context: RetrievedContext) -> str | None:
     source_label = term_labels.get(best_edge.source_concept_id, best_edge.source_concept_id)
     target_label = term_labels.get(best_edge.target_concept_id, best_edge.target_concept_id)
 
+    if source_label == best_edge.source_concept_id or target_label == best_edge.target_concept_id:
+        return None
+
     if best_edge.relation_type == "reinforces":
         relation_phrase = "reinforce each other"
     else:
@@ -287,8 +337,7 @@ def _load_relationship_insights(source_ids: list[int], user_id: str) -> list[str
 
     return [
         (
-            f"- {row['source_concept_id']} -> {row['target_concept_id']}: "
-            f"{row['relation_type']} (confidence={float(row['confidence']):.2f}) | "
+            f"- {row['relation_type']} (confidence={float(row['confidence']):.2f}) | "
             f"{str(row['explanation'])}"
         )
         for row in rows
@@ -323,13 +372,14 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
         key_terms_text = ", ".join(
             str(term).strip() for term in key_terms[:6] if str(term).strip()
         )
+        source_name = str(row.get("source_name") or row.get("generated_title") or "source").strip()
+        source_type = str(row.get("source_type") or "source").strip()
         source_blocks.append(
             (
-                f"Source {int(row['source_id'])} ({str(row['source_type'])}) "
-                f"[{str(row.get('source_name') or row.get('generated_title') or '').strip()}]\n"
+                f"{source_type.title()} [{source_name}]\n"
                 f"Title: {str(row.get('generated_title') or '').strip()}\n"
-                f"Summary: {_truncate_text(str(row.get('summary_text') or ''), 380)}\n"
-                f"Deep dive: {_truncate_text(str(row.get('deep_dive_text') or ''), 420)}\n"
+                f"Summary: {_truncate_text(str(row.get('summary_text') or ''), 280)}\n"
+                f"Deep dive: {_truncate_text(str(row.get('deep_dive_text') or ''), 320)}\n"
                 f"Key terms: {key_terms_text or 'n/a'}"
             )
         )
@@ -426,6 +476,7 @@ def _build_best_effort_answer(
     source_summaries: list[dict[str, str | int]],
     relationship_insights: list[str],
     generated_learning_context: str,
+    long_form: bool,
 ) -> str:
     summary_fragments = [
         _truncate_text(str(entry.get("summary_text") or ""), 220)
@@ -444,26 +495,31 @@ def _build_best_effort_answer(
     bridge_note = ""
     if relationship_insights:
         bridge_note = _truncate_text(relationship_insights[0].lstrip("- "), 220)
+        if "unrelated" in bridge_note.lower():
+            bridge_note = ""
 
-    background_section = (
-        "**Background and first principles**\n"
-        f"From the available material related to '{query}', "
-        f"{_truncate_text(' '.join(first_principles_bits), 520) if first_principles_bits else 'the core relevant signals are limited but not empty.'}"
+    merged_signal = _truncate_text(' '.join(first_principles_bits), 900 if long_form else 520)
+    direct_response = (
+        f"For your question about '{query}', "
+        f"{merged_signal if merged_signal else 'the available material has limited direct signal, but there are still useful grounded cues.'}"
     )
 
-    reflective_tail = "Focus on how the same mechanism behaves across source contexts and where assumptions change."
+    reflective_tail = "Notice where the mechanism stays the same across contexts and where constraints force a different interpretation."
     if bridge_note:
         reflective_tail = (
             f"A key cross-source bridge is: {bridge_note}. "
-            "Use that bridge to test what stays invariant versus what is context-specific."
+            "Track how this bridge holds up as examples become more specific and assumptions shift."
         )
 
-    reflective_section = (
-        "**Reflective synthesis**\n"
-        f"{reflective_tail}"
-    )
+    if long_form:
+        return (
+            f"{direct_response}\n\n"
+            "To go deeper, trace the causal chain step by step, identify which assumptions are fixed, "
+            "and check what breaks when those assumptions are relaxed.\n\n"
+            f"{reflective_tail}"
+        ).strip()
 
-    return f"{background_section}\n\n{reflective_section}".strip()
+    return f"{direct_response}\n\n{reflective_tail}".strip()
 
 
 def _run_unified_completion(
@@ -471,12 +527,20 @@ def _run_unified_completion(
     retrieved_context: RetrievedContext,
     recent_turns: list[InteractionTurnRecord],
     generated_learning_context: str,
+    long_form: bool,
     user_id: str,
 ) -> AskModelOutput:
     context_text = build_context_text(retrieved_context)
     recent_turns_json = [turn.model_dump() for turn in recent_turns]
 
     user_prompt = (
+        "Priority instruction: answer the user query directly in the opening sentence, then give only essential grounded support.\n"
+        + (
+            "Provide a deeper and longer answer (approximately 3-5 substantial paragraphs) with mechanism-level explanation in plain language.\n\n"
+            if long_form
+            else "\n"
+        )
+        +
         f"User query:\n{query}\n\n"
         f"Generated learning context:\n{generated_learning_context or '[None available]'}\n\n"
         f"Retrieved grounded context:\n{context_text}\n\n"
@@ -515,11 +579,12 @@ def _run_summary_completion(
     relationship_insights: list[str],
     recent_turns: list[InteractionTurnRecord],
     generated_learning_context: str,
+    long_form: bool,
     user_id: str,
 ) -> AskModelOutput:
     summary_lines = [
         (
-            f"- Source {entry['source_id']} ({entry['source_type']}): "
+            f"- {str(entry['source_type']).title()} material: "
             f"{str(entry['summary_text'])}"
         )
         for entry in source_summaries
@@ -529,6 +594,13 @@ def _run_summary_completion(
     recent_turns_json = [turn.model_dump() for turn in recent_turns]
 
     user_prompt = (
+        "Priority instruction: answer the user query directly in the opening sentence, then give only essential grounded support.\n"
+        + (
+            "Provide a deeper and longer answer (approximately 3-5 substantial paragraphs) with mechanism-level explanation in plain language.\n\n"
+            if long_form
+            else "\n"
+        )
+        +
         f"User query:\n{query}\n\n"
         f"Generated learning context:\n{generated_learning_context or '[None available]'}\n\n"
         f"High-level source summaries:\n{summary_text}\n\n"
@@ -592,22 +664,28 @@ def handle_user_query(
             raise ValueError("session_id source_ids do not match the existing session context.")
 
     recent_turns = state.turns[-MAX_PROMPT_TURNS:]
+    expanded_query = _expand_followup_query(normalized_query, recent_turns)
+    long_form = _wants_long_form(normalized_query)
     concept_ids: list[str] = []
     retrieved_context: RetrievedContext | None = None
     source_summaries = _load_source_summaries(normalized_source_ids, user_id)
-    generated_learning_context = _load_generated_learning_context(normalized_source_ids, user_id)
+    generated_learning_context = ""
+    if _should_include_generated_context(expanded_query):
+        generated_learning_context = _load_generated_learning_context(normalized_source_ids, user_id)
     relationship_insights = _load_relationship_insights(normalized_source_ids, user_id)
-    is_broad_query = _is_broad_query(normalized_query)
+    is_broad_query = _is_broad_query(expanded_query)
+    effective_top_k = max(4, min(top_k, 8 if long_form else 6))
 
     has_context_signal = bool(source_summaries) or _has_meaningful_text(generated_learning_context)
 
     if is_broad_query and has_context_signal:
         model_output = _run_summary_completion(
-            query=normalized_query,
+            query=expanded_query,
             source_summaries=source_summaries,
             relationship_insights=relationship_insights,
             recent_turns=recent_turns,
             generated_learning_context=generated_learning_context,
+            long_form=long_form,
             user_id=user_id,
         )
         answer = (model_output.answer or "").strip()
@@ -615,19 +693,20 @@ def handle_user_query(
     else:
         try:
             retrieved_context = retrieve_context(
-                query=normalized_query,
+                query=expanded_query,
                 source_ids=normalized_source_ids,
                 user_id=user_id,
-                top_k=top_k,
+                top_k=effective_top_k,
             )
         except ValueError:
             if has_context_signal:
                 model_output = _run_summary_completion(
-                    query=normalized_query,
+                    query=expanded_query,
                     source_summaries=source_summaries,
                     relationship_insights=relationship_insights,
                     recent_turns=recent_turns,
                     generated_learning_context=generated_learning_context,
+                    long_form=long_form,
                     user_id=user_id,
                 )
                 answer = (model_output.answer or "").strip()
@@ -638,10 +717,11 @@ def handle_user_query(
         else:
             concept_ids = retrieved_context.concept_ids
             model_output = _run_unified_completion(
-                query=normalized_query,
+                query=expanded_query,
                 retrieved_context=retrieved_context,
                 recent_turns=recent_turns,
                 generated_learning_context=generated_learning_context,
+                long_form=long_form,
                 user_id=user_id,
             )
             answer = (model_output.answer or "").strip()
@@ -649,11 +729,12 @@ def handle_user_query(
 
             if _is_insufficient_answer(answer) and has_context_signal:
                 summary_retry = _run_summary_completion(
-                    query=normalized_query,
+                    query=expanded_query,
                     source_summaries=source_summaries,
                     relationship_insights=relationship_insights,
                     recent_turns=recent_turns,
                     generated_learning_context=generated_learning_context,
+                    long_form=long_form,
                     user_id=user_id,
                 )
                 retried_answer = (summary_retry.answer or "").strip()
@@ -668,10 +749,11 @@ def handle_user_query(
 
     if _is_insufficient_answer(answer) and has_context_signal:
         answer = _build_best_effort_answer(
-            query=normalized_query,
+            query=expanded_query,
             source_summaries=source_summaries,
             relationship_insights=relationship_insights,
             generated_learning_context=generated_learning_context,
+            long_form=long_form,
         )
 
     if not follow_up_question:

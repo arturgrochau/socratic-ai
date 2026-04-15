@@ -13,6 +13,7 @@ from app.models import (
     CombinedQuizSection,
     GenerateTailoredLearningResponse,
     InsightIntersection,
+    KeyTermExplanation,
     QuizQuestion,
     ReflectionPoint,
     SourceLearningSection,
@@ -41,9 +42,10 @@ from prompts.source_deep_dive import (
     SOURCE_DEEP_DIVE_SYSTEM_PROMPT,
 )
 from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_PROMPT
+from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 4
+GENERATION_SCHEMA_VERSION = 5
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 
@@ -89,6 +91,18 @@ def ensure_generation_tables() -> None:
         if "source_name" not in source_columns:
             connection.execute(
                 text("ALTER TABLE source_learning_sections ADD COLUMN source_name TEXT DEFAULT ''")
+            )
+        if "under_surface_text" not in source_columns:
+            connection.execute(
+                text("ALTER TABLE source_learning_sections ADD COLUMN under_surface_text TEXT DEFAULT ''")
+            )
+        if "diagnostic_checklist_json" not in source_columns:
+            connection.execute(
+                text("ALTER TABLE source_learning_sections ADD COLUMN diagnostic_checklist_json TEXT DEFAULT '[]'")
+            )
+        if "key_term_explanations_json" not in source_columns:
+            connection.execute(
+                text("ALTER TABLE source_learning_sections ADD COLUMN key_term_explanations_json TEXT DEFAULT '[]'")
             )
 
         connection.execute(
@@ -404,6 +418,69 @@ def _generate_reflection_points(
     return points
 
 
+def _generate_under_surface_pack(
+    *,
+    summary_text: str,
+    deep_dive_text: str,
+    key_terms: list[str],
+    source_type: str,
+    grounding_chunks: list[str],
+    user_id: str,
+) -> tuple[str, list[str], list[KeyTermExplanation]]:
+    chunk_text = "\n\n".join(grounding_chunks[:6]) if grounding_chunks else "[No grounding chunks available]"
+    completion = openai_client.chat.completions.create(
+        model=GENERATION_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": UNDER_SURFACE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Source type: {source_type}\n\n"
+                    f"Summary:\n{summary_text}\n\n"
+                    f"Deep dive:\n{deep_dive_text}\n\n"
+                    f"Key terms: {', '.join(key_terms[:10])}\n\n"
+                    f"Grounding chunks:\n{chunk_text}"
+                ),
+            },
+        ],
+        response_format={"type": "json_schema", "json_schema": UNDER_SURFACE_JSON_SCHEMA},
+    )
+    log_api_usage(
+        response=completion,
+        user_id=user_id,
+        call_stage="generation",
+        model_name=GENERATION_MODEL,
+    )
+
+    content = completion.choices[0].message.content
+    if not content:
+        raise ValueError("Model returned empty under-surface content.")
+
+    payload = json.loads(content)
+    under_surface_explainer = str(payload.get("under_surface_explainer") or "").strip()
+    diagnostic_checklist = [
+        str(item).strip()
+        for item in payload.get("diagnostic_checklist", [])
+        if str(item).strip()
+    ]
+    key_term_explanations: list[KeyTermExplanation] = []
+    for entry in payload.get("key_term_explanations", []):
+        try:
+            key_term_explanations.append(KeyTermExplanation.model_validate(entry))
+        except Exception:
+            continue
+
+    if not under_surface_explainer:
+        raise ValueError("Model returned empty under-surface explainer text.")
+    if len(diagnostic_checklist) < 4:
+        raise ValueError("Model returned too few diagnostic checklist points.")
+    if len(key_term_explanations) < 4:
+        raise ValueError("Model returned too few key-term explanations.")
+
+    return under_surface_explainer, diagnostic_checklist, key_term_explanations
+
+
 def _store_source_learning_section(section: SourceLearningSection, user_id: str) -> None:
     with db_engine.begin() as connection:
         connection.execute(
@@ -419,6 +496,9 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     reflection_points_json,
                     deep_dive_text,
                     key_terms_json,
+                    under_surface_text,
+                    diagnostic_checklist_json,
+                    key_term_explanations_json,
                     schema_version,
                     model_name
                 ) VALUES (
@@ -431,6 +511,9 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     :reflection_points_json,
                     :deep_dive_text,
                     :key_terms_json,
+                    :under_surface_text,
+                    :diagnostic_checklist_json,
+                    :key_term_explanations_json,
                     :schema_version,
                     :model_name
                 )
@@ -442,6 +525,9 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     reflection_points_json = excluded.reflection_points_json,
                     deep_dive_text = excluded.deep_dive_text,
                     key_terms_json = excluded.key_terms_json,
+                    under_surface_text = excluded.under_surface_text,
+                    diagnostic_checklist_json = excluded.diagnostic_checklist_json,
+                    key_term_explanations_json = excluded.key_term_explanations_json,
                     schema_version = excluded.schema_version,
                     model_name = excluded.model_name,
                     updated_at = CURRENT_TIMESTAMP
@@ -460,6 +546,12 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                 ),
                 "deep_dive_text": section.deep_dive_text,
                 "key_terms_json": json.dumps(section.key_terms, ensure_ascii=True),
+                "under_surface_text": section.under_surface_explainer,
+                "diagnostic_checklist_json": json.dumps(section.diagnostic_checklist, ensure_ascii=True),
+                "key_term_explanations_json": json.dumps(
+                    [entry.model_dump() for entry in section.key_term_explanations],
+                    ensure_ascii=True,
+                ),
                 "schema_version": section.schema_version,
                 "model_name": section.model_name,
             },
@@ -480,6 +572,9 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
                     reflection_points_json,
                     deep_dive_text,
                     key_terms_json,
+                    under_surface_text,
+                    diagnostic_checklist_json,
+                    key_term_explanations_json,
                     model_name,
                     schema_version
                 FROM source_learning_sections
@@ -519,7 +614,20 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
     key_terms_raw = json.loads(str(row["key_terms_json"] or "[]"))
     key_terms = [str(term).strip() for term in key_terms_raw if str(term).strip()]
 
-    if not reflection_points or not key_terms:
+    diagnostic_checklist_raw = json.loads(str(row.get("diagnostic_checklist_json") or "[]"))
+    diagnostic_checklist = [str(item).strip() for item in diagnostic_checklist_raw if str(item).strip()]
+
+    key_term_explanations_raw = json.loads(str(row.get("key_term_explanations_json") or "[]"))
+    key_term_explanations: list[KeyTermExplanation] = []
+    for entry in key_term_explanations_raw:
+        try:
+            key_term_explanations.append(KeyTermExplanation.model_validate(entry))
+        except Exception:
+            continue
+
+    under_surface_explainer = str(row.get("under_surface_text") or "").strip()
+
+    if not reflection_points or not key_terms or not under_surface_explainer:
         return None
 
     return SourceLearningSection(
@@ -530,6 +638,9 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
         summary_text=str(row["summary_text"]),
         deep_dive_text=str(row["deep_dive_text"] or "").strip(),
         key_terms=key_terms,
+        under_surface_explainer=under_surface_explainer,
+        diagnostic_checklist=diagnostic_checklist,
+        key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
         model_name=str(row["model_name"]),
         schema_version=int(row["schema_version"]),
@@ -566,6 +677,14 @@ def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearni
         source_type,
         user_id,
     )
+    under_surface_explainer, diagnostic_checklist, key_term_explanations = _generate_under_surface_pack(
+        summary_text=summary_text,
+        deep_dive_text=deep_dive_text,
+        key_terms=key_terms,
+        source_type=source_type,
+        grounding_chunks=grounding_chunks,
+        user_id=user_id,
+    )
 
     section = SourceLearningSection(
         source_id=source_id,
@@ -575,6 +694,9 @@ def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearni
         summary_text=summary_text,
         deep_dive_text=deep_dive_text,
         key_terms=key_terms,
+        under_surface_explainer=under_surface_explainer,
+        diagnostic_checklist=diagnostic_checklist,
+        key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
         model_name=GENERATION_MODEL,
         schema_version=GENERATION_SCHEMA_VERSION,

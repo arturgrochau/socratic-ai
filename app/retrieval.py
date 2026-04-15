@@ -18,10 +18,12 @@ from config import RETRIEVAL_MODEL, chroma_client, db_engine, openai_client
 
 COLLECTION_NAME = "interaction_retrieval_concepts"
 EMBEDDING_BATCH_SIZE = 64
-QUERY_MULTIPLIER = 3
+QUERY_MULTIPLIER = 2
 RAW_PRIORITY_RATIO = 0.67
-MAX_CONTEXT_CHARS = 12000
-MAX_HIT_TEXT_CHARS = 520
+MAX_CONTEXT_CHARS = 9000
+MAX_HIT_TEXT_CHARS = 380
+MIN_CONCEPT_HIT_SCORE = 0.56
+MIN_RAW_HIT_SCORE = 0.53
 
 CONCEPT_FIELD_TYPES = {"term", "definition", "key_idea"}
 RAW_FIELD_TYPE = "raw_chunk"
@@ -509,6 +511,12 @@ def retrieve_context(query: str, source_ids: list[int], user_id: str, top_k: int
                 )
             )
 
+    strong_concept_hits = [hit for hit in candidate_concept_hits if hit.score >= MIN_CONCEPT_HIT_SCORE]
+    strong_raw_hits = [hit for hit in candidate_raw_hits if hit.score >= MIN_RAW_HIT_SCORE]
+    if strong_concept_hits or strong_raw_hits:
+        candidate_concept_hits = strong_concept_hits
+        candidate_raw_hits = strong_raw_hits
+
     if not candidate_concept_hits and not candidate_raw_hits:
         raise ValueError("No retrieval context found for the provided query and sources.")
 
@@ -632,16 +640,20 @@ def build_context_text(retrieved_context: RetrievedContext, max_chars: int = MAX
     )
 
     concepts_by_id: dict[str, list[str]] = defaultdict(list)
+    concept_label_map: dict[str, str] = {}
     for hit in concept_hits:
         concepts_by_id[str(hit.concept_id)].append(
             f"- ({hit.field_type}, score={hit.score:.3f}) {_truncate_hit_text(hit.text)}"
         )
+        if hit.field_type == "term" and hit.concept_id and hit.concept_id not in concept_label_map:
+            concept_label_map[str(hit.concept_id)] = _truncate_hit_text(hit.text, 120)
 
     concept_blocks: list[str] = []
     for concept_id in retrieved_context.concept_ids:
         concept_lines = concepts_by_id.get(concept_id, [])
         if concept_lines:
-            concept_blocks.append(f"Concept {concept_id}\n" + "\n".join(concept_lines))
+            concept_label = concept_label_map.get(concept_id, "related concept")
+            concept_blocks.append(f"Concept: {concept_label}\n" + "\n".join(concept_lines))
 
     concept_section, remaining_chars = _build_limited_section(
         "Structured Concepts:",
@@ -651,7 +663,8 @@ def build_context_text(retrieved_context: RetrievedContext, max_chars: int = MAX
 
     relationship_lines = [
         (
-            f"- {edge.source_concept_id} -> {edge.target_concept_id}: "
+            f"- {concept_label_map.get(edge.source_concept_id, 'related concept')} -> "
+            f"{concept_label_map.get(edge.target_concept_id, 'related concept')}: "
             f"{edge.relation_type} (confidence={edge.confidence:.2f}) | {_truncate_hit_text(edge.explanation, 280)}"
         )
         for edge in retrieved_context.relationships
