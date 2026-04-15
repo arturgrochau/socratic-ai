@@ -7,6 +7,7 @@ from sqlalchemy import text
 from app.cost_logging import log_api_usage
 from app.linking import link_source_pair
 from app.models import (
+    ApplicationScenario,
     AttributedSentence,
     CombinedInsightSection,
     CombinedQuizSection,
@@ -23,6 +24,14 @@ from prompts.combined_insights import (
     COMBINED_INSIGHTS_SYSTEM_PROMPT,
 )
 from prompts.combined_quiz import COMBINED_QUIZ_JSON_SCHEMA, COMBINED_QUIZ_SYSTEM_PROMPT
+from prompts.comparative_analysis import (
+    COMPARATIVE_ANALYSIS_JSON_SCHEMA,
+    COMPARATIVE_ANALYSIS_SYSTEM_PROMPT,
+)
+from prompts.application_scenarios import (
+    APPLICATION_SCENARIOS_JSON_SCHEMA,
+    APPLICATION_SCENARIOS_SYSTEM_PROMPT,
+)
 from prompts.socratic_reflection import (
     SOCRATIC_REFLECTION_JSON_SCHEMA,
     SOCRATIC_REFLECTION_SYSTEM_PROMPT,
@@ -34,7 +43,7 @@ from prompts.source_deep_dive import (
 from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 3
+GENERATION_SCHEMA_VERSION = 4
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 
@@ -126,6 +135,18 @@ def ensure_generation_tables() -> None:
         if "intersections_json" not in combined_columns:
             connection.execute(
                 text("ALTER TABLE combined_learning_sections ADD COLUMN intersections_json TEXT DEFAULT '[]'")
+            )
+        if "comparative_analysis_text" not in combined_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE combined_learning_sections ADD COLUMN comparative_analysis_text TEXT DEFAULT ''"
+                )
+            )
+        if "application_scenarios_json" not in combined_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE combined_learning_sections ADD COLUMN application_scenarios_json TEXT DEFAULT '[]'"
+                )
             )
 
         connection.execute(
@@ -830,6 +851,105 @@ def _generate_combined_quiz(
     )
 
 
+def _generate_comparative_analysis(
+    video_section: SourceLearningSection,
+    document_sections: list[SourceLearningSection],
+    insights_section: CombinedInsightSection,
+    relationship_insights: list[str],
+    user_id: str,
+) -> str:
+    payload = {
+        "video": video_section.model_dump(),
+        "documents": [section.model_dump() for section in document_sections],
+        "insights": insights_section.model_dump(),
+        "relationship_insights": relationship_insights,
+    }
+
+    completion = openai_client.chat.completions.create(
+        model=GENERATION_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": COMPARATIVE_ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Generate one comparative deepening analysis from this payload:\n\n"
+                    f"{json.dumps(payload, ensure_ascii=True)}"
+                ),
+            },
+        ],
+        response_format={"type": "json_schema", "json_schema": COMPARATIVE_ANALYSIS_JSON_SCHEMA},
+    )
+    log_api_usage(
+        response=completion,
+        user_id=user_id,
+        call_stage="generation",
+        model_name=GENERATION_MODEL,
+    )
+
+    content = completion.choices[0].message.content
+    if not content:
+        raise ValueError("Model returned empty comparative analysis content.")
+
+    result = json.loads(content)
+    comparative_analysis = str(result.get("comparative_analysis", "")).strip()
+    if not comparative_analysis:
+        raise ValueError("Model returned empty comparative analysis text.")
+
+    return comparative_analysis
+
+
+def _generate_application_scenarios(
+    video_section: SourceLearningSection,
+    document_sections: list[SourceLearningSection],
+    insights_section: CombinedInsightSection,
+    relationship_insights: list[str],
+    user_id: str,
+) -> list[ApplicationScenario]:
+    payload = {
+        "video": video_section.model_dump(),
+        "documents": [section.model_dump() for section in document_sections],
+        "insights": insights_section.model_dump(),
+        "relationship_insights": relationship_insights,
+    }
+
+    completion = openai_client.chat.completions.create(
+        model=GENERATION_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": APPLICATION_SCENARIOS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Generate grounded application scenarios from this payload:\n\n"
+                    f"{json.dumps(payload, ensure_ascii=True)}"
+                ),
+            },
+        ],
+        response_format={"type": "json_schema", "json_schema": APPLICATION_SCENARIOS_JSON_SCHEMA},
+    )
+    log_api_usage(
+        response=completion,
+        user_id=user_id,
+        call_stage="generation",
+        model_name=GENERATION_MODEL,
+    )
+
+    content = completion.choices[0].message.content
+    if not content:
+        raise ValueError("Model returned empty application scenarios content.")
+
+    result = json.loads(content)
+    scenarios = [
+        ApplicationScenario.model_validate(item)
+        for item in result.get("application_scenarios", [])
+    ]
+    if len(scenarios) < 2:
+        raise ValueError("Model returned too few application scenarios.")
+
+    return scenarios
+
+
 def _store_combined_learning_sections(
     *,
     user_id: str,
@@ -850,6 +970,8 @@ def _store_combined_learning_sections(
                     parallels_json,
                     layman_bridge,
                     synthesis_text,
+                    comparative_analysis_text,
+                    application_scenarios_json,
                     quiz_json,
                     schema_version,
                     model_name
@@ -861,6 +983,8 @@ def _store_combined_learning_sections(
                     :parallels_json,
                     :layman_bridge,
                     :synthesis_text,
+                    :comparative_analysis_text,
+                    :application_scenarios_json,
                     :quiz_json,
                     :schema_version,
                     :model_name
@@ -870,6 +994,8 @@ def _store_combined_learning_sections(
                     parallels_json = excluded.parallels_json,
                     layman_bridge = excluded.layman_bridge,
                     synthesis_text = excluded.synthesis_text,
+                    comparative_analysis_text = excluded.comparative_analysis_text,
+                    application_scenarios_json = excluded.application_scenarios_json,
                     quiz_json = excluded.quiz_json,
                     schema_version = excluded.schema_version,
                     model_name = excluded.model_name,
@@ -890,6 +1016,11 @@ def _store_combined_learning_sections(
                 ),
                 "layman_bridge": insights.layman_bridge,
                 "synthesis_text": insights.synthesis_text,
+                "comparative_analysis_text": insights.comparative_analysis,
+                "application_scenarios_json": json.dumps(
+                    [entry.model_dump() for entry in insights.application_scenarios],
+                    ensure_ascii=True,
+                ),
                 "quiz_json": json.dumps(quiz.model_dump(), ensure_ascii=True),
                 "schema_version": GENERATION_SCHEMA_VERSION,
                 "model_name": GENERATION_MODEL,
@@ -912,6 +1043,8 @@ def _load_cached_combined_learning_sections(
                     parallels_json,
                     layman_bridge,
                     synthesis_text,
+                    comparative_analysis_text,
+                    application_scenarios_json,
                     quiz_json,
                     model_name,
                     schema_version
@@ -969,6 +1102,17 @@ def _load_cached_combined_learning_sections(
     if not layman_bridge or not synthesis_text:
         return None
 
+    comparative_analysis = str(row.get("comparative_analysis_text") or "").strip()
+    raw_application_scenarios = json.loads(str(row.get("application_scenarios_json") or "[]"))
+    application_scenarios: list[ApplicationScenario] = []
+    for entry in raw_application_scenarios:
+        try:
+            application_scenarios.append(ApplicationScenario.model_validate(entry))
+        except Exception:
+            continue
+    if not comparative_analysis or len(application_scenarios) < 2:
+        return None
+
     quiz_payload = json.loads(str(row["quiz_json"] or "{}"))
     try:
         quiz_section = CombinedQuizSection.model_validate(quiz_payload)
@@ -980,6 +1124,8 @@ def _load_cached_combined_learning_sections(
         parallels=parallels,
         layman_bridge=layman_bridge,
         synthesis_text=synthesis_text,
+        comparative_analysis=comparative_analysis,
+        application_scenarios=application_scenarios,
         model_name=str(row["model_name"]),
         schema_version=int(row["schema_version"]),
     )
@@ -1039,6 +1185,26 @@ def generate_tailored_learning(
             insights_section=insights_section,
             relationship_insights=relationship_insights,
             user_id=user_id,
+        )
+        comparative_analysis = _generate_comparative_analysis(
+            video_section=video_section,
+            document_sections=document_sections,
+            insights_section=insights_section,
+            relationship_insights=relationship_insights,
+            user_id=user_id,
+        )
+        application_scenarios = _generate_application_scenarios(
+            video_section=video_section,
+            document_sections=document_sections,
+            insights_section=insights_section,
+            relationship_insights=relationship_insights,
+            user_id=user_id,
+        )
+        insights_section = insights_section.model_copy(
+            update={
+                "comparative_analysis": comparative_analysis,
+                "application_scenarios": application_scenarios,
+            }
         )
         _store_combined_learning_sections(
             user_id=user_id,

@@ -220,13 +220,22 @@ class InsightIntersection(BaseModel):
     inference_label: Literal["inferred_extension"] | None = None
 
 
+class ApplicationScenario(BaseModel):
+    scenario_title: str
+    scenario_prompt: str
+    transfer_steps: list[str]
+    common_pitfall: str
+
+
 class CombinedInsightSection(BaseModel):
     intersections: list[InsightIntersection]
     parallels: list[AttributedSentence] = Field(default_factory=list)
     layman_bridge: str
     synthesis_text: str
+    comparative_analysis: str = ""
+    application_scenarios: list[ApplicationScenario] = Field(default_factory=list)
     model_name: str
-    schema_version: int = 3
+    schema_version: int = 4
 
 
 class QuizQuestion(BaseModel):

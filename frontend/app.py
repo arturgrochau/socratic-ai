@@ -12,14 +12,6 @@ import streamlit as st
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 REQUEST_TIMEOUT = 300
 DOCUMENT_COLORS = ["green", "blue", "orange", "violet", "gray"]
-SOURCE_COLOR_DOTS = {
-    "red": "🔴",
-    "green": "🟢",
-    "blue": "🔵",
-    "orange": "🟠",
-    "violet": "🟣",
-    "gray": "⚪",
-}
 SOURCE_COLOR_HEX = {
     "red": "#ef4444",
     "green": "#22c55e",
@@ -376,44 +368,81 @@ def _render_source_legend(video_payload: dict, document_payloads: list[dict]) ->
             )
 
 
-def _render_highlighted_sentence(sentence_text: str, color_name: str) -> None:
-    safe_text = html.escape(sentence_text)
-    color_hex = SOURCE_COLOR_HEX.get(color_name, "#9ca3af")
-    st.markdown(
-        (
-            "<div style='padding:8px 10px;margin:6px 0;border-radius:8px;"
-            f"background:{color_hex}1A;border-left:4px solid {color_hex};'>"
-            f"{safe_text}"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
+def _collect_emphasis_terms(
+    attributed_sentences: list[dict],
+    *,
+    limit: int = 12,
+) -> list[str]:
+    keyword_pool: list[str] = []
+    seen_keywords: set[str] = set()
+
+    for item in attributed_sentences:
+        if not isinstance(item, dict):
+            continue
+
+        emphasis_terms = [
+            str(term).strip()
+            for term in (item.get("emphasis_terms", []) or [])
+            if str(term).strip()
+        ]
+        for term in emphasis_terms:
+            lowered = term.lower()
+            if lowered in seen_keywords:
+                continue
+            seen_keywords.add(lowered)
+            keyword_pool.append(term)
+            if len(keyword_pool) >= limit:
+                return keyword_pool
+
+    return keyword_pool
 
 
-def _render_attributed_sentence(
-    item: dict,
+def _bold_keywords_in_text(text_value: str, keywords: list[str]) -> str:
+    highlighted = text_value
+    for keyword in sorted((value for value in keywords if len(value) >= 3), key=len, reverse=True):
+        pattern = re.compile(rf"(?i)(?<![A-Za-z0-9])({re.escape(keyword)})(?![A-Za-z0-9])")
+        highlighted = pattern.sub(lambda match: f"**{match.group(0)}**", highlighted)
+    return highlighted
+
+
+def _render_grouped_evidence(
+    attributed_sentences: list[dict],
     source_style_map: dict[int, tuple[str, str]],
 ) -> None:
-    text_value = str(item.get("text", "")).strip()
-    if not text_value:
+    grouped_quotes: dict[str, list[str]] = {}
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for item in attributed_sentences:
+        if not isinstance(item, dict):
+            continue
+
+        quote_text = " ".join(str(item.get("text", "")).split()).strip()
+        if not quote_text:
+            continue
+
+        source_id = int(item.get("source_id", 0) or 0)
+        _, source_label = source_style_map.get(source_id, ("gray", "Unknown source"))
+        pair_key = (source_label, quote_text)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+
+        if len(quote_text) > 240:
+            quote_text = quote_text[:237].rstrip() + "..."
+
+        grouped_quotes.setdefault(source_label, []).append(quote_text)
+
+    if not grouped_quotes:
         return
 
-    source_id = int(item.get("source_id", 0) or 0)
-    color_name, label = source_style_map.get(source_id, ("gray", "Unknown source"))
-    emphasis_terms = [
-        str(term).strip() for term in (item.get("emphasis_terms", []) or []) if str(term).strip()
-    ]
-
-    safe_text = text_value.replace("[", "(").replace("]", ")")
-    dot = SOURCE_COLOR_DOTS.get(color_name, "•")
-    _render_highlighted_sentence(safe_text, color_name)
-
-    if emphasis_terms:
-        formatted_terms = ", ".join(f"**{term}**" for term in emphasis_terms)
-        st.caption(f"{dot} Source: {label} | Keywords: {formatted_terms}")
-    else:
-        st.caption(f"{dot} Source: {label}")
-
+    with st.expander("Show source-grounded evidence", expanded=False):
+        for source_label, quotes in grouped_quotes.items():
+            st.markdown(f"**{source_label}**")
+            for quote in quotes[:4]:
+                st.markdown(f"- \"{quote}\"")
+            hidden_count = len(quotes) - 4
+            if hidden_count > 0:
+                st.caption(f"+ {hidden_count} more supporting quote(s)")
 
 def _render_ask_tab(has_user_id: bool) -> None:
     if not st.session_state.pipeline_ready:
@@ -432,11 +461,23 @@ def _render_ask_tab(has_user_id: bool) -> None:
         st.warning("Set a user ID in the sidebar to use the chatbox.")
         return
 
-    ask_query = st.chat_input("Ask about concepts, intersections, or quiz reasoning...")
-    if not ask_query:
+    st.caption("Type your question below, then click Send.")
+    with st.form(key="socratic_chat_form", clear_on_submit=True):
+        ask_query = st.text_area(
+            "Ask about concepts, intersections, quiz reasoning, or practical applications",
+            height=130,
+            key="socratic_chat_text",
+            placeholder="Example: Explain the strongest intersection and how I could apply it in a real project.",
+        )
+        submitted = st.form_submit_button("Send")
+
+    if not submitted:
         return
 
-    st.session_state.dashboard_section = "Socratic Chatbox"
+    ask_query = ask_query.strip()
+    if not ask_query:
+        st.warning("Enter a question before sending.")
+        return
 
     st.session_state.ask_messages.append({"role": "user", "content": ask_query})
     with st.chat_message("user"):
@@ -518,7 +559,8 @@ def _render_generation_tabs(has_user_id: bool) -> None:
 
     if selected_section == "Cross-Source Synthesis & Assessment":
         st.markdown("### Cross-Source Connections")
-        _render_source_legend(video_payload, document_payloads)
+        with st.expander("Source legend", expanded=False):
+            _render_source_legend(video_payload, document_payloads)
 
         intersections = insights_payload.get("intersections", []) or []
         if intersections:
@@ -532,15 +574,26 @@ def _render_generation_tabs(has_user_id: bool) -> None:
 
                 with st.container(border=True):
                     st.markdown(f"#### {title or f'Intersection {index}'}")
-                    if why_it_matters:
-                        st.markdown(f"**Why it matters:** {why_it_matters}")
-                    if integrated_explanation:
-                        st.markdown(integrated_explanation)
 
-                    attributed_sentences = intersection.get("attributed_sentences", []) or []
-                    for item in attributed_sentences:
-                        if isinstance(item, dict):
-                            _render_attributed_sentence(item, source_style_map)
+                    attributed_sentences = [
+                        item
+                        for item in (intersection.get("attributed_sentences", []) or [])
+                        if isinstance(item, dict)
+                    ]
+                    emphasis_terms = _collect_emphasis_terms(attributed_sentences)
+
+                    if why_it_matters:
+                        st.markdown(
+                            f"**Why it matters:** {_bold_keywords_in_text(why_it_matters, emphasis_terms)}"
+                        )
+                    if integrated_explanation:
+                        st.markdown(_bold_keywords_in_text(integrated_explanation, emphasis_terms))
+
+                    if emphasis_terms:
+                        concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
+                        st.caption(f"Key concepts: {concept_list}")
+
+                    _render_grouped_evidence(attributed_sentences, source_style_map)
 
                     inferred_extension = str(intersection.get("inferred_extension") or "").strip()
                     inference_label = str(intersection.get("inference_label") or "").strip()
@@ -552,9 +605,12 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             if parallels:
                 with st.container(border=True):
                     st.markdown("#### Core Cross-Source Intersection")
-                    for item in parallels:
-                        if isinstance(item, dict):
-                            _render_attributed_sentence(item, source_style_map)
+                    normalized_parallels = [item for item in parallels if isinstance(item, dict)]
+                    emphasis_terms = _collect_emphasis_terms(normalized_parallels)
+                    if emphasis_terms:
+                        concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
+                        st.caption(f"Key concepts: {concept_list}")
+                    _render_grouped_evidence(normalized_parallels, source_style_map)
             else:
                 st.write("No intersections available.")
 
@@ -566,6 +622,33 @@ def _render_generation_tabs(has_user_id: bool) -> None:
         if synthesis_text:
             st.markdown("### Synthesis")
             st.markdown(synthesis_text)
+
+        comparative_analysis = str(insights_payload.get("comparative_analysis") or "").strip()
+        if comparative_analysis:
+            st.markdown("### Comparative Deepening")
+            st.markdown(comparative_analysis)
+
+        application_scenarios = insights_payload.get("application_scenarios", []) or []
+        if application_scenarios:
+            st.markdown("### Application Scenarios")
+            for index, scenario in enumerate(application_scenarios, start=1):
+                if not isinstance(scenario, dict):
+                    continue
+                scenario_title = str(scenario.get("scenario_title") or f"Scenario {index}").strip()
+                scenario_prompt = str(scenario.get("scenario_prompt") or "").strip()
+                transfer_steps = scenario.get("transfer_steps") or []
+                common_pitfall = str(scenario.get("common_pitfall") or "").strip()
+
+                with st.container(border=True):
+                    st.markdown(f"#### {scenario_title}")
+                    if scenario_prompt:
+                        st.markdown(f"**Prompt:** {scenario_prompt}")
+                    if transfer_steps:
+                        st.markdown("**Transfer steps**")
+                        for step_index, step_text in enumerate(transfer_steps, start=1):
+                            st.markdown(f"{step_index}. {step_text}")
+                    if common_pitfall:
+                        st.warning(f"Common pitfall: {common_pitfall}")
 
         st.markdown("### Knowledge Check")
         questions = quiz_payload.get("questions", []) or []
@@ -625,6 +708,15 @@ def main() -> None:
         value=st.session_state.user_id,
         help="Every API request includes this value in the X-User-ID header.",
     ).strip()
+
+    show_sidebar_reset = st.session_state.wizard_step > 1 or st.session_state.pipeline_ready
+    if show_sidebar_reset:
+        st.sidebar.markdown("---")
+        if st.sidebar.button("Reset build setup", use_container_width=True):
+            _reset_builder()
+            st.rerun()
+        st.sidebar.caption("Start over with a new video/document set.")
+
     has_user_id = bool(st.session_state.user_id)
     if not st.session_state.user_id:
         st.warning("User ID is required. Set it in the sidebar before running requests.")
@@ -701,21 +793,16 @@ def main() -> None:
             for upload in selected_documents:
                 st.markdown(f"- {upload['name']}")
 
-        col_back, col_generate = st.columns(2)
-        with col_back:
-            if st.button("Back to documents"):
-                st.session_state.wizard_step = 2
-                st.rerun()
-        with col_generate:
-            generate_clicked = st.button(
-                "Generate tailored Socratic learning",
-                type="primary",
-                disabled=(
-                    not has_user_id
-                    or st.session_state.wizard_video_upload is None
-                    or not st.session_state.wizard_document_uploads
-                ),
-            )
+        generate_clicked = st.button(
+            "Generate tailored Socratic learning",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                not has_user_id
+                or st.session_state.wizard_video_upload is None
+                or not st.session_state.wizard_document_uploads
+            ),
+        )
 
         if generate_clicked:
             stage_placeholder = st.empty()
@@ -739,10 +826,6 @@ def main() -> None:
     if st.session_state.pipeline_ready:
         st.header("Learning Dashboard")
         _render_generation_tabs(has_user_id)
-
-        if st.button("Start a new build"):
-            _reset_builder()
-            st.rerun()
 
 
 if __name__ == "__main__":

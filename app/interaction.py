@@ -117,6 +117,15 @@ def _has_meaningful_text(value: str) -> bool:
     return bool(value and value.strip() and value.strip() != "[None available]")
 
 
+def _is_insufficient_answer(value: str) -> bool:
+    normalized = value.strip().lower()
+    if not normalized:
+        return True
+    if normalized == INSUFFICIENT_CONTEXT_ANSWER.lower():
+        return True
+    return "don't have enough information" in normalized and "provided materials" in normalized
+
+
 def _is_broad_query(query: str) -> bool:
     lowered_query = query.lower().strip()
     if not lowered_query:
@@ -332,7 +341,15 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
         combined_candidates = connection.execute(
             text(
                 """
-                SELECT video_source_id, document_source_ids_json, intersections_json, layman_bridge, synthesis_text, quiz_json
+                SELECT
+                    video_source_id,
+                    document_source_ids_json,
+                    intersections_json,
+                    layman_bridge,
+                    synthesis_text,
+                    comparative_analysis_text,
+                    application_scenarios_json,
+                    quiz_json
                 FROM combined_learning_sections
                 WHERE user_id = :user_id
                 ORDER BY updated_at DESC, id DESC
@@ -373,12 +390,27 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
 
         quiz_payload = json.loads(str(combined_row.get("quiz_json") or "{}"))
         study_advice = _truncate_text(str(quiz_payload.get("study_advice") or ""), 320)
+        comparative_analysis = _truncate_text(
+            str(combined_row.get("comparative_analysis_text") or ""),
+            420,
+        )
+
+        scenario_payload = json.loads(str(combined_row.get("application_scenarios_json") or "[]"))
+        scenario_titles: list[str] = []
+        for entry in scenario_payload[:3]:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("scenario_title") or "").strip()
+            if title:
+                scenario_titles.append(title)
 
         combined_block = (
             "Combined synthesis context\n"
             f"Intersections: {', '.join(intersection_titles) if intersection_titles else 'n/a'}\n"
             f"Layman bridge: {_truncate_text(str(combined_row.get('layman_bridge') or ''), 320)}\n"
             f"Synthesis: {_truncate_text(str(combined_row.get('synthesis_text') or ''), 420)}\n"
+            f"Comparative analysis: {comparative_analysis or 'n/a'}\n"
+            f"Application scenarios: {', '.join(scenario_titles) if scenario_titles else 'n/a'}\n"
             f"Study advice: {study_advice or 'n/a'}"
         )
 
@@ -615,10 +647,26 @@ def handle_user_query(
             answer = (model_output.answer or "").strip()
             follow_up_question = (model_output.follow_up_question or "").strip()
 
+            if _is_insufficient_answer(answer) and has_context_signal:
+                summary_retry = _run_summary_completion(
+                    query=normalized_query,
+                    source_summaries=source_summaries,
+                    relationship_insights=relationship_insights,
+                    recent_turns=recent_turns,
+                    generated_learning_context=generated_learning_context,
+                    user_id=user_id,
+                )
+                retried_answer = (summary_retry.answer or "").strip()
+                retried_follow_up = (summary_retry.follow_up_question or "").strip()
+                if retried_answer and not _is_insufficient_answer(retried_answer):
+                    answer = retried_answer
+                    if not follow_up_question and retried_follow_up:
+                        follow_up_question = retried_follow_up
+
     if not answer:
         answer = INSUFFICIENT_CONTEXT_ANSWER
 
-    if answer == INSUFFICIENT_CONTEXT_ANSWER and has_context_signal:
+    if _is_insufficient_answer(answer) and has_context_signal:
         answer = _build_best_effort_answer(
             query=normalized_query,
             source_summaries=source_summaries,
@@ -629,7 +677,7 @@ def handle_user_query(
     if not follow_up_question:
         follow_up_question = None
 
-    if retrieved_context is not None and answer != INSUFFICIENT_CONTEXT_ANSWER:
+    if retrieved_context is not None and not _is_insufficient_answer(answer):
         learning_bridge = _build_learning_bridge(retrieved_context)
         if learning_bridge and learning_bridge not in answer:
             answer = f"{answer}\n\n{learning_bridge}".strip()

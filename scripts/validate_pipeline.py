@@ -251,6 +251,29 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
     if not str(insights.get("synthesis_text", "")).strip():
         raise RuntimeError("Generation payload has no synthesis text.")
 
+    comparative_analysis = str(insights.get("comparative_analysis", "")).strip()
+    if not comparative_analysis:
+        raise RuntimeError("Generation payload has no comparative analysis text.")
+    if len(comparative_analysis) < 280:
+        raise RuntimeError("Comparative analysis text is too short for elaborate mode.")
+
+    application_scenarios = insights.get("application_scenarios") or []
+    if len(application_scenarios) < 2:
+        raise RuntimeError("Generation payload has too few application scenarios.")
+
+    required_scenario_fields = {
+        "scenario_title",
+        "scenario_prompt",
+        "transfer_steps",
+        "common_pitfall",
+    }
+    for scenario in application_scenarios:
+        if not required_scenario_fields.issubset(set(scenario.keys())):
+            raise RuntimeError("Generation payload has a malformed application scenario entry.")
+        transfer_steps = scenario.get("transfer_steps") or []
+        if len(transfer_steps) < 3:
+            raise RuntimeError("Application scenario has too few transfer steps.")
+
     questions = quiz.get("questions") or []
     if len(questions) < 6:
         raise RuntimeError("Generation payload has too few quiz questions.")
@@ -277,6 +300,7 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         "document_count": len(documents),
         "intersection_count": len(intersections),
         "attributed_sentence_count": attributed_sentence_count,
+        "application_scenario_count": len(application_scenarios),
         "quiz_question_count": len(questions),
         "video_key_term_count": len(video_key_terms),
     }

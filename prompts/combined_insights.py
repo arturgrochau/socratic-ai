@@ -8,7 +8,7 @@ Rules:
 4) attributed_sentences must be short sentence-level snippets with valid source attribution.
 5) inferred_extension is allowed only for high-impact conceptual extension and must be clearly labeled with inference_label='inferred_extension'.
 6) Make the layman_bridge practical and easy to apply.
-7) synthesis_text must be elaborate and connect multiple sources in plain language.
+7) synthesis_text must be elaborate, continuous, and non-redundant while connecting multiple sources in plain language.
 8) emphasis_terms should include important keywords for each sentence.
 """.strip()
 
