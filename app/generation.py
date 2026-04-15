@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
+from difflib import SequenceMatcher
 from typing import Any
 
 from sqlalchemy import text
@@ -45,15 +47,25 @@ from prompts.source_deep_dive import (
     SOURCE_DEEP_DIVE_JSON_SCHEMA,
     SOURCE_DEEP_DIVE_SYSTEM_PROMPT,
 )
+from prompts.source_progression_outline import (
+    SOURCE_PROGRESSION_OUTLINE_JSON_SCHEMA,
+    SOURCE_PROGRESSION_OUTLINE_SYSTEM_PROMPT,
+)
 from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_PROMPT
 from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 5
+GENERATION_SCHEMA_VERSION = 6
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
+MAX_UNDER_SURFACE_GROUNDING_CHUNKS = 6
+MAX_UNDER_SURFACE_GROUNDING_CHARS = 7000
+MAX_REFLECTION_GROUNDING_CHUNKS = 6
+MAX_REFLECTION_GROUNDING_CHARS = 7000
 GENERATION_MAX_STAGE_ATTEMPTS = 3
 MAX_STAGE_ERROR_CHARS = 700
+DEDUPLICATION_SIMILARITY_THRESHOLD = 0.9
+DEDUPLICATION_MIN_CHAR_RATIO = 0.35
 
 
 class GenerationStageError(RuntimeError):
@@ -288,17 +300,21 @@ def ensure_generation_tables() -> None:
         )
 
 
-def _normalize_ids(video_source_id: int, document_source_ids: list[int]) -> tuple[int, list[int]]:
-    if video_source_id <= 0:
+def _normalize_ids(
+    video_source_id: int | None,
+    document_source_ids: list[int],
+) -> tuple[int | None, list[int]]:
+    normalized_video_id = video_source_id if (video_source_id or 0) > 0 else None
+    if video_source_id is not None and normalized_video_id is None:
         raise ValueError("video_source_id must be a positive integer.")
 
     normalized_document_ids = sorted(
         {source_id for source_id in document_source_ids if source_id > 0}
     )
-    if not normalized_document_ids:
-        raise ValueError("At least one valid document source_id is required.")
+    if normalized_video_id is None and not normalized_document_ids:
+        raise ValueError("At least one valid source_id is required.")
 
-    return video_source_id, normalized_document_ids
+    return normalized_video_id, normalized_document_ids
 
 
 def _serialize_ids(source_ids: list[int]) -> str:
@@ -342,48 +358,228 @@ def _load_relationship_insights(source_ids: list[int], user_id: str) -> list[str
     ]
 
 
-def _load_grounding_chunks(source_id: int, user_id: str) -> list[str]:
+def _load_grounding_chunk_rows(source_id: int, user_id: str) -> list[dict[str, Any]]:
     with db_engine.connect() as connection:
-        rows = connection.execute(
-            text(
-                """
-                SELECT chunk_type, chunk_index, chunk_text, timestamp_start, timestamp_end, page_number
-                FROM source_text_chunks
-                WHERE user_id = :user_id AND source_id = :source_id
-                ORDER BY chunk_index ASC
-                """
-            ),
-            {"user_id": user_id, "source_id": source_id},
-        ).mappings().all()
+        return list(
+            connection.execute(
+                text(
+                    """
+                    SELECT chunk_type, chunk_index, chunk_text, timestamp_start, timestamp_end, page_number
+                    FROM source_text_chunks
+                    WHERE user_id = :user_id AND source_id = :source_id
+                    ORDER BY chunk_index ASC
+                    """
+                ),
+                {"user_id": user_id, "source_id": source_id},
+            ).mappings().all()
+        )
 
+
+def _format_grounding_entry(row: dict[str, Any]) -> str | None:
+    chunk_text = str(row["chunk_text"] or "").strip()
+    if not chunk_text:
+        return None
+
+    chunk_label = f"{row['chunk_type']} chunk {int(row['chunk_index'])}"
+    if row["chunk_type"] == "transcript":
+        start = row["timestamp_start"]
+        end = row["timestamp_end"]
+        if start is not None and end is not None:
+            chunk_label += f" [{float(start):.1f}s-{float(end):.1f}s]"
+    if row["chunk_type"] == "document":
+        page_number = row["page_number"]
+        if page_number is not None:
+            chunk_label += f" [page {int(page_number)}]"
+
+    return f"[{chunk_label}]\n{chunk_text}"
+
+
+def _evenly_sample_positions(positions: list[int], count: int) -> list[int]:
+    if count <= 0 or not positions:
+        return []
+    if count >= len(positions):
+        return list(positions)
+    if count == 1:
+        return [positions[len(positions) // 2]]
+
+    step = (len(positions) - 1) / (count - 1)
+    sampled = [positions[round(index * step)] for index in range(count)]
+
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for value in sampled:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _compute_distributed_row_positions(total_rows: int, max_chunks: int) -> list[int]:
+    if total_rows <= 0 or max_chunks <= 0:
+        return []
+    if max_chunks >= total_rows:
+        return list(range(total_rows))
+
+    one_third = total_rows // 3
+    two_thirds = (2 * total_rows) // 3
+    segments = [
+        list(range(0, max(one_third, 1))),
+        list(range(max(one_third, 1), max(two_thirds, max(one_third, 1)))),
+        list(range(max(two_thirds, max(one_third, 1)), total_rows)),
+    ]
+
+    base = max_chunks // 3
+    remainder = max_chunks % 3
+    segment_quotas = [base + (1 if index < remainder else 0) for index in range(3)]
+
+    chosen: list[int] = []
+    for segment_positions, quota in zip(segments, segment_quotas):
+        chosen.extend(_evenly_sample_positions(segment_positions, quota))
+
+    seen: set[int] = set()
+    ordered_unique: list[int] = []
+    for value in sorted(chosen):
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered_unique.append(value)
+
+    if len(ordered_unique) < max_chunks:
+        for fallback in _evenly_sample_positions(list(range(total_rows)), total_rows):
+            if fallback in seen:
+                continue
+            seen.add(fallback)
+            ordered_unique.append(fallback)
+            if len(ordered_unique) >= max_chunks:
+                break
+
+    return sorted(ordered_unique[:max_chunks])
+
+
+def _select_distributed_grounding_chunks(
+    rows: list[dict[str, Any]],
+    *,
+    max_chunks: int,
+    max_chars: int,
+) -> tuple[list[str], list[int]]:
+    positions = _compute_distributed_row_positions(len(rows), max_chunks)
     chunks: list[str] = []
+    selected_chunk_indexes: list[int] = []
     consumed_chars = 0
-    for row in rows:
-        chunk_text = str(row["chunk_text"] or "").strip()
-        if not chunk_text:
+
+    for position in positions:
+        if position < 0 or position >= len(rows):
+            continue
+        row = rows[position]
+        entry = _format_grounding_entry(row)
+        if not entry:
             continue
 
-        chunk_label = f"{row['chunk_type']} chunk {int(row['chunk_index'])}"
-        if row["chunk_type"] == "transcript":
-            start = row["timestamp_start"]
-            end = row["timestamp_end"]
-            if start is not None and end is not None:
-                chunk_label += f" [{float(start):.1f}s-{float(end):.1f}s]"
-        if row["chunk_type"] == "document":
-            page_number = row["page_number"]
-            if page_number is not None:
-                chunk_label += f" [page {int(page_number)}]"
-
-        entry = f"[{chunk_label}]\n{chunk_text}"
-        if consumed_chars + len(entry) > MAX_GROUNDING_CHARS and chunks:
-            break
+        if consumed_chars + len(entry) > max_chars and chunks:
+            continue
+        if consumed_chars + len(entry) > max_chars and not chunks:
+            entry = entry[:max_chars]
 
         chunks.append(entry)
+        selected_chunk_indexes.append(int(row["chunk_index"]))
         consumed_chars += len(entry)
-        if len(chunks) >= MAX_GROUNDING_CHUNKS:
+        if len(chunks) >= max_chunks:
             break
 
-    return chunks
+    if not chunks and rows:
+        fallback_entry = _format_grounding_entry(rows[0])
+        if fallback_entry:
+            chunks.append(fallback_entry[:max_chars])
+            selected_chunk_indexes.append(int(rows[0]["chunk_index"]))
+
+    return chunks, selected_chunk_indexes
+
+
+def _generate_source_progression_outline(
+    *,
+    summary_text: str,
+    source_type: str,
+    grounding_chunks: list[str],
+    user_id: str,
+    run_id: str,
+) -> str:
+    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"source_progression_outline:{source_type}",
+        user_id=user_id,
+        system_prompt=SOURCE_PROGRESSION_OUTLINE_SYSTEM_PROMPT,
+        user_prompt=(
+            f"Source type: {source_type}\n\n"
+            f"Summary:\n{summary_text}\n\n"
+            "Distributed grounding chunks:\n"
+            f"{chunk_text}"
+        ),
+        response_schema=SOURCE_PROGRESSION_OUTLINE_JSON_SCHEMA,
+        required_keys=["progression_outline", "transition_points"],
+    )
+
+    progression_outline = str(payload.get("progression_outline") or "").strip()
+    transition_points = [
+        str(item).strip()
+        for item in payload.get("transition_points", [])
+        if str(item).strip()
+    ]
+    if not progression_outline:
+        raise ValueError("Model returned empty progression outline text.")
+
+    if transition_points:
+        transition_block = "\n".join(f"- {item}" for item in transition_points)
+        return f"{progression_outline}\n\nCore transitions:\n{transition_block}"
+    return progression_outline
+
+
+def _split_into_sentences(text_value: str) -> list[str]:
+    normalized = " ".join(str(text_value or "").split()).strip()
+    if not normalized:
+        return []
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", normalized)
+        if sentence.strip()
+    ]
+
+
+def _deduplicate_section_text(current_text: str, prior_texts: list[str]) -> str:
+    current_sentences = _split_into_sentences(current_text)
+    if len(current_sentences) < 3:
+        return current_text
+
+    prior_sentences: list[str] = []
+    for text_value in prior_texts:
+        prior_sentences.extend(_split_into_sentences(text_value))
+
+    if not prior_sentences:
+        return current_text
+
+    kept_sentences: list[str] = []
+    for sentence in current_sentences:
+        sentence_norm = sentence.lower()
+        is_duplicate = False
+        for prior_sentence in prior_sentences:
+            prior_norm = prior_sentence.lower()
+            if sentence_norm == prior_norm:
+                is_duplicate = True
+                break
+            if SequenceMatcher(None, sentence_norm, prior_norm).ratio() >= DEDUPLICATION_SIMILARITY_THRESHOLD:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            kept_sentences.append(sentence)
+
+    if not kept_sentences:
+        return current_text
+
+    deduplicated = " ".join(kept_sentences).strip()
+    if len(deduplicated) < int(len(current_text) * DEDUPLICATION_MIN_CHAR_RATIO):
+        return current_text
+    return deduplicated
 
 
 def _generate_source_title(summary_text: str, source_type: str, user_id: str, run_id: str) -> str:
@@ -410,6 +606,7 @@ def _generate_source_deep_dive(
     summary_text: str,
     source_type: str,
     grounding_chunks: list[str],
+    progression_outline: str,
     user_id: str,
     run_id: str,
 ) -> tuple[str, list[str]]:
@@ -422,6 +619,7 @@ def _generate_source_deep_dive(
         user_prompt=(
             f"Source type: {source_type}\n\n"
             f"Source summary:\n{summary_text}\n\n"
+            f"Progression outline:\n{progression_outline}\n\n"
             "Grounding chunks:\n"
             f"{chunk_text}"
         ),
@@ -446,9 +644,12 @@ def _generate_reflection_points(
     summary_text: str,
     deep_dive_text: str,
     source_type: str,
+    progression_outline: str,
+    grounding_chunks: list[str],
     user_id: str,
     run_id: str,
 ) -> list[ReflectionPoint]:
+    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
     payload = _run_structured_generation_step(
         run_id=run_id,
         stage_name=f"source_reflection:{source_type}",
@@ -458,6 +659,9 @@ def _generate_reflection_points(
             f"Source type: {source_type}\n\n"
             f"Summary:\n{summary_text}\n\n"
             f"Deep dive:\n{deep_dive_text}\n\n"
+            f"Progression outline:\n{progression_outline}\n\n"
+            "Representative grounding chunks:\n"
+            f"{chunk_text}\n\n"
             "Generate Socratic reflection points."
         ),
         response_schema=SOCRATIC_REFLECTION_JSON_SCHEMA,
@@ -493,10 +697,11 @@ def _generate_under_surface_pack(
     key_terms: list[str],
     source_type: str,
     grounding_chunks: list[str],
+    progression_outline: str,
     user_id: str,
     run_id: str,
 ) -> tuple[str, list[str], list[KeyTermExplanation]]:
-    chunk_text = "\n\n".join(grounding_chunks[:6]) if grounding_chunks else "[No grounding chunks available]"
+    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
     payload = _run_structured_generation_step(
         run_id=run_id,
         stage_name=f"source_under_surface:{source_type}",
@@ -506,6 +711,7 @@ def _generate_under_surface_pack(
             f"Source type: {source_type}\n\n"
             f"Summary:\n{summary_text}\n\n"
             f"Deep dive:\n{deep_dive_text}\n\n"
+            f"Progression outline:\n{progression_outline}\n\n"
             f"Key terms: {', '.join(key_terms[:10])}\n\n"
             f"Grounding chunks:\n{chunk_text}"
         ),
@@ -733,19 +939,61 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
     if not summary_text:
         raise ValueError(f"Source {source_id} summary is unavailable.")
 
-    grounding_chunks = _load_grounding_chunks(source_id, user_id)
+    grounding_rows = _load_grounding_chunk_rows(source_id, user_id)
+    grounding_chunks, deep_dive_chunk_indexes = _select_distributed_grounding_chunks(
+        grounding_rows,
+        max_chunks=MAX_GROUNDING_CHUNKS,
+        max_chars=MAX_GROUNDING_CHARS,
+    )
+    under_surface_chunks, under_surface_chunk_indexes = _select_distributed_grounding_chunks(
+        grounding_rows,
+        max_chunks=MAX_UNDER_SURFACE_GROUNDING_CHUNKS,
+        max_chars=MAX_UNDER_SURFACE_GROUNDING_CHARS,
+    )
+    reflection_chunks, reflection_chunk_indexes = _select_distributed_grounding_chunks(
+        grounding_rows,
+        max_chunks=MAX_REFLECTION_GROUNDING_CHUNKS,
+        max_chars=MAX_REFLECTION_GROUNDING_CHARS,
+    )
+
+    log_generation_stage_event(
+        run_id=run_id,
+        user_id=user_id,
+        stage_name=f"source_grounding_selection:{source_type}",
+        attempt_number=1,
+        status="succeeded",
+        details=(
+            f"total_rows={len(grounding_rows)};"
+            f"deep_dive={deep_dive_chunk_indexes};"
+            f"under_surface={under_surface_chunk_indexes};"
+            f"reflection={reflection_chunk_indexes}"
+        ),
+    )
+
+    progression_outline = _generate_source_progression_outline(
+        summary_text=summary_text,
+        source_type=source_type,
+        grounding_chunks=grounding_chunks,
+        user_id=user_id,
+        run_id=run_id,
+    )
     generated_title = _generate_source_title(summary_text, source_type, user_id, run_id)
     deep_dive_text, key_terms = _generate_source_deep_dive(
         summary_text,
         source_type,
         grounding_chunks,
+        progression_outline,
         user_id,
         run_id,
     )
+    deep_dive_text = _deduplicate_section_text(deep_dive_text, [summary_text])
+
     reflection_points = _generate_reflection_points(
         summary_text,
         deep_dive_text,
         source_type,
+        progression_outline,
+        reflection_chunks,
         user_id,
         run_id,
     )
@@ -754,9 +1002,14 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         deep_dive_text=deep_dive_text,
         key_terms=key_terms,
         source_type=source_type,
-        grounding_chunks=grounding_chunks,
+        grounding_chunks=under_surface_chunks,
+        progression_outline=progression_outline,
         user_id=user_id,
         run_id=run_id,
+    )
+    under_surface_explainer = _deduplicate_section_text(
+        under_surface_explainer,
+        [summary_text, deep_dive_text],
     )
 
     section = SourceLearningSection(
@@ -1271,8 +1524,137 @@ def _load_cached_combined_learning_sections(
     return insights_section, quiz_section
 
 
+def _truncate_sentence(text_value: str, limit: int = 260) -> str:
+    normalized = " ".join(str(text_value or "").split()).strip()
+    if not normalized:
+        return ""
+
+    first_sentence = normalized.split(". ", 1)[0].strip()
+    candidate = first_sentence if first_sentence else normalized
+    if len(candidate) > limit:
+        return candidate[: limit - 3].rstrip() + "..."
+    return candidate
+
+
+def _build_noncomparative_insights_and_quiz(
+    source_sections: list[SourceLearningSection],
+) -> tuple[CombinedInsightSection, CombinedQuizSection]:
+    if not source_sections:
+        raise ValueError("source_sections cannot be empty.")
+
+    intersections: list[InsightIntersection] = []
+    for section in source_sections[:3]:
+        summary_sentence = _truncate_sentence(section.summary_text, limit=240)
+        deep_sentence = _truncate_sentence(section.deep_dive_text, limit=240)
+        emphasis_terms = [term for term in section.key_terms[:4] if term.strip()]
+
+        attributed_sentences: list[AttributedSentence] = []
+        for snippet in [summary_sentence, deep_sentence]:
+            if not snippet:
+                continue
+            attributed_sentences.append(
+                AttributedSentence(
+                    text=snippet,
+                    source_id=section.source_id,
+                    source_type=section.source_type,
+                    emphasis_terms=emphasis_terms,
+                )
+            )
+
+        if not attributed_sentences:
+            attributed_sentences.append(
+                AttributedSentence(
+                    text=f"Focus on the core mechanism behind '{section.generated_title}'.",
+                    source_id=section.source_id,
+                    source_type=section.source_type,
+                    emphasis_terms=emphasis_terms,
+                )
+            )
+
+        intersections.append(
+            InsightIntersection(
+                intersection_title=f"Focus Area: {section.generated_title}",
+                why_it_matters=(
+                    summary_sentence
+                    or f"This source defines the core mechanism for {section.generated_title}."
+                ),
+                integrated_explanation=(
+                    deep_sentence
+                    or "Use the deep-dive section and reflection points to pressure-test understanding."
+                ),
+                attributed_sentences=attributed_sentences,
+            )
+        )
+
+    parallels = intersections[0].attributed_sentences if intersections else []
+    primary = source_sections[0]
+    layman_bridge = _truncate_sentence(primary.under_surface_explainer, limit=320) or _truncate_sentence(
+        primary.summary_text,
+        limit=320,
+    )
+    source_labels = ", ".join(section.generated_title for section in source_sections[:4])
+    synthesis_text = (
+        f"This run has {len(source_sections)} source(s): {source_labels}. "
+        "Use each source section's deep dive, checklist, and reflection points to reinforce understanding before asking follow-up questions in chat."
+    )
+
+    quiz_questions: list[QuizQuestion] = []
+    for section in source_sections[:2]:
+        key_claim = _truncate_sentence(section.summary_text, limit=180) or section.generated_title
+        under_surface = _truncate_sentence(section.under_surface_explainer, limit=220)
+        source_evidence = [
+            value for value in [
+                _truncate_sentence(section.summary_text, limit=180),
+                _truncate_sentence(section.deep_dive_text, limit=180),
+            ] if value
+        ]
+
+        quiz_questions.append(
+            QuizQuestion(
+                question=(
+                    f"For '{section.generated_title}', which statement best matches the grounded explanation in your material?"
+                ),
+                options=[
+                    key_claim,
+                    "The source mainly argues from unsupported assumptions.",
+                    "The source presents no actionable mechanism.",
+                    "The source rejects the central idea entirely.",
+                ],
+                answer_index=0,
+                explanation="The first option restates the grounded claim from your source summary.",
+                under_the_hood=under_surface or "Look for the mechanism and boundary conditions in the deep dive.",
+                difficulty_level="foundational",
+                question_type="synthesis",
+                source_evidence=source_evidence or [f"Review source {section.source_id} summary and deep dive."],
+            )
+        )
+
+    study_advice = (
+        "If this run has one source, ask the chatbox to test assumptions and edge cases. "
+        "If it has multiple sources, ask for agreements, tensions, and transfer steps across them."
+    )
+
+    insights_section = CombinedInsightSection(
+        intersections=intersections,
+        parallels=parallels,
+        layman_bridge=layman_bridge or "Use the source summaries and deep dives as your grounding layer.",
+        synthesis_text=synthesis_text,
+        comparative_analysis="",
+        application_scenarios=[],
+        model_name="deterministic-noncomparative",
+        schema_version=4,
+    )
+    quiz_section = CombinedQuizSection(
+        questions=quiz_questions,
+        study_advice=study_advice,
+        model_name="deterministic-noncomparative",
+        schema_version=2,
+    )
+    return insights_section, quiz_section
+
+
 def generate_tailored_learning(
-    video_source_id: int,
+    video_source_id: int | None,
     document_source_ids: list[int],
     user_id: str,
 ) -> GenerateTailoredLearningResponse:
@@ -1283,6 +1665,10 @@ def generate_tailored_learning(
         video_source_id,
         document_source_ids,
     )
+    source_ids: list[int] = []
+    if normalized_video_id is not None:
+        source_ids.append(normalized_video_id)
+    source_ids.extend(normalized_document_ids)
 
     log_generation_stage_event(
         run_id=run_id,
@@ -1291,20 +1677,21 @@ def generate_tailored_learning(
         attempt_number=1,
         status="started",
         details=(
-            f"video_source_id={normalized_video_id}; "
+            f"video_source_id={normalized_video_id if normalized_video_id is not None else 'none'}; "
             f"document_source_ids={','.join(str(value) for value in normalized_document_ids)}"
         ),
     )
 
-    video_process_result = process_source(normalized_video_id, user_id)
-    log_generation_stage_event(
-        run_id=run_id,
-        user_id=user_id,
-        stage_name=f"process_source:{normalized_video_id}",
-        attempt_number=1,
-        status="cache_hit" if int(video_process_result.chunk_count) == 0 else "succeeded",
-        details=f"source_type=video; chunk_count={video_process_result.chunk_count}",
-    )
+    if normalized_video_id is not None:
+        video_process_result = process_source(normalized_video_id, user_id)
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"process_source:{normalized_video_id}",
+            attempt_number=1,
+            status="cache_hit" if int(video_process_result.chunk_count) == 0 else "succeeded",
+            details=f"source_type=video; chunk_count={video_process_result.chunk_count}",
+        )
     for document_source_id in normalized_document_ids:
         process_result = process_source(document_source_id, user_id)
         log_generation_stage_event(
@@ -1316,92 +1703,117 @@ def generate_tailored_learning(
             details=f"source_type=document; chunk_count={process_result.chunk_count}",
         )
 
-    for document_source_id in normalized_document_ids:
-        link_result = link_source_pair(normalized_video_id, document_source_id, user_id)
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"link_sources:{normalized_video_id}:{document_source_id}",
-            attempt_number=1,
-            status="cache_hit" if int(link_result.get("stored_edges", 0)) == 0 else "succeeded",
-            details=(
-                f"candidate_pairs={int(link_result.get('candidate_pairs', 0))}; "
-                f"stored_edges={int(link_result.get('stored_edges', 0))}"
-            ),
-        )
+    if normalized_video_id is not None and normalized_document_ids:
+        for document_source_id in normalized_document_ids:
+            link_result = link_source_pair(normalized_video_id, document_source_id, user_id)
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=f"link_sources:{normalized_video_id}:{document_source_id}",
+                attempt_number=1,
+                status="cache_hit" if int(link_result.get("stored_edges", 0)) == 0 else "succeeded",
+                details=(
+                    f"candidate_pairs={int(link_result.get('candidate_pairs', 0))}; "
+                    f"stored_edges={int(link_result.get('stored_edges', 0))}"
+                ),
+            )
 
-    video_section = _build_source_learning_section(normalized_video_id, user_id, run_id)
+    video_section = (
+        _build_source_learning_section(normalized_video_id, user_id, run_id)
+        if normalized_video_id is not None
+        else None
+    )
     document_sections = [
         _build_source_learning_section(source_id, user_id, run_id)
         for source_id in normalized_document_ids
     ]
 
-    cached_combined = None
-    if CACHE_PROCESSED_SOURCES:
-        cached_combined = _load_cached_combined_learning_sections(
+    all_sections = ([video_section] if video_section is not None else []) + document_sections
+    if not all_sections:
+        raise ValueError("No source learning sections were generated.")
+
+    if video_section is not None and normalized_document_ids:
+        cached_combined = None
+        if CACHE_PROCESSED_SOURCES:
+            cached_combined = _load_cached_combined_learning_sections(
+                user_id=user_id,
+                video_source_id=normalized_video_id,
+                document_source_ids=normalized_document_ids,
+            )
+        log_generation_stage_event(
+            run_id=run_id,
             user_id=user_id,
-            video_source_id=normalized_video_id,
-            document_source_ids=normalized_document_ids,
+            stage_name="combined_learning_cache",
+            attempt_number=1,
+            status="cache_hit" if cached_combined is not None else "cache_miss",
         )
-    log_generation_stage_event(
-        run_id=run_id,
-        user_id=user_id,
-        stage_name="combined_learning_cache",
-        attempt_number=1,
-        status="cache_hit" if cached_combined is not None else "cache_miss",
-    )
 
-    relationship_insights = _load_relationship_insights(
-        [normalized_video_id, *normalized_document_ids],
-        user_id,
-    )
+        relationship_insights = _load_relationship_insights(source_ids, user_id)
 
-    if cached_combined is not None:
-        insights_section, quiz_section = cached_combined
+        if cached_combined is not None:
+            insights_section, quiz_section = cached_combined
+        else:
+            insights_section = _generate_combined_insights(
+                video_section=video_section,
+                document_sections=document_sections,
+                relationship_insights=relationship_insights,
+                user_id=user_id,
+                run_id=run_id,
+            )
+            quiz_section = _generate_combined_quiz(
+                video_section=video_section,
+                document_sections=document_sections,
+                insights_section=insights_section,
+                relationship_insights=relationship_insights,
+                user_id=user_id,
+                run_id=run_id,
+            )
+            comparative_analysis = _generate_comparative_analysis(
+                video_section=video_section,
+                document_sections=document_sections,
+                insights_section=insights_section,
+                relationship_insights=relationship_insights,
+                user_id=user_id,
+                run_id=run_id,
+            )
+            application_scenarios = _generate_application_scenarios(
+                video_section=video_section,
+                document_sections=document_sections,
+                insights_section=insights_section,
+                relationship_insights=relationship_insights,
+                user_id=user_id,
+                run_id=run_id,
+            )
+            insights_section = insights_section.model_copy(
+                update={
+                    "comparative_analysis": comparative_analysis,
+                    "application_scenarios": application_scenarios,
+                }
+            )
+            _store_combined_learning_sections(
+                user_id=user_id,
+                video_source_id=normalized_video_id,
+                document_source_ids=normalized_document_ids,
+                insights=insights_section,
+                quiz=quiz_section,
+            )
     else:
-        insights_section = _generate_combined_insights(
-            video_section=video_section,
-            document_sections=document_sections,
-            relationship_insights=relationship_insights,
-            user_id=user_id,
+        log_generation_stage_event(
             run_id=run_id,
-        )
-        quiz_section = _generate_combined_quiz(
-            video_section=video_section,
-            document_sections=document_sections,
-            insights_section=insights_section,
-            relationship_insights=relationship_insights,
             user_id=user_id,
+            stage_name="combined_learning_cache",
+            attempt_number=1,
+            status="skipped",
+            details="Non-comparative run: skipping combined comparative generation stages.",
+        )
+        insights_section, quiz_section = _build_noncomparative_insights_and_quiz(all_sections)
+        log_generation_stage_event(
             run_id=run_id,
-        )
-        comparative_analysis = _generate_comparative_analysis(
-            video_section=video_section,
-            document_sections=document_sections,
-            insights_section=insights_section,
-            relationship_insights=relationship_insights,
             user_id=user_id,
-            run_id=run_id,
-        )
-        application_scenarios = _generate_application_scenarios(
-            video_section=video_section,
-            document_sections=document_sections,
-            insights_section=insights_section,
-            relationship_insights=relationship_insights,
-            user_id=user_id,
-            run_id=run_id,
-        )
-        insights_section = insights_section.model_copy(
-            update={
-                "comparative_analysis": comparative_analysis,
-                "application_scenarios": application_scenarios,
-            }
-        )
-        _store_combined_learning_sections(
-            user_id=user_id,
-            video_source_id=normalized_video_id,
-            document_source_ids=normalized_document_ids,
-            insights=insights_section,
-            quiz=quiz_section,
+            stage_name="noncomparative_generation",
+            attempt_number=1,
+            status="succeeded",
+            details=f"source_count={len(all_sections)}",
         )
 
     log_generation_stage_event(
@@ -1411,14 +1823,14 @@ def generate_tailored_learning(
         attempt_number=1,
         status="succeeded",
         details=(
-            f"video_source_id={normalized_video_id}; "
+            f"video_source_id={normalized_video_id if normalized_video_id is not None else 'none'}; "
             f"document_count={len(normalized_document_ids)}"
         ),
     )
 
     return GenerateTailoredLearningResponse(
         status_message="Tailored Socratic learning generated successfully.",
-        source_ids=[normalized_video_id, *normalized_document_ids],
+        source_ids=source_ids,
         video=video_section,
         documents=document_sections,
         insights=insights_section,

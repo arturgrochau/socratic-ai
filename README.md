@@ -1,136 +1,75 @@
 # Socratic AI Study Assistant
 
-Socratic AI turns one video lecture plus supporting documents into a guided, source-grounded learning system.
+Socratic AI turns your sources into a grounded learning workflow with generation plus chat follow-up. It supports three intake modes: video only, documents only, or video plus documents.
 
-The short version:
-- It helps you study one concept deeply, not just skim answers.
-- It links ideas across sources, then challenges your thinking.
-- It keeps everything in one interface so exploration is focused and continuous.
+## Design Choice (Short Version)
 
-## Why This Exists (Learning Philosophy)
+The app is intentionally retrieval-first and stage-based instead of one-shot chat. Ingestion stores transcript and document chunks, processing builds source concepts and summaries, and generation produces structured learning artifacts. This keeps answers tied to your material, makes failures observable by stage, and allows selective skipping of expensive comparative calls when a run has only one source type.
 
-Most AI tools optimize for speed of answers.
-This project optimizes for depth of understanding.
+## What It Supports
 
-Its philosophy is close to "sapere aude" (dare to know):
-- think for yourself,
-- test assumptions,
-- connect ideas across contexts,
-- ask one better question after each answer.
+- Upload one video file.
+- Paste one YouTube URL (downloaded with yt-dlp, then transcribed through the same Whisper path).
+- Upload one or more documents.
+- Run with:
+  - video only
+  - documents only
+  - video + documents
+- Unified Socratic chat over generated and retrieved context.
 
-It also follows first-principles learning:
-- break ideas into mechanisms,
-- identify assumptions and failure modes,
-- rebuild understanding from fundamentals,
-- then apply it in concrete scenarios.
+## Implementation Flow
 
-That is why the app is designed as a full learning loop (summaries, intersections, diagnostics, quiz, Socratic follow-up), not a single chatbot text box.
+1. Ingestion
+- `POST /upload` accepts optional `video`, optional `video_url`, and optional `documents`.
+- Constraint: at most one video source per request (`video` XOR `video_url`).
+- YouTube URLs are downloaded via yt-dlp and converted to WAV with ffmpeg.
+- Whisper transcription produces timestamped segments for video sources.
+- Documents are parsed (`pdf`, `txt`, `md`) and chunked.
 
-## What Makes This Different From Typical AI Use
+2. Processing and linking
+- `/process` now runs with any non-empty source set.
+- For mixed mode (video + documents): process all sources and link video concepts to document concepts.
+- For single-source mode: process only, skip linking.
 
-Typical usage: ask one question, get one answer, move on.
+3. Tailored generation
+- `/generate-tailored-learning` always returns source learning sections and quiz/insight payloads.
+- Mixed mode uses full comparative stages (intersections, quiz, comparative analysis, scenarios).
+- Non-comparative mode uses deterministic, grounded synthesis objects and skips comparative model calls.
 
-Socratic AI usage:
-1. Ingest real study material.
-2. Build structured concept representations.
-3. Link concepts between sources.
-4. Generate cross-source synthesis and challenge questions.
-5. Continue exploration in a grounded Socratic chat.
+4. Interaction
+- `/ask` uses source-scoped retrieval and generated context.
+- Streamlit quick actions can auto-navigate to chat and auto-submit the generated query.
 
-This creates a "single-concept deep dive" experience:
-- you can stay focused on one thing you want to learn,
-- inspect it from multiple sources,
-- test your understanding,
-- and keep drilling deeper in the same UI.
+## Streamlit UX Notes
 
-## System Overview
+- Step 1 lets users choose one video source mode: upload or YouTube link.
+- After a source is saved, the input is replaced by a selected-state card plus replace button.
+- Step 1 and Step 2 each provide an explicit skip button.
+- Step 3 enables generation only when at least one source is selected.
 
-### Frontend
-- Streamlit dashboard for upload, generation, synthesis, quiz, and chat.
-- Guided sections:
-  - Video
-  - Documents
-  - Cross-Source Synthesis & Assessment
-  - Socratic Chatbox
+## Cost Expectations (gpt-4o-mini + current defaults)
 
-### Backend
-- FastAPI routes for upload, processing/linking, generation, and ask.
-- SQLite + Chroma persistence.
-- User scoping via `X-User-ID`.
+Assumptions:
+- Prompt/response sizes are based on current prompts and average medium-length material.
+- Whisper is treated as $0.00 in this project estimator.
+- Cost logging is enabled and includes generation, linking, processing, retrieval, interaction.
 
-### Core pipeline
-1. **Upload and ingestion**
-   - Save files and extract text/audio.
-   - Transcribe video audio via Whisper.
-2. **Processing**
-   - Chunk source text.
-   - Extract concepts and key ideas.
-   - Create source summaries.
-3. **Linking**
-   - Build candidate concept pairs by token overlap.
-   - Classify relationship per pair (reinforces, overlaps, etc.).
-4. **Tailored generation**
-   - Per-source: title, deep dive, reflection, under-surface explanation.
-   - Cross-source: intersections, synthesis, comparative analysis, scenarios, quiz.
-5. **Socratic interaction**
-   - Retrieval over stored chunks/concepts when needed.
-   - Direct answer + grounded support + follow-up reflection.
+Average ranges per run:
 
-## Prompt and Design Choices (Why It Is Built This Way)
+| Scenario                               | Typical model work                                                 |  Estimated cost |
+| -------------------------------------- | ------------------------------------------------------------------ | --------------: |
+| Video only                             | Transcription + per-source generation + chat-ready retrieval setup |  $0.12 to $0.35 |
+| Documents only (1-3 docs)              | Per-source processing/generation, no video linking                 |  $0.10 to $0.45 |
+| Video + documents (1 video + 1-3 docs) | Full processing + linking + comparative generation                 |  $0.55 to $1.80 |
+| One chat ask                           | 1 embedding + 1 interaction completion                             | $0.001 to $0.01 |
 
-The prompts are intentionally not just "summarize this":
-- They require grounded outputs tied to provided material.
-- They enforce mechanism-level explanations (not shallow paraphrase).
-- They include reflection and diagnostics to promote active learning.
-- They ask for practical transfer (application scenarios), not only theory.
-
-Design choice rationale:
-- **Cross-source intersections** improve transfer learning.
-- **Diagnostic checklist + key-term breakdown** improves self-assessment.
-- **Harder quiz with distractors** improves discrimination, not memorization.
-- **Socratic follow-up** keeps exploration open-ended and learner-driven.
-
-## Reliability and Efficiency Model
-
-Generation now includes reliability controls for long runs:
-- Structured JSON parsing safeguards.
-- Bounded automatic retries per generation stage.
-- Stage-level telemetry with `run_id`, stage name, attempt count, status, duration, and error detail.
-- Safe fallback decoding for cached JSON rows.
-
-Why this matters:
-- Prevents a single malformed model response from wasting the whole run.
-- Makes failures actionable (`run_id` + failing stage).
-- Improves observability for cost/performance tuning.
-
-## Average Model Calls (What to Expect)
-
-Actual call volume depends on number of documents, concept density, and cache hits.
-
-For one video + `D` documents:
-
-- **Ingestion**
-  - Whisper transcription: `1` call (video).
-- **Processing**
-  - Concept extraction + source summary: `2 x (1 + D)` calls.
-- **Per-source generation**
-  - Title + deep dive + reflection + under-surface: `4 x (1 + D)` calls.
-- **Cross-source generation**
-  - Insights + quiz + comparative analysis + scenarios: `4` calls.
-- **Linking**
-  - Up to `30` concept-comparison calls per video-document pair (bounded by candidate cap), often fewer with cache reuse.
-
-A practical cold-start estimate for one video + two documents (`D = 2`):
-- Base calls (without linking comparisons): `23`
-- Plus linking comparisons: variable (typically much lower than max, highest cost driver when concept sets are large)
-
-Ask/chat calls are separate from generation and typically add:
-- 1 embedding call (retrieval path), and
-- 1 chat completion (sometimes 2 in fallback/retry branches).
+Why mixed mode costs more:
+- Concept linking plus comparative generation stages dominate token usage.
+- Single-source runs skip those stages by design.
 
 ## Quick Start
 
-### 1) Install dependencies
+1. Install dependencies
 
 ```bash
 python -m venv .venv
@@ -138,57 +77,57 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2) Configure environment
-
-Create a `.env` file with at least:
+2. Configure environment
 
 ```env
 OPENAI_API_KEY=your_key_here
 ```
 
-Optional runtime settings are defined in `config.py`.
-For long frontend waits, you can also set:
+Optional:
 
 ```env
 FRONTEND_REQUEST_TIMEOUT=600
 ```
 
-### 3) Run backend API
+3. Run API
 
 ```bash
 uvicorn main:app --reload
 ```
 
-Backend: `http://127.0.0.1:8000`
-
-### 4) Run frontend
+4. Run Streamlit
 
 ```bash
 streamlit run frontend/app.py
 ```
 
-## Typical User Flow
+## Validation and Tests
 
-1. Open the Streamlit app.
-2. Set API URL and user ID in the sidebar.
-3. Upload one video and one or more documents.
-4. Click **Generate tailored Socratic learning**.
-5. Explore the dashboard sections.
-6. Use Socratic chat to deepen one concept at a time.
-
-## Validation
-
-Run end-to-end validation with test assets:
+Run unit tests:
 
 ```bash
-python scripts/validate_pipeline.py
+python -m pytest tests/test_json_reliability.py tests/test_optional_source_modes.py -v
 ```
 
-Validation includes generation quality checks and usage summaries.
+Run end-to-end validator:
 
-## Notes
+```bash
+python scripts/validate_pipeline.py --api-base-url http://127.0.0.1:8000
+```
 
-- Data is user-scoped using the `X-User-ID` header.
-- Caching and schema versioning are built into processing and generation.
-- Local persistence uses SQLite by default.
-- Retrieval storage uses Chroma for concept/raw chunk embeddings.
+## Key Files
+
+- `frontend/app.py` : wizard UX, skip controls, auto-jump and auto-submit behavior.
+- `routes/upload.py` : optional upload contract with `video_url` support.
+- `app/ingestion.py` : yt-dlp download, WAV conversion, Whisper ingestion.
+- `app/workflow.py` : optional-source processing/linking orchestration.
+- `app/generation.py` : mixed-mode comparative path and non-comparative cost-saving path.
+- `app/cost_logging.py` : token usage logging per stage/model.
+- `scripts/validate_pipeline.py` : integration and usage summary checks.
+
+## Operational Notes
+
+- All API calls are user-scoped via `X-User-ID`.
+- ffmpeg is required for audio extraction.
+- yt-dlp is required for YouTube URL ingestion.
+- Cached processing and generation can reduce repeated-call cost.

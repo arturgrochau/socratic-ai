@@ -6,8 +6,9 @@ from pydantic import BaseModel, Field
 
 
 class UploadRequestMeta(BaseModel):
-    video_filename: str
-    document_filenames: list[str]
+    video_filename: str | None = None
+    video_url: str | None = None
+    document_filenames: list[str] = Field(default_factory=list)
 
 
 class TranscriptSegment(BaseModel):
@@ -45,8 +46,8 @@ class DocumentIngestionRecord(BaseModel):
 class IngestionResponse(BaseModel):
     message: str
     request: UploadRequestMeta
-    video: VideoIngestionRecord
-    documents: list[DocumentIngestionRecord]
+    video: VideoIngestionRecord | None = None
+    documents: list[DocumentIngestionRecord] = Field(default_factory=list)
 
 
 class ConceptItem(BaseModel):
@@ -162,8 +163,8 @@ class InteractionSessionState(BaseModel):
 
 
 class ProcessPipelineRequest(BaseModel):
-    video_source_id: int
-    document_source_ids: list[int]
+    video_source_id: int | None = None
+    document_source_ids: list[int] = Field(default_factory=list)
 
 
 class ProcessPipelineLinkResult(BaseModel):
@@ -180,8 +181,8 @@ class ProcessPipelineResponse(BaseModel):
 
 
 class GenerateTailoredLearningRequest(BaseModel):
-    video_source_id: int
-    document_source_ids: list[int]
+    video_source_id: int | None = None
+    document_source_ids: list[int] = Field(default_factory=list)
 
 
 class ReflectionPoint(BaseModel):
@@ -209,7 +210,7 @@ class SourceLearningSection(BaseModel):
     key_term_explanations: list[KeyTermExplanation] = Field(default_factory=list)
     reflection_points: list[ReflectionPoint]
     model_name: str
-    schema_version: int = 5
+    schema_version: int = 6
 
 
 class AttributedSentence(BaseModel):
@@ -267,8 +268,8 @@ class CombinedQuizSection(BaseModel):
 class GenerateTailoredLearningResponse(BaseModel):
     status_message: str
     source_ids: list[int]
-    video: SourceLearningSection
-    documents: list[SourceLearningSection]
+    video: SourceLearningSection | None = None
+    documents: list[SourceLearningSection] = Field(default_factory=list)
     insights: CombinedInsightSection
     quiz: CombinedQuizSection
 

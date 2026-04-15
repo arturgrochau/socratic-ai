@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 import shutil
+import subprocess
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import ffmpeg
@@ -29,9 +33,21 @@ from config import db_engine, openai_client
 UPLOAD_ROOT = Path("uploads")
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
+SUPPORTED_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+    "youtu.be",
+    "www.youtu.be",
+}
 RAW_CHUNK_TARGET_CHARS = 2400
 RAW_CHUNK_OVERLAP_CHARS = 320
 TRANSCRIPT_TEXT_PLACEHOLDER = "[chunked transcript stored in source_text_chunks]"
+WHISPER_MAX_REQUEST_BYTES = 24 * 1024 * 1024
+WHISPER_CHUNK_SECONDS = 540
 
 
 def ensure_ingestion_tables() -> None:
@@ -141,9 +157,6 @@ def validate_video_file(video_file: UploadFile) -> None:
 
 
 def validate_document_files(document_files: list[UploadFile]) -> None:
-    if not document_files:
-        raise ValueError("At least one document file is required.")
-
     for document in document_files:
         if not document.filename:
             raise ValueError("Each document must include a filename.")
@@ -154,6 +167,184 @@ def validate_document_files(document_files: list[UploadFile]) -> None:
                 f"Unsupported document file type for {document.filename}. "
                 "Allowed: .pdf, .txt, .md"
             )
+
+
+def validate_youtube_url(video_url: str) -> str:
+    raw = video_url.strip()
+    if not raw:
+        raise ValueError("YouTube URL cannot be empty.")
+
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parsed = urlparse(candidate)
+    except Exception as exc:
+        raise ValueError("Only single-video YouTube URLs are supported.") from exc
+
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www.") and host not in {"www.youtube.com", "www.youtube-nocookie.com"}:
+        host = host[4:]
+    if host not in SUPPORTED_YOUTUBE_HOSTS:
+        raise ValueError("Only single-video YouTube URLs are supported.")
+
+    path = (parsed.path or "").strip()
+    if host == "youtu.be":
+        if path.strip("/"):
+            return candidate
+        raise ValueError("Only single-video YouTube URLs are supported.")
+
+    normalized_path = path.rstrip("/")
+    if normalized_path == "/watch":
+        video_id = (parse_qs(parsed.query).get("v") or [""])[0].strip()
+        if video_id:
+            return candidate
+        raise ValueError("Only single-video YouTube URLs are supported.")
+
+    for prefix in ("/shorts/", "/embed/", "/live/"):
+        if normalized_path.startswith(prefix):
+            tail = normalized_path[len(prefix):].strip("/")
+            if tail:
+                return candidate
+
+    raise ValueError("Only single-video YouTube URLs are supported.")
+
+
+def _safe_filename(raw_value: str, fallback: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_value).strip("._-")
+    if not safe:
+        return fallback
+    return safe[:120]
+
+
+def _normalize_downloaded_video_path(
+    *,
+    downloaded_path: Path,
+    source_title: str,
+) -> tuple[Path, str, str | None]:
+    if not downloaded_path.exists() or downloaded_path.stat().st_size == 0:
+        raise RuntimeError("YouTube download produced an empty media file.")
+
+    suffix = downloaded_path.suffix or ".mp4"
+    target_name = f"{_safe_filename(source_title, 'youtube_video')}{suffix}"
+    normalized_path = downloaded_path.with_name(target_name)
+
+    if downloaded_path != normalized_path:
+        candidate_path = normalized_path
+        collision_index = 1
+        while candidate_path.exists():
+            candidate_path = normalized_path.with_name(
+                f"{normalized_path.stem}_{collision_index}{normalized_path.suffix}"
+            )
+            collision_index += 1
+        downloaded_path.rename(candidate_path)
+        normalized_path = candidate_path
+
+    mime_type = mimetypes.guess_type(normalized_path.name)[0]
+    return normalized_path, normalized_path.name, mime_type
+
+
+def _download_youtube_video_with_cli(video_url: str, destination_dir: Path) -> tuple[Path, str, str | None]:
+    yt_dlp_binary = shutil.which("yt-dlp")
+    if not yt_dlp_binary:
+        raise RuntimeError(
+            "yt-dlp is required for YouTube ingestion. Install it with '.venv/bin/pip install -r requirements.txt'."
+        )
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(destination_dir / "%(id)s.%(ext)s")
+
+    try:
+        metadata_result = subprocess.run(
+            [
+                yt_dlp_binary,
+                "--no-playlist",
+                "--quiet",
+                "--dump-single-json",
+                video_url,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        metadata = json.loads(metadata_result.stdout)
+    except Exception as exc:
+        raise RuntimeError(f"YouTube metadata lookup failed: {exc}") from exc
+
+    try:
+        subprocess.run(
+            [
+                yt_dlp_binary,
+                "-f",
+                "bestaudio/best",
+                "--no-playlist",
+                "--quiet",
+                "--no-warnings",
+                "-o",
+                output_template,
+                video_url,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr_text = (exc.stderr or "").strip()
+        raise RuntimeError(f"YouTube download failed: {stderr_text or exc}") from exc
+
+    video_id = str(metadata.get("id") or "").strip()
+    source_title = str(metadata.get("title") or video_id or "youtube_video")
+    downloaded_candidates = list(destination_dir.glob(f"{video_id}.*")) if video_id else []
+    if not downloaded_candidates:
+        downloaded_candidates = sorted(
+            destination_dir.glob("*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    if not downloaded_candidates:
+        raise RuntimeError("YouTube download produced no output file.")
+
+    return _normalize_downloaded_video_path(
+        downloaded_path=downloaded_candidates[0],
+        source_title=source_title,
+    )
+
+
+def download_youtube_video(video_url: str, destination_dir: Path) -> tuple[Path, str, str | None]:
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        # Fallback for environments where the CLI exists but Python module is unavailable.
+        return _download_youtube_video_with_cli(video_url, destination_dir)
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(destination_dir / "%(id)s.%(ext)s")
+    ydl_options = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    try:
+        with YoutubeDL(ydl_options) as ydl:
+            metadata = ydl.extract_info(video_url, download=True)
+            if not isinstance(metadata, dict):
+                raise RuntimeError("yt-dlp did not return video metadata.")
+
+            if metadata.get("entries"):
+                first_entry = metadata["entries"][0]
+                if isinstance(first_entry, dict):
+                    metadata = first_entry
+
+            downloaded_path = Path(ydl.prepare_filename(metadata))
+    except Exception as exc:  # pragma: no cover - external downloader exceptions vary
+        raise RuntimeError(f"YouTube download failed: {exc}") from exc
+
+    source_title = str(metadata.get("title") or metadata.get("id") or "youtube_video")
+    return _normalize_downloaded_video_path(
+        downloaded_path=downloaded_path,
+        source_title=source_title,
+    )
 
 
 def save_upload_file(upload: UploadFile, destination_dir: Path) -> Path:
@@ -193,24 +384,25 @@ def extract_audio_from_video(video_path: Path, audio_path: Path) -> None:
         raise RuntimeError("Audio extraction produced no audio output.")
 
 
-def transcribe_audio_with_whisper(audio_path: Path, user_id: str) -> TranscriptPayload:
-    if not audio_path.exists() or audio_path.stat().st_size == 0:
-        raise RuntimeError("Audio file is missing or empty.")
+def _probe_audio_duration_seconds(audio_path: Path) -> float:
+    try:
+        probe_data = ffmpeg.probe(str(audio_path))
+    except ffmpeg.Error:
+        return 0.0
 
-    with audio_path.open("rb") as audio_file:
-        transcription = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
-    log_api_usage(
-        response=transcription,
-        user_id=user_id,
-        call_stage="ingestion",
-        model_name="whisper-1",
-    )
+    format_data = probe_data.get("format", {}) if isinstance(probe_data, dict) else {}
+    raw_duration = format_data.get("duration")
+    try:
+        return max(0.0, float(raw_duration or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
+
+def _parse_whisper_transcription(
+    transcription: object,
+    *,
+    segment_offset_seconds: float,
+) -> TranscriptPayload:
     transcript_text = getattr(transcription, "text", None)
     segments_raw = getattr(transcription, "segments", None)
 
@@ -221,8 +413,6 @@ def transcribe_audio_with_whisper(audio_path: Path, user_id: str) -> TranscriptP
             segments_raw = transcription.get("segments")
 
     text_value = (transcript_text or "").strip()
-    if not text_value:
-        raise RuntimeError("Transcription returned empty text.")
 
     segments: list[TranscriptSegment] = []
     for segment in segments_raw or []:
@@ -236,13 +426,128 @@ def transcribe_audio_with_whisper(audio_path: Path, user_id: str) -> TranscriptP
             segment_text = str(getattr(segment, "text", "")).strip()
 
         segments.append(
-            TranscriptSegment(start=start_value, end=end_value, text=segment_text)
+            TranscriptSegment(
+                start=start_value + segment_offset_seconds,
+                end=end_value + segment_offset_seconds,
+                text=segment_text,
+            )
         )
+
+    if not text_value and segments:
+        text_value = " ".join(segment.text for segment in segments if segment.text.strip()).strip()
+
+    if not text_value:
+        raise RuntimeError("Transcription returned empty text.")
 
     if not segments:
         raise RuntimeError("Transcription did not include segment timestamps.")
 
     return TranscriptPayload(text=text_value, segments=segments)
+
+
+def _transcribe_whisper_file(
+    *,
+    audio_path: Path,
+    user_id: str,
+    segment_offset_seconds: float,
+) -> TranscriptPayload:
+    try:
+        with audio_path.open("rb") as audio_file:
+            transcription = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+    except Exception as exc:
+        raise RuntimeError(f"Whisper transcription failed: {exc}") from exc
+
+    log_api_usage(
+        response=transcription,
+        user_id=user_id,
+        call_stage="ingestion",
+        model_name="whisper-1",
+    )
+    return _parse_whisper_transcription(
+        transcription,
+        segment_offset_seconds=segment_offset_seconds,
+    )
+
+
+def transcribe_audio_with_whisper(audio_path: Path, user_id: str) -> TranscriptPayload:
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        raise RuntimeError("Audio file is missing or empty.")
+
+    audio_size = audio_path.stat().st_size
+    if audio_size <= WHISPER_MAX_REQUEST_BYTES:
+        return _transcribe_whisper_file(
+            audio_path=audio_path,
+            user_id=user_id,
+            segment_offset_seconds=0.0,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="whisper_chunks_") as tmp_dir:
+        chunk_dir = Path(tmp_dir)
+        chunk_pattern = str(chunk_dir / "chunk_%03d.wav")
+        try:
+            (
+                ffmpeg.input(str(audio_path))
+                .output(
+                    chunk_pattern,
+                    f="segment",
+                    segment_format="wav",
+                    segment_time=WHISPER_CHUNK_SECONDS,
+                    reset_timestamps=1,
+                    ac=1,
+                    ar=16000,
+                )
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+        except ffmpeg.Error as exc:
+            stderr = exc.stderr.decode("utf-8", "ignore") if exc.stderr else "Unknown ffmpeg error"
+            raise RuntimeError(f"Audio chunking failed: {stderr}") from exc
+
+        chunk_paths = sorted(chunk_dir.glob("chunk_*.wav"))
+        if not chunk_paths:
+            raise RuntimeError("Audio chunking produced no chunks for transcription.")
+
+        all_segments: list[TranscriptSegment] = []
+        text_parts: list[str] = []
+        running_offset_seconds = 0.0
+
+        for chunk_path in chunk_paths:
+            if not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                continue
+
+            chunk_payload = _transcribe_whisper_file(
+                audio_path=chunk_path,
+                user_id=user_id,
+                segment_offset_seconds=running_offset_seconds,
+            )
+            if chunk_payload.text.strip():
+                text_parts.append(chunk_payload.text.strip())
+            all_segments.extend(chunk_payload.segments)
+
+            chunk_duration = _probe_audio_duration_seconds(chunk_path)
+            if chunk_duration <= 0.0 and chunk_payload.segments:
+                max_chunk_end = max(segment.end for segment in chunk_payload.segments)
+                chunk_duration = max(0.0, max_chunk_end - running_offset_seconds)
+            if chunk_duration <= 0.0:
+                chunk_duration = float(WHISPER_CHUNK_SECONDS)
+
+            running_offset_seconds += chunk_duration
+
+    if not all_segments:
+        raise RuntimeError("Transcription did not include segment timestamps.")
+
+    combined_text = " ".join(text_parts).strip()
+    if not combined_text:
+        combined_text = " ".join(segment.text for segment in all_segments if segment.text.strip()).strip()
+    if not combined_text:
+        raise RuntimeError("Transcription returned empty text.")
+
+    return TranscriptPayload(text=combined_text, segments=all_segments)
 
 
 def extract_pdf_text_with_pages(pdf_path: Path) -> list[DocumentPageText]:
@@ -576,12 +881,24 @@ def store_document_pages(
 
 async def ingest_upload_bundle(
     user_id: str,
-    video_file: UploadFile,
+    video_file: UploadFile | None,
+    video_url: str | None,
     document_files: list[UploadFile],
 ) -> IngestionResponse:
     ensure_ingestion_tables()
-    validate_video_file(video_file)
-    validate_document_files(document_files)
+
+    normalized_documents = document_files or []
+    if video_file is not None and video_url and video_url.strip():
+        raise ValueError("Provide either a video file or a YouTube URL, not both.")
+
+    if video_file is None and not (video_url and video_url.strip()) and not normalized_documents:
+        raise ValueError("Provide at least one source: video upload, YouTube URL, or document.")
+
+    if video_file is not None:
+        validate_video_file(video_file)
+    normalized_video_url = validate_youtube_url(video_url) if video_url and video_url.strip() else None
+    if normalized_documents:
+        validate_document_files(normalized_documents)
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + f"-{uuid4().hex[:8]}"
     run_root = UPLOAD_ROOT / run_id
@@ -589,19 +906,32 @@ async def ingest_upload_bundle(
     documents_dir = run_root / "documents"
     audio_dir = run_root / "audio"
 
-    # 1) Upload save
-    video_path = save_upload_file(video_file, video_dir)
+    # 1) Upload save / URL download
+    video_path: Path | None = None
+    video_display_name: str | None = None
+    video_mime_type: str | None = None
+
+    if video_file is not None:
+        video_path = save_upload_file(video_file, video_dir)
+        video_display_name = Path(video_file.filename or video_path.name).name
+        video_mime_type = video_file.content_type
+    elif normalized_video_url is not None:
+        video_path, video_display_name, video_mime_type = download_youtube_video(
+            normalized_video_url,
+            video_dir,
+        )
+
     saved_documents: list[tuple[UploadFile, Path]] = []
-    for document_file in document_files:
+    for document_file in normalized_documents:
         document_path = save_upload_file(document_file, documents_dir)
         saved_documents.append((document_file, document_path))
 
-    # 2) Audio extraction
-    audio_path = audio_dir / f"{video_path.stem}.wav"
-    extract_audio_from_video(video_path, audio_path)
-
-    # 3) Transcription
-    transcript = transcribe_audio_with_whisper(audio_path, user_id)
+    # 2) Audio extraction + 3) Transcription
+    transcript: TranscriptPayload | None = None
+    if video_path is not None:
+        audio_path = audio_dir / f"{video_path.stem}.wav"
+        extract_audio_from_video(video_path, audio_path)
+        transcript = transcribe_audio_with_whisper(audio_path, user_id)
 
     # 4) PDF or note parsing
     parsed_documents: list[tuple[UploadFile, list[DocumentPageText]]] = []
@@ -610,12 +940,14 @@ async def ingest_upload_bundle(
         parsed_documents.append((document_file, pages))
 
     # 5) Storage
-    video_record = store_video_transcript(
-        user_id=user_id,
-        filename=Path(video_file.filename or video_path.name).name,
-        mime_type=video_file.content_type,
-        transcript=transcript,
-    )
+    video_record: VideoIngestionRecord | None = None
+    if transcript is not None and video_display_name is not None:
+        video_record = store_video_transcript(
+            user_id=user_id,
+            filename=video_display_name,
+            mime_type=video_mime_type,
+            transcript=transcript,
+        )
 
     document_records: list[DocumentIngestionRecord] = []
     for document_file, pages in parsed_documents:
@@ -630,10 +962,11 @@ async def ingest_upload_bundle(
     return IngestionResponse(
         message="Ingestion completed successfully.",
         request=UploadRequestMeta(
-            video_filename=Path(video_file.filename or video_path.name).name,
+            video_filename=video_display_name,
+            video_url=normalized_video_url,
             document_filenames=[
                 Path(document_file.filename or "document").name
-                for document_file in document_files
+                for document_file in normalized_documents
             ],
         ),
         video=video_record,

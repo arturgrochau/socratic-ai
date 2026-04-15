@@ -15,6 +15,12 @@ Set these variables in your deployment platform:
 - `CACHE_PROCESSED_SOURCES` (`true` or `false`)
 - `DEPLOY_ENV` (default: `production`)
 
+## Runtime Dependencies
+
+- `ffmpeg` must be present at runtime (already installed in the Dockerfile).
+- `yt-dlp` is installed from `requirements.txt` and is required for YouTube URL ingestion.
+- YouTube mode downloads one media source and then reuses the same Whisper pipeline used for uploaded videos.
+
 ## Local Docker Run
 
 ```bash
@@ -86,6 +92,16 @@ curl -X POST http://127.0.0.1:8000/ask \
   -H "Content-Type: application/json" \
   -H "X-User-ID: demo-user" \
   -d '{"session_id":"demo-session","source_ids":[1,2],"query":"What are the key ideas?","top_k":8}'
+
+## Upload Modes
+
+`POST /upload` supports all three source combinations:
+
+- Video only (multipart `video` file OR form `video_url`)
+- Documents only (multipart `documents`)
+- Video + documents
+
+Constraint: provide at most one video source per request (`video` XOR `video_url`).
 ```
 
 ## Validation Script

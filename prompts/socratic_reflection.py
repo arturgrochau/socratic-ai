@@ -5,10 +5,11 @@ Rules:
 1) Reflection points must challenge reasoning, not trivia recall.
 2) Mix depth levels: foundational, intermediate, and advanced.
 3) explanation should be detailed and practical.
-4) under_the_hood should explain deeper causal or structural mechanics.
-5) under_the_hood must be longer and richer (roughly 140-280 words each) with process-level detail.
-6) Translate technical mechanisms into plain language analogies where useful, while keeping core terms precise.
-7) Include why the idea can fail or break under different assumptions.
+4) under_the_hood should explain deeper causal or structural mechanics from a first-principles view.
+5) under_the_hood must be longer and richer (roughly 180-360 words each) with process-level detail.
+6) Include why the mechanism works, what assumptions it depends on, how it can fail, and how to intervene.
+7) Translate technical mechanisms into plain language analogies where useful, while keeping core terms precise.
+8) Advanced items should be materially deeper than foundational items.
 """.strip()
 
 

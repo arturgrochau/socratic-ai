@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import streamlit as st
@@ -22,6 +23,16 @@ DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 REQUEST_TIMEOUT = _resolve_timeout_seconds()
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
+SUPPORTED_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+    "youtu.be",
+    "www.youtu.be",
+}
 
 
 def _init_state() -> None:
@@ -65,6 +76,16 @@ def _init_state() -> None:
         st.session_state.wizard_replace_video = False
     if "wizard_replace_documents" not in st.session_state:
         st.session_state.wizard_replace_documents = False
+    if "wizard_video_source_mode" not in st.session_state:
+        st.session_state.wizard_video_source_mode = "Paste YouTube link"
+    if "wizard_last_video_source_mode" not in st.session_state:
+        st.session_state.wizard_last_video_source_mode = "Paste YouTube link"
+    if "wizard_video_url" not in st.session_state:
+        st.session_state.wizard_video_url = ""
+    if "wizard_video_url_input" not in st.session_state:
+        st.session_state.wizard_video_url_input = ""
+    if "auto_submit_query" not in st.session_state:
+        st.session_state.auto_submit_query = ""
 
 
 def _request_headers() -> dict[str, str]:
@@ -139,6 +160,11 @@ def _reset_builder() -> None:
     st.session_state.pending_dashboard_section = ""
     st.session_state.wizard_replace_video = False
     st.session_state.wizard_replace_documents = False
+    st.session_state.wizard_video_source_mode = "Paste YouTube link"
+    st.session_state.wizard_last_video_source_mode = "Paste YouTube link"
+    st.session_state.wizard_video_url = ""
+    st.session_state.wizard_video_url_input = ""
+    st.session_state.auto_submit_query = ""
 
 
 def _file_extension(filename: str) -> str:
@@ -152,18 +178,65 @@ def _is_supported_video_name(filename: str) -> bool:
     return _file_extension(filename) in SUPPORTED_VIDEO_EXTENSIONS
 
 
+def _is_supported_youtube_url(url_value: str) -> bool:
+    return bool(_normalize_youtube_url(url_value))
+
+
+def _normalize_youtube_url(url_value: str) -> str:
+    raw = url_value.strip()
+    if not raw:
+        return ""
+
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www.") and host not in {"www.youtube.com", "www.youtube-nocookie.com"}:
+        host = host[4:]
+
+    if host not in SUPPORTED_YOUTUBE_HOSTS:
+        return ""
+
+    path = (parsed.path or "").strip()
+    if host == "youtu.be":
+        video_id = path.strip("/")
+        return candidate if video_id else ""
+
+    normalized_path = path.rstrip("/")
+    if normalized_path == "/watch":
+        video_id = (parse_qs(parsed.query).get("v") or [""])[0].strip()
+        return candidate if video_id else ""
+
+    for prefix in ("/shorts/", "/embed/", "/live/"):
+        if normalized_path.startswith(prefix):
+            tail = normalized_path[len(prefix):].strip("/")
+            return candidate if tail else ""
+
+    return ""
+
+
 def _are_supported_document_names(filenames: list[str]) -> tuple[bool, list[str]]:
     invalid = [name for name in filenames if _file_extension(name) not in SUPPORTED_DOCUMENT_EXTENSIONS]
     return len(invalid) == 0, invalid
 
 
-def _queue_chat_navigation(prefill: str) -> None:
-    st.session_state.ask_prefill = prefill.strip()
+def _queue_chat_navigation(prefill: str, *, auto_submit: bool = False) -> None:
+    normalized = prefill.strip()
+    if auto_submit:
+        st.session_state.auto_submit_query = normalized
+        st.session_state.ask_prefill = ""
+    else:
+        st.session_state.ask_prefill = normalized
+        st.session_state.auto_submit_query = ""
     st.session_state.pending_dashboard_section = "Socratic Chatbox"
 
 
 def _run_upload_process_and_generate(
-    video_upload: dict[str, str | bytes],
+    video_upload: dict[str, str | bytes] | None,
+    video_url: str,
     document_uploads: list[dict[str, str | bytes]],
     stage_callback: Callable[[str], None] | None = None,
 ) -> None:
@@ -173,16 +246,22 @@ def _run_upload_process_and_generate(
 
     _set_stage("Stage 1/4: Uploading files...")
 
-    files = [
-        (
-            "video",
+    files: list[tuple[str, tuple[str, bytes, str]]] = []
+    data: dict[str, str] = {}
+
+    if video_upload is not None:
+        files.append(
             (
-                str(video_upload["name"]),
-                video_upload["data"],
-                str(video_upload["mime_type"]),
-            ),
+                "video",
+                (
+                    str(video_upload["name"]),
+                    video_upload["data"],
+                    str(video_upload["mime_type"]),
+                ),
+            )
         )
-    ]
+    elif video_url.strip():
+        data["video_url"] = video_url.strip()
 
     for document_upload in document_uploads:
         files.append(
@@ -198,7 +277,8 @@ def _run_upload_process_and_generate(
 
     upload_response = requests.post(
         f"{st.session_state.api_base_url}/upload",
-        files=files,
+        files=files if files else None,
+        data=data if data else None,
         headers=_request_headers(),
         timeout=REQUEST_TIMEOUT,
     )
@@ -206,14 +286,16 @@ def _run_upload_process_and_generate(
         raise RuntimeError(f"/upload failed: {_extract_error(upload_response)}")
 
     upload_payload = upload_response.json()
-    video_source_id = int(upload_payload["video"]["source_id"])
+    video_payload = upload_payload.get("video") or {}
+    video_source_id = int(video_payload.get("source_id", 0) or 0)
+    normalized_video_source_id = video_source_id if video_source_id > 0 else None
     document_source_ids = [
         int(document_payload["source_id"])
         for document_payload in upload_payload.get("documents", [])
     ]
 
     process_payload = {
-        "video_source_id": video_source_id,
+        "video_source_id": normalized_video_source_id,
         "document_source_ids": document_source_ids,
     }
 
@@ -225,28 +307,34 @@ def _run_upload_process_and_generate(
 
     _set_stage("Stage 4/4: Finalizing dashboard...")
 
-    st.session_state.video_source_id = video_source_id
+    st.session_state.video_source_id = normalized_video_source_id
     st.session_state.document_source_ids = document_source_ids
-    st.session_state.source_ids = [video_source_id, *document_source_ids]
+    st.session_state.source_ids = (
+        ([normalized_video_source_id] if normalized_video_source_id is not None else [])
+        + document_source_ids
+    )
     st.session_state.pipeline_ready = True
     st.session_state.interaction_session_id = str(uuid.uuid4())
     st.session_state.ask_result = None
     st.session_state.ask_messages = []
+    st.session_state.ask_prefill = ""
+    st.session_state.auto_submit_query = ""
     st.session_state.generation_result = generation_payload
     st.session_state.wizard_step = 3
     st.session_state.dashboard_section = "Cross-Source Synthesis & Assessment"
 
 
-def _resolve_source_label_map(video_payload: dict, document_payloads: list[dict]) -> dict[int, str]:
+def _resolve_source_label_map(video_payload: dict | None, document_payloads: list[dict]) -> dict[int, str]:
     label_map: dict[int, str] = {}
 
-    video_source_id = int(video_payload.get("source_id", 0) or 0)
-    if video_source_id > 0:
-        video_label = (
-            str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
-            or "Video"
-        )
-        label_map[video_source_id] = video_label
+    if video_payload:
+        video_source_id = int(video_payload.get("source_id", 0) or 0)
+        if video_source_id > 0:
+            video_label = (
+                str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
+                or "Video"
+            )
+            label_map[video_source_id] = video_label
 
     for index, document_payload in enumerate(document_payloads, start=1):
         source_id = int(document_payload.get("source_id", 0) or 0)
@@ -263,6 +351,29 @@ def _resolve_source_label_map(video_payload: dict, document_payloads: list[dict]
         label_map[source_id] = document_label
 
     return label_map
+
+
+def _should_show_cross_source_section(
+    *,
+    generation_result: dict,
+    insights_payload: dict,
+    quiz_payload: dict,
+) -> bool:
+    source_ids = generation_result.get("source_ids") or []
+    if len(source_ids) < 2:
+        return False
+
+    return any(
+        [
+            bool(insights_payload.get("intersections")),
+            bool(insights_payload.get("parallels")),
+            bool(str(insights_payload.get("synthesis_text") or "").strip()),
+            bool(str(insights_payload.get("layman_bridge") or "").strip()),
+            bool(str(insights_payload.get("comparative_analysis") or "").strip()),
+            bool(insights_payload.get("application_scenarios")),
+            bool(quiz_payload.get("questions")),
+        ]
+    )
 
 
 def _render_key_terms(key_terms: list[str]) -> None:
@@ -577,6 +688,12 @@ def _render_ask_tab(has_user_id: bool) -> None:
         st.session_state.socratic_chat_text = st.session_state.ask_prefill.strip()
         st.session_state.ask_prefill = ""
 
+    auto_query = st.session_state.auto_submit_query.strip()
+    if auto_query:
+        st.session_state.auto_submit_query = ""
+        _submit_chat_query(auto_query)
+        return
+
     if not has_user_id:
         st.warning("Set a user ID in the sidebar to use the chatbox.")
         return
@@ -634,23 +751,32 @@ def _render_generation_tabs(has_user_id: bool) -> None:
         st.info("Generate tailored content to populate tabs.")
         return
 
-    video_payload = generation_result.get("video", {})
+    video_payload = generation_result.get("video") or None
     document_payloads = generation_result.get("documents", []) or []
     insights_payload = generation_result.get("insights", {})
     quiz_payload = generation_result.get("quiz", {})
     source_label_map = _resolve_source_label_map(video_payload, document_payloads)
 
-    section_options = [
-        "Video",
-        "Documents",
-        "Cross-Source Synthesis & Assessment",
-        "Socratic Chatbox",
-    ]
+    section_options: list[str] = []
+    if video_payload:
+        section_options.append("Video")
+    if document_payloads:
+        section_options.append("Documents")
+
+    if _should_show_cross_source_section(
+        generation_result=generation_result,
+        insights_payload=insights_payload,
+        quiz_payload=quiz_payload,
+    ):
+        section_options.append("Cross-Source Synthesis & Assessment")
+    section_options.append("Socratic Chatbox")
 
     pending_section = str(st.session_state.pending_dashboard_section or "").strip()
     if pending_section in section_options:
         st.session_state.dashboard_section = pending_section
     st.session_state.pending_dashboard_section = ""
+    if st.session_state.dashboard_section not in section_options:
+        st.session_state.dashboard_section = section_options[0]
 
     st.radio(
         "Dashboard Section",
@@ -661,7 +787,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
     )
     selected_section = st.session_state.dashboard_section
 
-    if selected_section == "Video":
+    if selected_section == "Video" and video_payload:
         _render_source_learning_section(video_payload)
 
     if selected_section == "Documents":
@@ -729,7 +855,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                             why_it_matters=why_it_matters,
                             emphasis_terms=emphasis_terms,
                             attributed_sentences=attributed_sentences,
-                        ))
+                        ), auto_submit=True)
                         st.rerun()
 
                     inferred_extension = str(intersection.get("inferred_extension") or "").strip()
@@ -768,7 +894,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                             why_it_matters="Help me understand the strongest overlap across my sources.",
                             emphasis_terms=emphasis_terms,
                             attributed_sentences=normalized_parallels,
-                        ))
+                        ), auto_submit=True)
                         st.rerun()
             else:
                 st.write("No intersections available.")
@@ -884,43 +1010,116 @@ def main() -> None:
     st.caption(f"Step {st.session_state.wizard_step} of 3")
 
     if st.session_state.wizard_step == 1:
-        st.markdown("### Step 1: Upload video")
+        st.markdown("### Step 1: Add one optional video source")
+        st.caption("Choose exactly one video source: upload OR YouTube link. You can skip video.")
 
-        video_file = None
-        if st.session_state.wizard_video_upload is None or st.session_state.wizard_replace_video:
-            video_file = st.file_uploader(
-                "Upload one video",
-                accept_multiple_files=False,
-                key="wizard_video_uploader",
-                help="Supported formats: mp4, mov, m4v, avi, mkv, webm.",
-            )
-            if video_file is not None and not _is_supported_video_name(video_file.name):
-                st.warning("Unsupported video format. Use: mp4, mov, m4v, avi, mkv, or webm.")
-                video_file = None
-        else:
-            st.caption("A video is already selected. Use Replace video to choose another one.")
-            if st.button("Replace video", key="replace_video_button"):
-                st.session_state.wizard_replace_video = True
-                st.rerun()
+        selected_mode = st.radio(
+            "Video source",
+            options=["Upload video", "Paste YouTube link"],
+            key="wizard_video_source_mode",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
 
-        if st.session_state.wizard_video_upload is not None:
-            st.success(f"Selected: {st.session_state.wizard_video_upload['name']}")
-
-        if st.button("Next", disabled=(not has_user_id)):
-            if video_file is None and st.session_state.wizard_video_upload is None:
-                st.error("Upload a video before continuing.")
+        if st.session_state.wizard_last_video_source_mode != selected_mode:
+            st.session_state.wizard_replace_video = False
+            if selected_mode == "Upload video":
+                st.session_state.wizard_video_url = ""
             else:
-                if video_file is not None:
-                    st.session_state.wizard_video_upload = _pack_uploaded_file(video_file)
+                st.session_state.wizard_video_upload = None
+            st.session_state.wizard_last_video_source_mode = selected_mode
+
+        if selected_mode == "Upload video":
+            uploaded_video = None
+            if st.session_state.wizard_video_upload is not None and not st.session_state.wizard_replace_video:
+                st.success(f"Video selected: {st.session_state.wizard_video_upload['name']}")
+                if st.button("Replace video", key="replace_video_button"):
+                    st.session_state.wizard_replace_video = True
+                    st.rerun()
+            else:
+                uploaded_video = st.file_uploader(
+                    "Upload one video",
+                    accept_multiple_files=False,
+                    key="wizard_video_uploader",
+                    help="Supported formats: mp4, mov, m4v, avi, mkv, webm.",
+                )
+                if uploaded_video is not None and not _is_supported_video_name(uploaded_video.name):
+                    st.warning("Unsupported video format. Use: mp4, mov, m4v, avi, mkv, or webm.")
+                    uploaded_video = None
+                if uploaded_video is not None:
+                    st.session_state.wizard_video_upload = _pack_uploaded_file(uploaded_video)
+                    st.session_state.wizard_video_url = ""
                     st.session_state.wizard_replace_video = False
+                    st.success(f"Video selected: {uploaded_video.name}")
+        else:
+            if st.session_state.wizard_video_url.strip() and not st.session_state.wizard_replace_video:
+                st.success(f"YouTube link saved: {st.session_state.wizard_video_url.strip()}")
+                if st.button("Replace YouTube link", key="replace_video_link_button"):
+                    st.session_state.wizard_replace_video = True
+                    st.rerun()
+            else:
+                if (
+                    not st.session_state.wizard_video_url_input.strip()
+                    and st.session_state.wizard_video_url.strip()
+                ):
+                    st.session_state.wizard_video_url_input = st.session_state.wizard_video_url.strip()
+                youtube_url_candidate = st.text_input(
+                    "Paste one YouTube URL",
+                    key="wizard_video_url_input",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                )
+                if st.button("Save link", key="save_video_link"):
+                    normalized_youtube_url = _normalize_youtube_url(youtube_url_candidate)
+                    if not normalized_youtube_url:
+                        st.error("Enter a valid single-video YouTube URL.")
+                    else:
+                        st.session_state.wizard_video_url = normalized_youtube_url
+                        st.session_state.wizard_video_upload = None
+                        st.session_state.wizard_replace_video = False
+                        st.rerun()
+
+        col_skip, col_next = st.columns(2)
+        with col_skip:
+            if st.button("Skip video", disabled=(not has_user_id)):
+                st.session_state.wizard_video_upload = None
+                st.session_state.wizard_video_url = ""
                 st.session_state.wizard_step = 2
                 st.rerun()
+        with col_next:
+            if st.button("Next", disabled=(not has_user_id)):
+                normalized_saved_youtube_url = _normalize_youtube_url(st.session_state.wizard_video_url)
+                normalized_input_youtube_url = _normalize_youtube_url(
+                    st.session_state.wizard_video_url_input
+                )
+                effective_youtube_url = normalized_saved_youtube_url or normalized_input_youtube_url
+
+                if effective_youtube_url:
+                    st.session_state.wizard_video_url = effective_youtube_url
+
+                has_video_source = bool(st.session_state.wizard_video_upload) or bool(effective_youtube_url)
+                if not has_video_source:
+                    st.error("Add a valid video upload or YouTube link, or use Skip video.")
+                else:
+                    if effective_youtube_url:
+                        st.session_state.wizard_video_upload = None
+                    st.session_state.wizard_step = 2
+                    st.rerun()
 
     elif st.session_state.wizard_step == 2:
-        st.markdown("### Step 2: Upload source documents")
+        st.markdown("### Step 2: Add optional documents")
+        st.caption("Upload documents for cross-source synthesis, or skip this step.")
+        has_video_source = bool(st.session_state.wizard_video_upload) or bool(
+            _normalize_youtube_url(st.session_state.wizard_video_url)
+        )
 
-        document_files = []
-        if not st.session_state.wizard_document_uploads or st.session_state.wizard_replace_documents:
+        document_files: list = []
+        if st.session_state.wizard_document_uploads and not st.session_state.wizard_replace_documents:
+            existing_names = [item["name"] for item in st.session_state.wizard_document_uploads]
+            st.success(f"Documents selected: {', '.join(existing_names)}")
+            if st.button("Replace documents", key="replace_documents_button"):
+                st.session_state.wizard_replace_documents = True
+                st.rerun()
+        else:
             uploaded_files = st.file_uploader(
                 "Upload one or more documents",
                 accept_multiple_files=True,
@@ -937,31 +1136,35 @@ def main() -> None:
                         + ". Use: pdf, txt, md."
                     )
                     document_files = []
-        else:
-            st.caption("Documents are already selected. Use Replace documents to choose a new set.")
-            if st.button("Replace documents", key="replace_documents_button"):
-                st.session_state.wizard_replace_documents = True
-                st.rerun()
 
-        if st.session_state.wizard_document_uploads:
-            existing_names = [item["name"] for item in st.session_state.wizard_document_uploads]
-            st.success(f"Selected: {', '.join(existing_names)}")
+            if st.button("Save documents", key="save_documents_selection"):
+                if not document_files:
+                    st.error("Select at least one document before saving.")
+                else:
+                    st.session_state.wizard_document_uploads = [
+                        _pack_uploaded_file(file) for file in document_files
+                    ]
+                    st.session_state.wizard_replace_documents = False
+                    st.success("Saved document selection.")
 
-        col_back, col_next = st.columns(2)
+        col_back, col_skip, col_next = st.columns(3)
         with col_back:
             if st.button("Back"):
                 st.session_state.wizard_step = 1
                 st.rerun()
+        with col_skip:
+            if st.button("Skip documents", disabled=(not has_user_id or not has_video_source)):
+                st.session_state.wizard_document_uploads = []
+                st.session_state.wizard_replace_documents = False
+                st.session_state.wizard_step = 3
+                st.rerun()
+            if not has_video_source:
+                st.caption("Documents cannot be skipped when no video source is selected.")
         with col_next:
             if st.button("Next", disabled=(not has_user_id)):
-                if not document_files and not st.session_state.wizard_document_uploads:
-                    st.error("Upload at least one document before continuing.")
+                if not st.session_state.wizard_document_uploads:
+                    st.error("Save documents first, or use Skip documents.")
                 else:
-                    if document_files:
-                        st.session_state.wizard_document_uploads = [
-                            _pack_uploaded_file(file) for file in document_files
-                        ]
-                        st.session_state.wizard_replace_documents = False
                     st.session_state.wizard_step = 3
                     st.rerun()
 
@@ -970,18 +1173,28 @@ def main() -> None:
         st.caption("Estimated generation time: about 2 to 5 minutes.")
 
         selected_video = st.session_state.wizard_video_upload
+        selected_video_url = st.session_state.wizard_video_url.strip()
         selected_documents = st.session_state.wizard_document_uploads
+        has_video_source = selected_video is not None or bool(selected_video_url)
+        has_document_source = bool(selected_documents)
+        has_any_source = has_video_source or has_document_source
 
-        if selected_video is None:
-            st.warning("Video is missing. Go back to Step 1.")
-        else:
+        if selected_video is not None:
             st.write(f"Video: {selected_video['name']}")
-        if not selected_documents:
-            st.warning("Documents are missing. Go back to Step 2.")
+        elif selected_video_url:
+            st.write(f"YouTube: {selected_video_url}")
         else:
+            st.info("Video: skipped")
+
+        if selected_documents:
             st.write("Documents:")
             for upload in selected_documents:
                 st.markdown(f"- {upload['name']}")
+        else:
+            st.info("Documents: skipped")
+
+        if not has_any_source:
+            st.warning("Add at least one source before generating tailored learning.")
 
         generate_clicked = st.button(
             "Generate tailored Socratic learning",
@@ -989,8 +1202,7 @@ def main() -> None:
             use_container_width=True,
             disabled=(
                 not has_user_id
-                or st.session_state.wizard_video_upload is None
-                or not st.session_state.wizard_document_uploads
+                or not has_any_source
             ),
         )
 
@@ -1004,6 +1216,7 @@ def main() -> None:
                 try:
                     _run_upload_process_and_generate(
                         video_upload=st.session_state.wizard_video_upload,
+                        video_url=st.session_state.wizard_video_url,
                         document_uploads=st.session_state.wizard_document_uploads,
                         stage_callback=_update_stage,
                     )
