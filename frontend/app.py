@@ -384,6 +384,50 @@ def _render_key_terms(key_terms: list[str]) -> None:
         st.markdown(f"Key terms: {formatted}")
 
 
+def _looks_structured_markdown(text_value: str) -> bool:
+    normalized = str(text_value or "").strip()
+    if not normalized:
+        return False
+    if "\n\n" in normalized:
+        return True
+
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    for line in lines:
+        if line.startswith(("#", "- ", "* ", "> ")):
+            return True
+        if re.match(r"^\d+\.\s", line):
+            return True
+    return False
+
+
+def _format_long_prose_markdown(text_value: str, *, max_sentences_per_paragraph: int = 3) -> str:
+    normalized = " ".join(str(text_value or "").split()).strip()
+    if not normalized:
+        return ""
+    if _looks_structured_markdown(text_value):
+        return str(text_value).strip()
+    if len(normalized) < 360:
+        return normalized
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", normalized)
+        if sentence.strip()
+    ]
+    if len(sentences) <= max_sentences_per_paragraph:
+        return normalized
+
+    paragraph_size = max(2, max_sentences_per_paragraph)
+    paragraphs = [
+        " ".join(sentences[index:index + paragraph_size]).strip()
+        for index in range(0, len(sentences), paragraph_size)
+    ]
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
+
+
 def _render_reflection_points(reflection_points: list[dict] | list[str]) -> None:
     if not reflection_points:
         st.write("No reflection points available.")
@@ -403,10 +447,10 @@ def _render_reflection_points(reflection_points: list[dict] | list[str]) -> None
         if depth_level:
             st.caption(f"Depth: {depth_level}")
         if explanation:
-            st.write(explanation)
+            st.markdown(_format_long_prose_markdown(explanation))
         if under_the_hood:
             with st.expander(f"Why this works under the surface (point {index})"):
-                st.write(under_the_hood)
+                st.markdown(_format_long_prose_markdown(under_the_hood, max_sentences_per_paragraph=4))
 
 
 def _render_source_learning_section(section_payload: dict) -> None:
@@ -469,7 +513,7 @@ def _render_source_learning_section(section_payload: dict) -> None:
     )
     if deep_dive_text:
         st.markdown("### Deep Dive")
-        st.markdown(deep_dive_text)
+        st.markdown(_format_long_prose_markdown(deep_dive_text))
 
     key_terms = section_payload.get("key_terms", []) or []
     normalized_terms = [str(term) for term in key_terms]
@@ -478,7 +522,11 @@ def _render_source_learning_section(section_payload: dict) -> None:
     under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
     if under_surface_text:
         with st.expander("Why this works under the surface"):
-            st.markdown(_bold_keywords_in_text(under_surface_text, normalized_terms))
+            formatted_under_surface = _format_long_prose_markdown(
+                under_surface_text,
+                max_sentences_per_paragraph=4,
+            )
+            st.markdown(_bold_keywords_in_text(formatted_under_surface, normalized_terms))
 
             diagnostic_checklist = section_payload.get("diagnostic_checklist", []) or []
             if diagnostic_checklist:

@@ -65,7 +65,10 @@ MAX_REFLECTION_GROUNDING_CHARS = 7000
 GENERATION_MAX_STAGE_ATTEMPTS = 3
 MAX_STAGE_ERROR_CHARS = 700
 DEDUPLICATION_SIMILARITY_THRESHOLD = 0.9
+DEDUPLICATION_TOKEN_OVERLAP_THRESHOLD = 0.58
 DEDUPLICATION_MIN_CHAR_RATIO = 0.35
+DEDUPLICATION_MIN_TOKEN_LENGTH = 4
+OUTLINE_MODEL_MIN_GROUNDING_ROWS = 12
 
 
 class GenerationStageError(RuntimeError):
@@ -496,6 +499,63 @@ def _select_distributed_grounding_chunks(
     return chunks, selected_chunk_indexes
 
 
+def _should_use_model_progression_outline(*, total_rows: int, grounding_chunks: list[str]) -> bool:
+    return total_rows >= OUTLINE_MODEL_MIN_GROUNDING_ROWS and len(grounding_chunks) >= 5
+
+
+def _build_heuristic_progression_outline(summary_text: str, grounding_chunks: list[str]) -> str:
+    summary_sentences = _split_into_sentences(summary_text)
+    summary_anchor = summary_sentences[0] if summary_sentences else "Core ideas are developed progressively."
+
+    chunk_labels: list[str] = []
+    for entry in grounding_chunks:
+        first_line = str(entry).splitlines()[0].strip() if entry else ""
+        if first_line.startswith("[") and first_line.endswith("]"):
+            chunk_labels.append(first_line.strip("[]"))
+
+    if chunk_labels:
+        first_label = chunk_labels[0]
+        mid_label = chunk_labels[len(chunk_labels) // 2]
+        last_label = chunk_labels[-1]
+    else:
+        first_label = "early section"
+        mid_label = "middle section"
+        last_label = "later section"
+
+    transitions = [
+        f"- Foundations are established in {first_label} and frame the core mechanism.",
+        f"- Complexity increases by {mid_label}, where interactions and tradeoffs become explicit.",
+        f"- Edge-case behavior and implications appear in {last_label}, clarifying failure boundaries.",
+    ]
+    transition_block = "\n".join(transitions)
+    return (
+        f"{summary_anchor} The material progresses from fundamentals to integration and finally to "
+        "boundary conditions that pressure-test the core assumptions.\n\n"
+        "Core transitions:\n"
+        f"{transition_block}"
+    )
+
+
+def _tokenize_for_similarity(text_value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(text_value or "").lower())
+        if len(token) >= DEDUPLICATION_MIN_TOKEN_LENGTH
+    }
+
+
+def _token_overlap_ratio(left_text: str, right_text: str) -> float:
+    left_tokens = _tokenize_for_similarity(left_text)
+    right_tokens = _tokenize_for_similarity(right_text)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection_size = len(left_tokens.intersection(right_tokens))
+    union_size = len(left_tokens.union(right_tokens))
+    if union_size == 0:
+        return 0.0
+    return intersection_size / union_size
+
+
 def _generate_source_progression_outline(
     *,
     summary_text: str,
@@ -548,26 +608,28 @@ def _split_into_sentences(text_value: str) -> list[str]:
 
 def _deduplicate_section_text(current_text: str, prior_texts: list[str]) -> str:
     current_sentences = _split_into_sentences(current_text)
-    if len(current_sentences) < 3:
+    if len(current_sentences) < 2:
         return current_text
 
     prior_sentences: list[str] = []
     for text_value in prior_texts:
         prior_sentences.extend(_split_into_sentences(text_value))
 
-    if not prior_sentences:
-        return current_text
-
     kept_sentences: list[str] = []
     for sentence in current_sentences:
         sentence_norm = sentence.lower()
         is_duplicate = False
-        for prior_sentence in prior_sentences:
+        for prior_sentence in [*prior_sentences, *kept_sentences]:
             prior_norm = prior_sentence.lower()
             if sentence_norm == prior_norm:
                 is_duplicate = True
                 break
-            if SequenceMatcher(None, sentence_norm, prior_norm).ratio() >= DEDUPLICATION_SIMILARITY_THRESHOLD:
+            sequence_similarity = SequenceMatcher(None, sentence_norm, prior_norm).ratio()
+            token_overlap = _token_overlap_ratio(sentence_norm, prior_norm)
+            if sequence_similarity >= DEDUPLICATION_SIMILARITY_THRESHOLD:
+                is_duplicate = True
+                break
+            if token_overlap >= DEDUPLICATION_TOKEN_OVERLAP_THRESHOLD:
                 is_duplicate = True
                 break
         if not is_duplicate:
@@ -970,13 +1032,34 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         ),
     )
 
-    progression_outline = _generate_source_progression_outline(
-        summary_text=summary_text,
-        source_type=source_type,
+    if _should_use_model_progression_outline(
+        total_rows=len(grounding_rows),
         grounding_chunks=grounding_chunks,
-        user_id=user_id,
-        run_id=run_id,
-    )
+    ):
+        progression_outline = _generate_source_progression_outline(
+            summary_text=summary_text,
+            source_type=source_type,
+            grounding_chunks=grounding_chunks,
+            user_id=user_id,
+            run_id=run_id,
+        )
+    else:
+        progression_outline = _build_heuristic_progression_outline(
+            summary_text=summary_text,
+            grounding_chunks=grounding_chunks,
+        )
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_progression_outline:{source_type}",
+            attempt_number=1,
+            status="skipped",
+            details=(
+                "heuristic_short_source;"
+                f"total_rows={len(grounding_rows)};"
+                f"grounding_chunk_count={len(grounding_chunks)}"
+            ),
+        )
     generated_title = _generate_source_title(summary_text, source_type, user_id, run_id)
     deep_dive_text, key_terms = _generate_source_deep_dive(
         summary_text,

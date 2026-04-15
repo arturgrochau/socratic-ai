@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from app.generation import _compute_distributed_row_positions, _deduplicate_section_text
+from app.generation import (
+    _compute_distributed_row_positions,
+    _deduplicate_section_text,
+    _should_use_model_progression_outline,
+)
 from frontend.app import _should_show_cross_source_section
 
 
@@ -46,6 +50,35 @@ class DeduplicationTests(unittest.TestCase):
 
         result = _deduplicate_section_text(current_text, prior_texts)
         self.assertEqual(result, current_text)
+
+    def test_deduplication_catches_semantic_overlap(self) -> None:
+        current_text = (
+            "Dopamine drives short-term reward seeking and narrows attention toward outcomes. "
+            "By reinforcing process-level milestones, you can retrain attention toward long-term growth."
+        )
+        prior_texts = [
+            "Short-term reward seeking is driven by dopamine and narrows attention toward outcomes."
+        ]
+
+        result = _deduplicate_section_text(current_text, prior_texts)
+        self.assertNotIn("dopamine drives short-term reward seeking", result.lower())
+        self.assertIn("process-level milestones", result.lower())
+
+
+class ProgressionOutlineEfficiencyTests(unittest.TestCase):
+    def test_short_sources_skip_model_outline_stage(self) -> None:
+        should_use_model = _should_use_model_progression_outline(
+            total_rows=6,
+            grounding_chunks=["a", "b", "c"],
+        )
+        self.assertFalse(should_use_model)
+
+    def test_long_sources_use_model_outline_stage(self) -> None:
+        should_use_model = _should_use_model_progression_outline(
+            total_rows=24,
+            grounding_chunks=[str(index) for index in range(7)],
+        )
+        self.assertTrue(should_use_model)
 
 
 class CrossSourceVisibilityTests(unittest.TestCase):
