@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
+import uuid
+from typing import Any
 
 from sqlalchemy import text
 
-from app.cost_logging import log_api_usage
+from app.cost_logging import log_api_usage, log_generation_stage_event
+from app.json_reliability import parse_json_object, safe_json_loads
 from app.linking import link_source_pair
 from app.models import (
     ApplicationScenario,
@@ -48,6 +52,117 @@ from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTE
 GENERATION_SCHEMA_VERSION = 5
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
+GENERATION_MAX_STAGE_ATTEMPTS = 3
+MAX_STAGE_ERROR_CHARS = 700
+
+
+class GenerationStageError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        stage_name: str,
+        attempt_number: int,
+        reason: str,
+    ) -> None:
+        self.run_id = run_id
+        self.stage_name = stage_name
+        self.attempt_number = attempt_number
+        self.reason = reason
+        super().__init__(
+            f"Generation failed at stage '{stage_name}' for run_id={run_id} "
+            f"after attempt {attempt_number}: {reason}"
+        )
+
+
+def _trim_error_detail(error_text: str) -> str:
+    compact = " ".join(str(error_text).split())
+    if len(compact) <= MAX_STAGE_ERROR_CHARS:
+        return compact
+    return compact[: MAX_STAGE_ERROR_CHARS - 3].rstrip() + "..."
+
+
+def _run_structured_generation_step(
+    *,
+    run_id: str,
+    stage_name: str,
+    user_id: str,
+    user_prompt: str,
+    system_prompt: str,
+    response_schema: dict[str, Any],
+    required_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    for attempt_number in range(1, GENERATION_MAX_STAGE_ATTEMPTS + 1):
+        started = time.perf_counter()
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=stage_name,
+            attempt_number=attempt_number,
+            status="started",
+        )
+
+        try:
+            completion = openai_client.chat.completions.create(
+                model=GENERATION_MODEL,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_schema", "json_schema": response_schema},
+            )
+            log_api_usage(
+                response=completion,
+                user_id=user_id,
+                call_stage="generation",
+                model_name=GENERATION_MODEL,
+            )
+
+            content = completion.choices[0].message.content
+            payload = parse_json_object(content or "", stage_name=f"{stage_name} attempt {attempt_number}")
+
+            if required_keys:
+                missing_keys = [key for key in required_keys if key not in payload]
+                if missing_keys:
+                    raise ValueError(f"Missing required keys: {', '.join(missing_keys)}")
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=stage_name,
+                attempt_number=attempt_number,
+                status="succeeded",
+                duration_ms=duration_ms,
+            )
+            return payload
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            error_detail = _trim_error_detail(str(exc))
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=stage_name,
+                attempt_number=attempt_number,
+                status="failed",
+                duration_ms=duration_ms,
+                error_message=error_detail,
+            )
+            if attempt_number >= GENERATION_MAX_STAGE_ATTEMPTS:
+                raise GenerationStageError(
+                    run_id=run_id,
+                    stage_name=stage_name,
+                    attempt_number=attempt_number,
+                    reason=error_detail,
+                ) from exc
+
+    raise GenerationStageError(
+        run_id=run_id,
+        stage_name=stage_name,
+        attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
+        reason="Retry budget exhausted.",
+    )
 
 
 def ensure_generation_tables() -> None:
@@ -271,35 +386,20 @@ def _load_grounding_chunks(source_id: int, user_id: str) -> list[str]:
     return chunks
 
 
-def _generate_source_title(summary_text: str, source_type: str, user_id: str) -> str:
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": SOURCE_TITLE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Source type: {source_type}\n\n"
-                    "Generate a concise title from this summary:\n\n"
-                    f"{summary_text}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": SOURCE_TITLE_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+def _generate_source_title(summary_text: str, source_type: str, user_id: str, run_id: str) -> str:
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"source_title:{source_type}",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=SOURCE_TITLE_SYSTEM_PROMPT,
+        user_prompt=(
+            f"Source type: {source_type}\n\n"
+            "Generate a concise title from this summary:\n\n"
+            f"{summary_text}"
+        ),
+        response_schema=SOURCE_TITLE_JSON_SCHEMA,
+        required_keys=["title"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty source title content.")
-
-    payload = json.loads(content)
     title = str(payload.get("title", "")).strip()
     if not title:
         raise ValueError("Model returned an empty source title.")
@@ -311,38 +411,23 @@ def _generate_source_deep_dive(
     source_type: str,
     grounding_chunks: list[str],
     user_id: str,
+    run_id: str,
 ) -> tuple[str, list[str]]:
     chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
-
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": SOURCE_DEEP_DIVE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Source type: {source_type}\n\n"
-                    f"Source summary:\n{summary_text}\n\n"
-                    "Grounding chunks:\n"
-                    f"{chunk_text}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": SOURCE_DEEP_DIVE_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"source_deep_dive:{source_type}",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=SOURCE_DEEP_DIVE_SYSTEM_PROMPT,
+        user_prompt=(
+            f"Source type: {source_type}\n\n"
+            f"Source summary:\n{summary_text}\n\n"
+            "Grounding chunks:\n"
+            f"{chunk_text}"
+        ),
+        response_schema=SOURCE_DEEP_DIVE_JSON_SCHEMA,
+        required_keys=["deep_dive_text", "key_terms"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty deep-dive content.")
-
-    payload = json.loads(content)
     deep_dive_text = str(payload.get("deep_dive_text", "")).strip()
     key_terms = [
         str(term).strip()
@@ -362,39 +447,22 @@ def _generate_reflection_points(
     deep_dive_text: str,
     source_type: str,
     user_id: str,
+    run_id: str,
 ) -> list[ReflectionPoint]:
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": SOCRATIC_REFLECTION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Source type: {source_type}\n\n"
-                    f"Summary:\n{summary_text}\n\n"
-                    f"Deep dive:\n{deep_dive_text}\n\n"
-                    "Generate Socratic reflection points."
-                ),
-            },
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": SOCRATIC_REFLECTION_JSON_SCHEMA,
-        },
-    )
-    log_api_usage(
-        response=completion,
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"source_reflection:{source_type}",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=SOCRATIC_REFLECTION_SYSTEM_PROMPT,
+        user_prompt=(
+            f"Source type: {source_type}\n\n"
+            f"Summary:\n{summary_text}\n\n"
+            f"Deep dive:\n{deep_dive_text}\n\n"
+            "Generate Socratic reflection points."
+        ),
+        response_schema=SOCRATIC_REFLECTION_JSON_SCHEMA,
+        required_keys=["reflection_points"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty reflection content.")
-
-    payload = json.loads(content)
     raw_points = payload.get("reflection_points", [])
     points: list[ReflectionPoint] = []
     for raw_point in raw_points:
@@ -426,38 +494,24 @@ def _generate_under_surface_pack(
     source_type: str,
     grounding_chunks: list[str],
     user_id: str,
+    run_id: str,
 ) -> tuple[str, list[str], list[KeyTermExplanation]]:
     chunk_text = "\n\n".join(grounding_chunks[:6]) if grounding_chunks else "[No grounding chunks available]"
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": UNDER_SURFACE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Source type: {source_type}\n\n"
-                    f"Summary:\n{summary_text}\n\n"
-                    f"Deep dive:\n{deep_dive_text}\n\n"
-                    f"Key terms: {', '.join(key_terms[:10])}\n\n"
-                    f"Grounding chunks:\n{chunk_text}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": UNDER_SURFACE_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"source_under_surface:{source_type}",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=UNDER_SURFACE_SYSTEM_PROMPT,
+        user_prompt=(
+            f"Source type: {source_type}\n\n"
+            f"Summary:\n{summary_text}\n\n"
+            f"Deep dive:\n{deep_dive_text}\n\n"
+            f"Key terms: {', '.join(key_terms[:10])}\n\n"
+            f"Grounding chunks:\n{chunk_text}"
+        ),
+        response_schema=UNDER_SURFACE_JSON_SCHEMA,
+        required_keys=["under_surface_explainer", "diagnostic_checklist", "key_term_explanations"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty under-surface content.")
-
-    payload = json.loads(content)
     under_surface_explainer = str(payload.get("under_surface_explainer") or "").strip()
     diagnostic_checklist = [
         str(item).strip()
@@ -591,7 +645,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
     if int(row.get("schema_version") or 1) != GENERATION_SCHEMA_VERSION:
         return None
 
-    reflection_points_raw = json.loads(str(row["reflection_points_json"] or "[]"))
+    reflection_points_raw = safe_json_loads(row.get("reflection_points_json"), default=[])
     reflection_points: list[ReflectionPoint] = []
     for value in reflection_points_raw:
         if isinstance(value, str):
@@ -611,13 +665,13 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
             except Exception:
                 continue
 
-    key_terms_raw = json.loads(str(row["key_terms_json"] or "[]"))
+    key_terms_raw = safe_json_loads(row.get("key_terms_json"), default=[])
     key_terms = [str(term).strip() for term in key_terms_raw if str(term).strip()]
 
-    diagnostic_checklist_raw = json.loads(str(row.get("diagnostic_checklist_json") or "[]"))
+    diagnostic_checklist_raw = safe_json_loads(row.get("diagnostic_checklist_json"), default=[])
     diagnostic_checklist = [str(item).strip() for item in diagnostic_checklist_raw if str(item).strip()]
 
-    key_term_explanations_raw = json.loads(str(row.get("key_term_explanations_json") or "[]"))
+    key_term_explanations_raw = safe_json_loads(row.get("key_term_explanations_json"), default=[])
     key_term_explanations: list[KeyTermExplanation] = []
     for entry in key_term_explanations_raw:
         try:
@@ -647,13 +701,29 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
     )
 
 
-def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearningSection:
+def _build_source_learning_section(source_id: int, user_id: str, run_id: str) -> SourceLearningSection:
     source_type, source_name, _ = get_source_metadata(source_id, user_id)
 
     if CACHE_PROCESSED_SOURCES:
         cached = _load_cached_source_learning_section(source_id, user_id)
         if cached is not None:
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=f"source_learning_cache:{source_id}",
+                attempt_number=1,
+                status="cache_hit",
+                details=f"source_type={source_type}",
+            )
             return cached
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_learning_cache:{source_id}",
+            attempt_number=1,
+            status="cache_miss",
+            details=f"source_type={source_type}",
+        )
 
     summary_text = load_existing_source_summary(source_id, user_id)
     if summary_text is None:
@@ -664,18 +734,20 @@ def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearni
         raise ValueError(f"Source {source_id} summary is unavailable.")
 
     grounding_chunks = _load_grounding_chunks(source_id, user_id)
-    generated_title = _generate_source_title(summary_text, source_type, user_id)
+    generated_title = _generate_source_title(summary_text, source_type, user_id, run_id)
     deep_dive_text, key_terms = _generate_source_deep_dive(
         summary_text,
         source_type,
         grounding_chunks,
         user_id,
+        run_id,
     )
     reflection_points = _generate_reflection_points(
         summary_text,
         deep_dive_text,
         source_type,
         user_id,
+        run_id,
     )
     under_surface_explainer, diagnostic_checklist, key_term_explanations = _generate_under_surface_pack(
         summary_text=summary_text,
@@ -684,6 +756,7 @@ def _build_source_learning_section(source_id: int, user_id: str) -> SourceLearni
         source_type=source_type,
         grounding_chunks=grounding_chunks,
         user_id=user_id,
+        run_id=run_id,
     )
 
     section = SourceLearningSection(
@@ -743,6 +816,7 @@ def _generate_combined_insights(
     document_sections: list[SourceLearningSection],
     relationship_insights: list[str],
     user_id: str,
+    run_id: str,
 ) -> CombinedInsightSection:
     source_catalog = [
         {
@@ -768,33 +842,18 @@ def _generate_combined_insights(
         "relationship_insights": relationship_insights,
     }
 
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": COMBINED_INSIGHTS_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Generate cross-source attributed insights from this payload:\n\n"
-                    f"{json.dumps(source_payload, ensure_ascii=True)}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": COMBINED_INSIGHTS_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name="combined_insights",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=COMBINED_INSIGHTS_SYSTEM_PROMPT,
+        user_prompt=(
+            "Generate cross-source attributed insights from this payload:\n\n"
+            f"{json.dumps(source_payload, ensure_ascii=True)}"
+        ),
+        response_schema=COMBINED_INSIGHTS_JSON_SCHEMA,
+        required_keys=["intersections", "layman_bridge", "synthesis_text"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty combined insights content.")
-
-    payload = json.loads(content)
     known_sources = {
         video_section.source_id: "video",
         **{section.source_id: "document" for section in document_sections},
@@ -909,6 +968,7 @@ def _generate_combined_quiz(
     insights_section: CombinedInsightSection,
     relationship_insights: list[str],
     user_id: str,
+    run_id: str,
 ) -> CombinedQuizSection:
     quiz_payload = {
         "video": video_section.model_dump(),
@@ -930,33 +990,18 @@ def _generate_combined_quiz(
         ),
     }
 
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": COMBINED_QUIZ_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Generate overlap-focused advanced quiz questions from this payload:\n\n"
-                    f"{json.dumps(quiz_payload, ensure_ascii=True)}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": COMBINED_QUIZ_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name="combined_quiz",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=COMBINED_QUIZ_SYSTEM_PROMPT,
+        user_prompt=(
+            "Generate overlap-focused advanced quiz questions from this payload:\n\n"
+            f"{json.dumps(quiz_payload, ensure_ascii=True)}"
+        ),
+        response_schema=COMBINED_QUIZ_JSON_SCHEMA,
+        required_keys=["questions", "study_advice"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty quiz content.")
-
-    payload = json.loads(content)
     questions = [QuizQuestion.model_validate(item) for item in payload.get("questions", [])]
     if len(questions) < 6:
         raise ValueError("Model returned too few quiz questions.")
@@ -979,6 +1024,7 @@ def _generate_comparative_analysis(
     insights_section: CombinedInsightSection,
     relationship_insights: list[str],
     user_id: str,
+    run_id: str,
 ) -> str:
     payload = {
         "video": video_section.model_dump(),
@@ -987,33 +1033,18 @@ def _generate_comparative_analysis(
         "relationship_insights": relationship_insights,
     }
 
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": COMPARATIVE_ANALYSIS_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Generate one comparative deepening analysis from this payload:\n\n"
-                    f"{json.dumps(payload, ensure_ascii=True)}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": COMPARATIVE_ANALYSIS_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+    result = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name="comparative_analysis",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=COMPARATIVE_ANALYSIS_SYSTEM_PROMPT,
+        user_prompt=(
+            "Generate one comparative deepening analysis from this payload:\n\n"
+            f"{json.dumps(payload, ensure_ascii=True)}"
+        ),
+        response_schema=COMPARATIVE_ANALYSIS_JSON_SCHEMA,
+        required_keys=["comparative_analysis"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty comparative analysis content.")
-
-    result = json.loads(content)
     comparative_analysis = str(result.get("comparative_analysis", "")).strip()
     if not comparative_analysis:
         raise ValueError("Model returned empty comparative analysis text.")
@@ -1027,6 +1058,7 @@ def _generate_application_scenarios(
     insights_section: CombinedInsightSection,
     relationship_insights: list[str],
     user_id: str,
+    run_id: str,
 ) -> list[ApplicationScenario]:
     payload = {
         "video": video_section.model_dump(),
@@ -1035,33 +1067,18 @@ def _generate_application_scenarios(
         "relationship_insights": relationship_insights,
     }
 
-    completion = openai_client.chat.completions.create(
-        model=GENERATION_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": APPLICATION_SCENARIOS_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Generate grounded application scenarios from this payload:\n\n"
-                    f"{json.dumps(payload, ensure_ascii=True)}"
-                ),
-            },
-        ],
-        response_format={"type": "json_schema", "json_schema": APPLICATION_SCENARIOS_JSON_SCHEMA},
-    )
-    log_api_usage(
-        response=completion,
+    result = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name="application_scenarios",
         user_id=user_id,
-        call_stage="generation",
-        model_name=GENERATION_MODEL,
+        system_prompt=APPLICATION_SCENARIOS_SYSTEM_PROMPT,
+        user_prompt=(
+            "Generate grounded application scenarios from this payload:\n\n"
+            f"{json.dumps(payload, ensure_ascii=True)}"
+        ),
+        response_schema=APPLICATION_SCENARIOS_JSON_SCHEMA,
+        required_keys=["application_scenarios"],
     )
-
-    content = completion.choices[0].message.content
-    if not content:
-        raise ValueError("Model returned empty application scenarios content.")
-
-    result = json.loads(content)
     scenarios = [
         ApplicationScenario.model_validate(item)
         for item in result.get("application_scenarios", [])
@@ -1190,7 +1207,7 @@ def _load_cached_combined_learning_sections(
     if int(row.get("schema_version") or 1) != GENERATION_SCHEMA_VERSION:
         return None
 
-    raw_intersections = json.loads(str(row.get("intersections_json") or "[]"))
+    raw_intersections = safe_json_loads(row.get("intersections_json"), default=[])
     intersections: list[InsightIntersection] = []
     for entry in raw_intersections:
         try:
@@ -1198,7 +1215,7 @@ def _load_cached_combined_learning_sections(
         except Exception:
             continue
 
-    raw_parallels = json.loads(str(row["parallels_json"] or "[]"))
+    raw_parallels = safe_json_loads(row.get("parallels_json"), default=[])
     parallels: list[AttributedSentence] = []
     for entry in raw_parallels:
         try:
@@ -1225,7 +1242,7 @@ def _load_cached_combined_learning_sections(
         return None
 
     comparative_analysis = str(row.get("comparative_analysis_text") or "").strip()
-    raw_application_scenarios = json.loads(str(row.get("application_scenarios_json") or "[]"))
+    raw_application_scenarios = safe_json_loads(row.get("application_scenarios_json"), default=[])
     application_scenarios: list[ApplicationScenario] = []
     for entry in raw_application_scenarios:
         try:
@@ -1235,7 +1252,7 @@ def _load_cached_combined_learning_sections(
     if not comparative_analysis or len(application_scenarios) < 2:
         return None
 
-    quiz_payload = json.loads(str(row["quiz_json"] or "{}"))
+    quiz_payload = safe_json_loads(row.get("quiz_json"), default={})
     try:
         quiz_section = CombinedQuizSection.model_validate(quiz_payload)
     except Exception:
@@ -1260,22 +1277,62 @@ def generate_tailored_learning(
     user_id: str,
 ) -> GenerateTailoredLearningResponse:
     ensure_generation_tables()
+    run_id = f"gen-{uuid.uuid4().hex[:12]}"
 
     normalized_video_id, normalized_document_ids = _normalize_ids(
         video_source_id,
         document_source_ids,
     )
 
-    process_source(normalized_video_id, user_id)
+    log_generation_stage_event(
+        run_id=run_id,
+        user_id=user_id,
+        stage_name="pipeline_start",
+        attempt_number=1,
+        status="started",
+        details=(
+            f"video_source_id={normalized_video_id}; "
+            f"document_source_ids={','.join(str(value) for value in normalized_document_ids)}"
+        ),
+    )
+
+    video_process_result = process_source(normalized_video_id, user_id)
+    log_generation_stage_event(
+        run_id=run_id,
+        user_id=user_id,
+        stage_name=f"process_source:{normalized_video_id}",
+        attempt_number=1,
+        status="cache_hit" if int(video_process_result.chunk_count) == 0 else "succeeded",
+        details=f"source_type=video; chunk_count={video_process_result.chunk_count}",
+    )
     for document_source_id in normalized_document_ids:
-        process_source(document_source_id, user_id)
+        process_result = process_source(document_source_id, user_id)
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"process_source:{document_source_id}",
+            attempt_number=1,
+            status="cache_hit" if int(process_result.chunk_count) == 0 else "succeeded",
+            details=f"source_type=document; chunk_count={process_result.chunk_count}",
+        )
 
     for document_source_id in normalized_document_ids:
-        link_source_pair(normalized_video_id, document_source_id, user_id)
+        link_result = link_source_pair(normalized_video_id, document_source_id, user_id)
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"link_sources:{normalized_video_id}:{document_source_id}",
+            attempt_number=1,
+            status="cache_hit" if int(link_result.get("stored_edges", 0)) == 0 else "succeeded",
+            details=(
+                f"candidate_pairs={int(link_result.get('candidate_pairs', 0))}; "
+                f"stored_edges={int(link_result.get('stored_edges', 0))}"
+            ),
+        )
 
-    video_section = _build_source_learning_section(normalized_video_id, user_id)
+    video_section = _build_source_learning_section(normalized_video_id, user_id, run_id)
     document_sections = [
-        _build_source_learning_section(source_id, user_id)
+        _build_source_learning_section(source_id, user_id, run_id)
         for source_id in normalized_document_ids
     ]
 
@@ -1286,6 +1343,13 @@ def generate_tailored_learning(
             video_source_id=normalized_video_id,
             document_source_ids=normalized_document_ids,
         )
+    log_generation_stage_event(
+        run_id=run_id,
+        user_id=user_id,
+        stage_name="combined_learning_cache",
+        attempt_number=1,
+        status="cache_hit" if cached_combined is not None else "cache_miss",
+    )
 
     relationship_insights = _load_relationship_insights(
         [normalized_video_id, *normalized_document_ids],
@@ -1300,6 +1364,7 @@ def generate_tailored_learning(
             document_sections=document_sections,
             relationship_insights=relationship_insights,
             user_id=user_id,
+            run_id=run_id,
         )
         quiz_section = _generate_combined_quiz(
             video_section=video_section,
@@ -1307,6 +1372,7 @@ def generate_tailored_learning(
             insights_section=insights_section,
             relationship_insights=relationship_insights,
             user_id=user_id,
+            run_id=run_id,
         )
         comparative_analysis = _generate_comparative_analysis(
             video_section=video_section,
@@ -1314,6 +1380,7 @@ def generate_tailored_learning(
             insights_section=insights_section,
             relationship_insights=relationship_insights,
             user_id=user_id,
+            run_id=run_id,
         )
         application_scenarios = _generate_application_scenarios(
             video_section=video_section,
@@ -1321,6 +1388,7 @@ def generate_tailored_learning(
             insights_section=insights_section,
             relationship_insights=relationship_insights,
             user_id=user_id,
+            run_id=run_id,
         )
         insights_section = insights_section.model_copy(
             update={
@@ -1335,6 +1403,18 @@ def generate_tailored_learning(
             insights=insights_section,
             quiz=quiz_section,
         )
+
+    log_generation_stage_event(
+        run_id=run_id,
+        user_id=user_id,
+        stage_name="pipeline_end",
+        attempt_number=1,
+        status="succeeded",
+        details=(
+            f"video_source_id={normalized_video_id}; "
+            f"document_count={len(normalized_document_ids)}"
+        ),
+    )
 
     return GenerateTailoredLearningResponse(
         status_message="Tailored Socratic learning generated successfully.",

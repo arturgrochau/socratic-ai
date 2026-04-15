@@ -7,6 +7,7 @@ Rules:
 3) Write one cohesive analysis that is practical and non-redundant.
 4) Include concrete language that helps a learner decide when to use one framing versus another.
 5) Keep the tone explanatory and technically honest.
+6) Keep the output bounded (single focused analysis, no repetition loops).
 """.strip()
 
 
@@ -17,7 +18,7 @@ COMPARATIVE_ANALYSIS_JSON_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "comparative_analysis": {"type": "string"},
+            "comparative_analysis": {"type": "string", "maxLength": 3600},
         },
         "required": ["comparative_analysis"],
     },

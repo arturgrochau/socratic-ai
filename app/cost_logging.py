@@ -34,6 +34,32 @@ def ensure_cost_logging_tables() -> None:
                 """
             )
         )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS generation_stage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    stage_name TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms INTEGER,
+                    error_message TEXT,
+                    details TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_stage_events_run
+                ON generation_stage_events (run_id, stage_name, created_at)
+                """
+            )
+        )
 
 
 def extract_usage_fields(response: Any) -> tuple[int | None, int | None, int | None]:
@@ -104,5 +130,57 @@ def log_api_usage(
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
                 "request_count": max(int(request_count), 1),
+            },
+        )
+
+
+def log_generation_stage_event(
+    *,
+    run_id: str,
+    user_id: str,
+    stage_name: str,
+    attempt_number: int,
+    status: str,
+    duration_ms: int | None = None,
+    error_message: str | None = None,
+    details: str | None = None,
+) -> None:
+    if not ENABLE_COST_LOGGING:
+        return
+
+    with db_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO generation_stage_events (
+                    run_id,
+                    user_id,
+                    stage_name,
+                    attempt_number,
+                    status,
+                    duration_ms,
+                    error_message,
+                    details
+                ) VALUES (
+                    :run_id,
+                    :user_id,
+                    :stage_name,
+                    :attempt_number,
+                    :status,
+                    :duration_ms,
+                    :error_message,
+                    :details
+                )
+                """
+            ),
+            {
+                "run_id": str(run_id).strip(),
+                "user_id": user_id,
+                "stage_name": stage_name,
+                "attempt_number": max(int(attempt_number), 1),
+                "status": str(status).strip() or "unknown",
+                "duration_ms": int(duration_ms) if duration_ms is not None else None,
+                "error_message": (str(error_message)[:1200] if error_message else None),
+                "details": (str(details)[:2000] if details else None),
             },
         )

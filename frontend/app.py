@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from collections.abc import Callable
@@ -8,8 +9,17 @@ import requests
 import streamlit as st
 
 
+def _resolve_timeout_seconds() -> int:
+    raw = str(os.getenv("FRONTEND_REQUEST_TIMEOUT", "600")).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 600
+    return max(120, value)
+
+
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
-REQUEST_TIMEOUT = 300
+REQUEST_TIMEOUT = _resolve_timeout_seconds()
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
 
@@ -67,9 +77,26 @@ def _extract_error(response: requests.Response) -> str:
     except ValueError:
         return response.text.strip() or f"HTTP {response.status_code}"
 
+    if not isinstance(payload, dict):
+        return str(payload)
+
     detail = payload.get("detail")
     if isinstance(detail, str):
         return detail
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or "Generation failed.").strip()
+        run_id = str(detail.get("run_id") or "").strip()
+        stage = str(detail.get("stage") or "").strip()
+        reason = str(detail.get("reason") or "").strip()
+
+        fragments = [message]
+        if stage:
+            fragments.append(f"stage={stage}")
+        if run_id:
+            fragments.append(f"run_id={run_id}")
+        if reason:
+            fragments.append(f"reason={reason}")
+        return " | ".join(fragments)
     return str(payload)
 
 

@@ -10,6 +10,7 @@ Rules:
 6) Make the layman_bridge practical and easy to apply.
 7) synthesis_text must be elaborate, continuous, and non-redundant while connecting multiple sources in plain language.
 8) emphasis_terms should include important keywords for each sentence.
+9) Keep outputs bounded and focused: concise titles, compact attributed sentences, and no unnecessary repetition.
 """.strip()
 
 
@@ -28,9 +29,9 @@ COMBINED_INSIGHTS_JSON_SCHEMA = {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "intersection_title": {"type": "string"},
-                        "why_it_matters": {"type": "string"},
-                        "integrated_explanation": {"type": "string"},
+                        "intersection_title": {"type": "string", "maxLength": 140},
+                        "why_it_matters": {"type": "string", "maxLength": 700},
+                        "integrated_explanation": {"type": "string", "maxLength": 2200},
                         "attributed_sentences": {
                             "type": "array",
                             "minItems": 3,
@@ -39,7 +40,7 @@ COMBINED_INSIGHTS_JSON_SCHEMA = {
                                 "type": "object",
                                 "additionalProperties": False,
                                 "properties": {
-                                    "text": {"type": "string"},
+                                    "text": {"type": "string", "maxLength": 320},
                                     "source_id": {"type": "integer"},
                                     "source_type": {
                                         "type": "string",
@@ -81,8 +82,8 @@ COMBINED_INSIGHTS_JSON_SCHEMA = {
                     ],
                 },
             },
-            "layman_bridge": {"type": "string"},
-            "synthesis_text": {"type": "string"},
+            "layman_bridge": {"type": "string", "maxLength": 1200},
+            "synthesis_text": {"type": "string", "maxLength": 5200},
         },
         "required": ["intersections", "layman_bridge", "synthesis_text"],
     },

@@ -418,6 +418,49 @@ def _load_usage_summary(db_path: Path) -> list[dict[str, Any]]:
     return results
 
 
+def _load_generation_stage_summary(db_path: Path) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+
+    query = """
+        SELECT
+            run_id,
+            user_id,
+            stage_name,
+            status,
+            COUNT(*) AS event_count,
+            COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+            COALESCE(MAX(duration_ms), 0) AS max_duration_ms
+        FROM generation_stage_events
+        GROUP BY run_id, user_id, stage_name, status
+        ORDER BY run_id DESC, stage_name ASC, status ASC
+        LIMIT 300
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        try:
+            rows = connection.execute(query).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+    summary: list[dict[str, Any]] = []
+    for row in rows:
+        run_id, user_id, stage_name, status, event_count, avg_duration_ms, max_duration_ms = row
+        summary.append(
+            {
+                "run_id": str(run_id),
+                "user_id": str(user_id),
+                "stage_name": str(stage_name),
+                "status": str(status),
+                "event_count": int(event_count or 0),
+                "avg_duration_ms": int(float(avg_duration_ms or 0.0)),
+                "max_duration_ms": int(max_duration_ms or 0),
+            }
+        )
+
+    return summary
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Socratic AI end-to-end pipeline.")
     parser.add_argument("--api-base-url", default="http://127.0.0.1:8000")
@@ -502,9 +545,11 @@ def main() -> int:
     sqlite_path = _resolve_sqlite_path(str(args.database_url), project_root)
     if sqlite_path is None:
         result["usage_summary"] = []
+        result["generation_stage_summary"] = []
         result["usage_note"] = "Skipped usage summary because DATABASE_URL is not sqlite."
     else:
         result["usage_summary"] = _load_usage_summary(sqlite_path)
+        result["generation_stage_summary"] = _load_generation_stage_summary(sqlite_path)
 
     print(json.dumps(result, indent=2, ensure_ascii=True))
     return 0

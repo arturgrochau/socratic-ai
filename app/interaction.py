@@ -6,6 +6,7 @@ import re
 from sqlalchemy import text
 
 from app.cost_logging import log_api_usage
+from app.json_reliability import safe_json_loads
 from app.models import (
     AskModelOutput,
     AskResponse,
@@ -368,7 +369,7 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
 
     source_blocks: list[str] = []
     for row in source_rows:
-        key_terms = json.loads(str(row.get("key_terms_json") or "[]"))
+        key_terms = safe_json_loads(row.get("key_terms_json"), default=[])
         key_terms_text = ", ".join(
             str(term).strip() for term in key_terms[:6] if str(term).strip()
         )
@@ -415,7 +416,7 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
         try:
             candidate_doc_ids = {
                 int(value)
-                for value in json.loads(str(candidate.get("document_source_ids_json") or "[]"))
+                for value in safe_json_loads(candidate.get("document_source_ids_json"), default=[])
             }
         except Exception:
             candidate_doc_ids = set()
@@ -431,21 +432,21 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
 
     combined_block = ""
     if combined_row is not None and best_score > 0:
-        intersections = json.loads(str(combined_row.get("intersections_json") or "[]"))
+        intersections = safe_json_loads(combined_row.get("intersections_json"), default=[])
         intersection_titles = []
         for entry in intersections[:4]:
             title = str(entry.get("intersection_title", "")).strip() if isinstance(entry, dict) else ""
             if title:
                 intersection_titles.append(title)
 
-        quiz_payload = json.loads(str(combined_row.get("quiz_json") or "{}"))
+        quiz_payload = safe_json_loads(combined_row.get("quiz_json"), default={})
         study_advice = _truncate_text(str(quiz_payload.get("study_advice") or ""), 320)
         comparative_analysis = _truncate_text(
             str(combined_row.get("comparative_analysis_text") or ""),
             420,
         )
 
-        scenario_payload = json.loads(str(combined_row.get("application_scenarios_json") or "[]"))
+        scenario_payload = safe_json_loads(combined_row.get("application_scenarios_json"), default=[])
         scenario_titles: list[str] = []
         for entry in scenario_payload[:3]:
             if not isinstance(entry, dict):

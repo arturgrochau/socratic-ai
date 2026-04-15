@@ -12,6 +12,7 @@ Rules:
 5) explanation should explicitly contrast why the correct option fits and why each distractor fails for this specific question.
 6) under_the_hood must be technical, first-principles oriented, and mechanism-focused (causal chain, assumptions, constraints, and tradeoffs).
 6) source_evidence should cite concrete facts/sections from the provided payload.
+7) Keep question bodies and explanations concise enough to avoid excessively large JSON payloads.
 """.strip()
 
 
@@ -30,10 +31,10 @@ COMBINED_QUIZ_JSON_SCHEMA = {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "question": {"type": "string"},
+                        "question": {"type": "string", "maxLength": 360},
                         "options": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {"type": "string", "maxLength": 240},
                             "minItems": 4,
                             "maxItems": 4,
                         },
@@ -42,8 +43,8 @@ COMBINED_QUIZ_JSON_SCHEMA = {
                             "minimum": 0,
                             "maximum": 3,
                         },
-                        "explanation": {"type": "string"},
-                        "under_the_hood": {"type": "string"},
+                        "explanation": {"type": "string", "maxLength": 1800},
+                        "under_the_hood": {"type": "string", "maxLength": 2400},
                         "difficulty_level": {
                             "type": "string",
                             "enum": ["foundational", "intermediate", "advanced"],
@@ -54,7 +55,7 @@ COMBINED_QUIZ_JSON_SCHEMA = {
                         },
                         "source_evidence": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {"type": "string", "maxLength": 320},
                             "minItems": 2,
                             "maxItems": 5,
                         },
@@ -71,7 +72,7 @@ COMBINED_QUIZ_JSON_SCHEMA = {
                     ],
                 },
             },
-            "study_advice": {"type": "string"},
+            "study_advice": {"type": "string", "maxLength": 1400},
         },
         "required": ["questions", "study_advice"],
     },
