@@ -30,8 +30,11 @@ def _assert_clean_continuous_text(field_name: str, text_value: str) -> None:
     if "###" in value or "\n#" in value:
         raise RuntimeError(f"{field_name} contains leaked markdown heading/hash artifacts.")
 
-    if "\u2014" in value:
-        raise RuntimeError(f"{field_name} contains disallowed em-dash characters.")
+    if "\u2014" in value or "\u2013" in value:
+        raise RuntimeError(f"{field_name} contains disallowed dash characters.")
+
+    if " - " in value:
+        raise RuntimeError(f"{field_name} contains disallowed spaced-hyphen punctuation.")
 
 
 def _headers(user_id: str) -> dict[str, str]:

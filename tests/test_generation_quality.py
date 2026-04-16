@@ -5,7 +5,9 @@ import unittest
 from app.generation import (
     _compute_distributed_row_positions,
     _deduplicate_section_text,
+    _enforce_section_novelty,
     _normalize_continuous_prose,
+    _section_redundancy_ratio,
     _should_use_model_progression_outline,
     _truncate_to_max_words,
 )
@@ -16,6 +18,7 @@ from frontend.app import (
     _build_quiz_grading_prompt,
     _compose_assistant_chat_message,
     _normalize_continuous_text_for_display,
+    _parse_summary_sections,
     _resolve_source_label_map,
     _should_show_cross_source_section,
 )
@@ -81,6 +84,7 @@ class DeduplicationTests(unittest.TestCase):
         self.assertNotIn("###", normalized)
         self.assertNotIn("- First", normalized)
         self.assertNotIn("\u2014", normalized)
+        self.assertNotIn(" - ", normalized)
         self.assertIn("First causal step", normalized)
         self.assertIn("Second causal step", normalized)
 
@@ -88,6 +92,21 @@ class DeduplicationTests(unittest.TestCase):
         raw = " ".join(f"word{index}" for index in range(1, 1201))
         truncated = _truncate_to_max_words(raw, max_words=900)
         self.assertLessEqual(len(truncated.split()), 900)
+
+    def test_section_novelty_reduces_overlap_ratio(self) -> None:
+        current = (
+            "Core mechanism starts with delayed reward weighting. "
+            "Core mechanism starts with delayed reward weighting. "
+            "Failure appears when assumptions drift under noisy feedback."
+        )
+        prior = ["Core mechanism starts with delayed reward weighting."]
+
+        ratio_before = _section_redundancy_ratio(current, prior)
+        refined = _enforce_section_novelty(current, prior)
+        ratio_after = _section_redundancy_ratio(refined, prior)
+
+        self.assertGreater(ratio_before, 0.0)
+        self.assertLessEqual(ratio_after, ratio_before)
 
 
 class ProgressionOutlineEfficiencyTests(unittest.TestCase):
@@ -179,8 +198,29 @@ class ChatBehaviorTests(unittest.TestCase):
         self.assertNotIn("1.", normalized)
         self.assertNotIn("\u2014", normalized)
         self.assertNotIn("###", normalized)
+        self.assertNotIn(" - ", normalized)
         self.assertIn("Core idea", normalized)
         self.assertIn("Second point", normalized)
+
+    def test_parse_summary_sections_extracts_expected_titles(self) -> None:
+        summary = (
+            "## Core Thesis and Scope\n"
+            "This source defines the central claim.\n\n"
+            "### Key Mechanisms and How They Work\n"
+            "Mechanism details appear here.\n\n"
+            "Practical Implications and Limitations\n"
+            "Boundaries and tradeoffs are discussed."
+        )
+        parsed = _parse_summary_sections(summary)
+        titles = [title for title, _ in parsed]
+        self.assertEqual(
+            titles,
+            [
+                "Core Thesis and Scope",
+                "Key Mechanisms and How They Work",
+                "Practical Implications and Limitations",
+            ],
+        )
 
     def test_first_principles_evidence_summary_omits_source_labels(self) -> None:
         summary = _build_first_principles_evidence_summary(

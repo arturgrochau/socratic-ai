@@ -14,6 +14,8 @@ Rules:
 10) Do not use markdown headers, list markers, or inline hash artifacts such as ### anywhere in deep_dive_text.
 11) Do not use em dashes. Use commas, periods, or parentheses instead.
 12) Start directly with explanation content; do not begin with a title-like opening line.
+13) Do not use spaced-hyphen punctuation (" - ").
+14) Avoid repeating claims already covered in the summary; add new mechanism details, boundary conditions, and keyword-level clarifications.
 """.strip()
 
 

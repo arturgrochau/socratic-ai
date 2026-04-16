@@ -35,6 +35,12 @@ SUPPORTED_YOUTUBE_HOSTS = {
     "www.youtu.be",
 }
 
+SUMMARY_SECTION_TITLES = {
+    "core thesis and scope": "Core Thesis and Scope",
+    "key mechanisms and how they work": "Key Mechanisms and How They Work",
+    "practical implications and limitations": "Practical Implications and Limitations",
+}
+
 
 def _init_state() -> None:
     if "api_base_url" not in st.session_state:
@@ -291,7 +297,8 @@ def _normalize_continuous_text_for_display(text_value: str) -> str:
                 cleaned_lines.append("")
             continue
 
-        line = line.replace("\u2014", " - ").replace("\u2013", " - ")
+        line = line.replace("\u2014", ", ").replace("\u2013", ", ")
+        line = re.sub(r"\s-\s", ", ", line)
         line = re.sub(r"^#{1,6}\s*", "", line)
         line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
         line = re.sub(r"^[-*]\s+", "", line)
@@ -318,6 +325,55 @@ def _normalize_continuous_text_for_display(text_value: str) -> str:
         paragraphs.append(" ".join(current).strip())
 
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
+
+
+def _parse_summary_sections(summary_text: str) -> list[tuple[str, str]]:
+    lines = str(summary_text or "").splitlines()
+    sections: list[tuple[str, str]] = []
+    current_title = ""
+    current_body: list[str] = []
+
+    def _normalize_heading(value: str) -> str:
+        cleaned = re.sub(r"^#{1,6}\s*", "", value.strip())
+        cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned.lower()).strip()
+        return cleaned
+
+    def _flush() -> None:
+        nonlocal current_title, current_body
+        body_text = "\n".join(current_body).strip()
+        if current_title and body_text:
+            sections.append((current_title, body_text))
+        current_title = ""
+        current_body = []
+
+    for line in lines:
+        stripped = line.strip()
+        normalized_heading = _normalize_heading(stripped)
+        canonical = SUMMARY_SECTION_TITLES.get(normalized_heading)
+        if canonical:
+            _flush()
+            current_title = canonical
+            continue
+
+        if current_title:
+            current_body.append(line)
+
+    _flush()
+    return sections
+
+
+def _render_structured_summary(summary_text: str) -> None:
+    parsed_sections = _parse_summary_sections(summary_text)
+    if parsed_sections:
+        for title, body in parsed_sections:
+            cleaned_body = _normalize_continuous_text_for_display(body)
+            if not cleaned_body:
+                continue
+            st.markdown(f"#### {title}")
+            st.markdown(_format_long_prose_markdown(cleaned_body, max_sentences_per_paragraph=4))
+        return
+
+    st.markdown(_normalize_continuous_text_for_display(summary_text))
 
 
 def _strip_socratic_follow_up(text_value: str) -> str:
@@ -753,8 +809,7 @@ def _render_source_learning_section(section_payload: dict) -> None:
         generated_title,
         "summary",
     )
-    summary_text = _normalize_continuous_text_for_display(summary_text)
-    st.markdown(summary_text)
+    _render_structured_summary(summary_text)
 
     deep_dive_text = _clean_block(
         str(section_payload.get("deep_dive_text", "")),

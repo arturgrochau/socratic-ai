@@ -15,6 +15,8 @@ Rules:
 11) For each integrated_explanation, include mechanism-level explanation, contrast points, and at least one practical implication.
 12) Minimize redundancy across intersections, layman_bridge, and synthesis_text; each section must add new information.
 13) Do not use em dashes; use commas, periods, or parentheses.
+14) Do not use spaced-hyphen punctuation (" - ").
+15) Prefer fresh grounded examples in each section rather than reusing the same example family.
 """.strip()
 
 

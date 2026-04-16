@@ -71,6 +71,9 @@ DEDUPLICATION_MIN_TOKEN_LENGTH = 4
 OUTLINE_MODEL_MIN_GROUNDING_ROWS = 12
 MAX_EXPANSION_GROUNDING_CHARS = 8000
 MAX_DEEP_DIVE_WORDS = 900
+SECTION_REDUNDANCY_RATIO_THRESHOLD = 0.34
+SECTION_SIMILARITY_THRESHOLD = 0.82
+SECTION_TOKEN_OVERLAP_THRESHOLD = 0.50
 
 TEXT_EXPANSION_JSON_SCHEMA = {
     "name": "expanded_text",
@@ -678,7 +681,8 @@ def _normalize_continuous_prose(text_value: str) -> str:
             continue
 
         # Remove disallowed dash styling and markdown residue, including leaked inline hashes.
-        line = line.replace("\u2014", " - ").replace("\u2013", " - ")
+        line = line.replace("\u2014", ", ").replace("\u2013", ", ")
+        line = re.sub(r"\s-\s", ", ", line)
 
         # Drop markdown heading/list markers but keep the content.
         line = re.sub(r"^#{1,6}\s*", "", line)
@@ -746,6 +750,43 @@ def _truncate_to_max_words(text_value: str, *, max_words: int) -> str:
         return " ".join(words[:max_words]).strip()
 
     return " ".join(kept_sentences).strip()
+
+
+def _section_redundancy_ratio(current_text: str, prior_texts: list[str]) -> float:
+    current_sentences = _split_into_sentences(current_text)
+    if not current_sentences:
+        return 0.0
+
+    prior_sentences: list[str] = []
+    for value in prior_texts:
+        prior_sentences.extend(_split_into_sentences(value))
+
+    if not prior_sentences:
+        return 0.0
+
+    redundant_count = 0
+    for sentence in current_sentences:
+        sentence_norm = sentence.lower()
+        for prior_sentence in prior_sentences:
+            prior_norm = prior_sentence.lower()
+            sequence_similarity = SequenceMatcher(None, sentence_norm, prior_norm).ratio()
+            token_overlap = _token_overlap_ratio(sentence_norm, prior_norm)
+            if sequence_similarity >= SECTION_SIMILARITY_THRESHOLD:
+                redundant_count += 1
+                break
+            if token_overlap >= SECTION_TOKEN_OVERLAP_THRESHOLD:
+                redundant_count += 1
+                break
+
+    return redundant_count / float(len(current_sentences))
+
+
+def _enforce_section_novelty(current_text: str, prior_texts: list[str]) -> str:
+    normalized = _normalize_continuous_prose(current_text)
+    deduplicated = _normalize_continuous_prose(_deduplicate_section_text(normalized, prior_texts))
+    if _section_redundancy_ratio(deduplicated, prior_texts) <= SECTION_REDUNDANCY_RATIO_THRESHOLD:
+        return deduplicated
+    return deduplicated
 
 
 def _expand_nonredundant_text(
@@ -1227,9 +1268,41 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         run_id,
     )
     deep_dive_text = _truncate_to_max_words(
-        _normalize_continuous_prose(_deduplicate_section_text(deep_dive_text, [summary_text])),
+        _enforce_section_novelty(deep_dive_text, [summary_text, progression_outline]),
         max_words=MAX_DEEP_DIVE_WORDS,
     )
+
+    if _section_redundancy_ratio(deep_dive_text, [summary_text, progression_outline]) > SECTION_REDUNDANCY_RATIO_THRESHOLD:
+        try:
+            refined_deep_dive = _expand_nonredundant_text(
+                run_id=run_id,
+                stage_name=f"source_deep_dive_refine:{source_type}",
+                user_id=user_id,
+                context_label=f"{source_type} deep dive novelty refinement",
+                base_text=deep_dive_text,
+                avoid_texts=[summary_text, progression_outline],
+                grounding_chunks=grounding_chunks,
+                key_terms=key_terms,
+                extra_context=(
+                    "Add new mechanism-level detail not already present in summary/progression text. "
+                    "Include boundary conditions and one fresh practical implication that was not previously stated."
+                ),
+            )
+            refined_deep_dive = _truncate_to_max_words(
+                _enforce_section_novelty(refined_deep_dive, [summary_text, progression_outline]),
+                max_words=MAX_DEEP_DIVE_WORDS,
+            )
+            if refined_deep_dive:
+                deep_dive_text = refined_deep_dive
+        except Exception as exc:
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=f"source_deep_dive_refine:{source_type}",
+                attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
+                status="skipped",
+                details=f"fallback_to_first_pass={_trim_error_detail(str(exc))}",
+            )
 
     reflection_points = _generate_reflection_points(
         summary_text,
@@ -1550,6 +1623,22 @@ def _generate_combined_insights(
         prior_intersection_explanations.append(fallback_intersection)
 
     intersections = refined_intersections
+    intersection_evidence_texts = [
+        sentence.text
+        for entry in intersections
+        for sentence in entry.attributed_sentences
+        if sentence.text.strip()
+    ]
+
+    layman_bridge = _enforce_section_novelty(
+        layman_bridge,
+        [
+            *[entry.why_it_matters for entry in intersections],
+            *[entry.integrated_explanation for entry in intersections],
+            *intersection_evidence_texts,
+            *source_background,
+        ],
+    )
 
     try:
         expanded_synthesis = _expand_nonredundant_text(
@@ -1585,6 +1674,17 @@ def _generate_combined_insights(
             synthesis_text = expanded_synthesis
     except Exception:
         synthesis_text = _normalize_continuous_prose(synthesis_text)
+
+    synthesis_text = _enforce_section_novelty(
+        synthesis_text,
+        [
+            layman_bridge,
+            *[entry.why_it_matters for entry in intersections],
+            *[entry.integrated_explanation for entry in intersections],
+            *intersection_evidence_texts,
+            *source_background,
+        ],
+    )
 
     layman_bridge = _normalize_continuous_prose(layman_bridge)
 
@@ -1749,6 +1849,21 @@ def _generate_comparative_analysis(
                 *[entry.integrated_explanation for entry in insights_section.intersections],
             ],
         )
+    )
+
+    comparative_analysis = _enforce_section_novelty(
+        comparative_analysis,
+        [
+            insights_section.synthesis_text,
+            insights_section.layman_bridge,
+            *[entry.why_it_matters for entry in insights_section.intersections],
+            *[entry.integrated_explanation for entry in insights_section.intersections],
+            *[
+                sentence.text
+                for entry in insights_section.intersections
+                for sentence in entry.attributed_sentences
+            ],
+        ],
     )
 
     return comparative_analysis

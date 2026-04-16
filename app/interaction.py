@@ -157,7 +157,8 @@ def _sanitize_continuous_text(text_value: str) -> str:
                 cleaned_lines.append("")
             continue
 
-        line = line.replace("\u2014", " - ").replace("\u2013", " - ")
+        line = line.replace("\u2014", ", ").replace("\u2013", ", ")
+        line = re.sub(r"\s-\s", ", ", line)
         line = re.sub(r"^#{1,6}\s*", "", line)
         line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
         line = re.sub(r"^[-*]\s+", "", line)
