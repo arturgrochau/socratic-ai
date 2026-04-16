@@ -702,6 +702,50 @@ def _format_long_prose_markdown(text_value: str, *, max_sentences_per_paragraph:
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
 
 
+def _text_overlap_ratio(left: str, right: str) -> float:
+    left_tokens = {
+        token
+        for token in re.findall(r"[A-Za-z0-9']+", str(left or "").lower())
+        if len(token) >= 4
+    }
+    right_tokens = {
+        token
+        for token in re.findall(r"[A-Za-z0-9']+", str(right or "").lower())
+        if len(token) >= 4
+    }
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / float(min(len(left_tokens), len(right_tokens)))
+
+
+def _render_integrated_cross_source_analysis(
+    *,
+    layman_bridge: str,
+    synthesis_text: str,
+    comparative_analysis: str,
+) -> None:
+    cleaned_bridge = _normalize_continuous_text_for_display(layman_bridge)
+    cleaned_synthesis = _normalize_continuous_text_for_display(synthesis_text)
+    cleaned_comparative = _normalize_continuous_text_for_display(comparative_analysis)
+
+    if not any([cleaned_bridge, cleaned_synthesis, cleaned_comparative]):
+        return
+
+    st.markdown("### Integrated Cross-Source Analysis")
+
+    if cleaned_synthesis:
+        st.markdown("#### Integration")
+        st.markdown(_format_long_prose_markdown(cleaned_synthesis, max_sentences_per_paragraph=4))
+
+    if cleaned_comparative and _text_overlap_ratio(cleaned_comparative, cleaned_synthesis) < 0.72:
+        st.markdown("#### Contrast and Trade-Offs")
+        st.markdown(_format_long_prose_markdown(cleaned_comparative, max_sentences_per_paragraph=4))
+
+    if cleaned_bridge and _text_overlap_ratio(cleaned_bridge, cleaned_synthesis) < 0.65:
+        st.markdown("#### Plain-Language Anchor")
+        st.markdown(_format_long_prose_markdown(cleaned_bridge, max_sentences_per_paragraph=3))
+
+
 def _render_reflection_points(
     reflection_points: list[dict] | list[str],
     *,
@@ -845,12 +889,24 @@ def _render_source_learning_section(section_payload: dict) -> None:
             if key_term_explanations:
                 st.markdown("**Key term breakdown**")
                 for entry in key_term_explanations:
-                    if not isinstance(entry, dict):
-                        continue
-                    term = str(entry.get("term") or "").strip()
-                    explanation = str(entry.get("explanation") or "").strip()
+                    term = ""
+                    explanation = ""
+                    if isinstance(entry, dict):
+                        term = str(entry.get("term") or "").strip()
+                        explanation = str(entry.get("explanation") or "").strip()
+                    elif isinstance(entry, str):
+                        cleaned_entry = _normalize_continuous_text_for_display(entry)
+                        if ":" in cleaned_entry:
+                            maybe_term, maybe_explanation = cleaned_entry.split(":", 1)
+                            term = maybe_term.strip()
+                            explanation = maybe_explanation.strip()
+                        else:
+                            explanation = cleaned_entry
+
                     if term and explanation:
                         st.markdown(f"- **{term}**: {explanation}")
+                    elif explanation:
+                        st.markdown(f"- {explanation}")
 
             if st.button(
                 "Elaborate further in chat",
@@ -1404,22 +1460,13 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                 st.write("No intersections available.")
 
         layman_bridge = str(insights_payload.get("layman_bridge", "")).strip()
-        if layman_bridge:
-            st.markdown("### Bridge in Plain Language")
-            cleaned_bridge = _normalize_continuous_text_for_display(layman_bridge)
-            st.markdown(_format_long_prose_markdown(cleaned_bridge, max_sentences_per_paragraph=4))
-
         synthesis_text = str(insights_payload.get("synthesis_text", "")).strip()
-        if synthesis_text:
-            st.markdown("### Synthesis")
-            cleaned_synthesis = _normalize_continuous_text_for_display(synthesis_text)
-            st.markdown(_format_long_prose_markdown(cleaned_synthesis, max_sentences_per_paragraph=4))
-
         comparative_analysis = str(insights_payload.get("comparative_analysis") or "").strip()
-        if comparative_analysis:
-            st.markdown("### Comparative Deepening")
-            cleaned_comparative = _normalize_continuous_text_for_display(comparative_analysis)
-            st.markdown(_format_long_prose_markdown(cleaned_comparative, max_sentences_per_paragraph=4))
+        _render_integrated_cross_source_analysis(
+            layman_bridge=layman_bridge,
+            synthesis_text=synthesis_text,
+            comparative_analysis=comparative_analysis,
+        )
 
         application_scenarios = insights_payload.get("application_scenarios", []) or []
         if application_scenarios:

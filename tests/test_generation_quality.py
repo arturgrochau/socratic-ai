@@ -10,6 +10,7 @@ from app.generation import (
     _section_redundancy_ratio,
     _should_use_model_progression_outline,
     _truncate_to_max_words,
+    _pairwise_overlap_ratio,
 )
 from frontend.app import (
     _build_first_principles_evidence_summary,
@@ -19,6 +20,7 @@ from frontend.app import (
     _compose_assistant_chat_message,
     _normalize_continuous_text_for_display,
     _parse_summary_sections,
+    _text_overlap_ratio,
     _resolve_source_label_map,
     _should_show_cross_source_section,
 )
@@ -107,6 +109,12 @@ class DeduplicationTests(unittest.TestCase):
 
         self.assertGreater(ratio_before, 0.0)
         self.assertLessEqual(ratio_after, ratio_before)
+
+    def test_pairwise_overlap_ratio_detects_near_duplicates(self) -> None:
+        left = "The model emphasizes boundary conditions and constraint-sensitive behavior."
+        right = "Constraint-sensitive behavior and boundary conditions are emphasized by the model."
+        score = _pairwise_overlap_ratio(left, right)
+        self.assertGreater(score, 0.5)
 
 
 class ProgressionOutlineEfficiencyTests(unittest.TestCase):
@@ -231,6 +239,13 @@ class ChatBehaviorTests(unittest.TestCase):
         )
         self.assertIn("Mechanism starts", summary)
         self.assertNotIn("Video:", summary)
+
+    def test_text_overlap_ratio_captures_shared_terms(self) -> None:
+        score = _text_overlap_ratio(
+            "Transfer constraints shape outcomes in practical deployments.",
+            "Practical deployments are shaped by transfer constraints and assumptions.",
+        )
+        self.assertGreater(score, 0.4)
 
 
 class SourceLabelFormattingTests(unittest.TestCase):

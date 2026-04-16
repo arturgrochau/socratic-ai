@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -55,7 +56,7 @@ from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_P
 from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 7
+GENERATION_SCHEMA_VERSION = 8
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 MAX_UNDER_SURFACE_GROUNDING_CHUNKS = 6
@@ -74,6 +75,8 @@ MAX_DEEP_DIVE_WORDS = 900
 SECTION_REDUNDANCY_RATIO_THRESHOLD = 0.34
 SECTION_SIMILARITY_THRESHOLD = 0.82
 SECTION_TOKEN_OVERLAP_THRESHOLD = 0.50
+SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD = 0.32
+CROSS_SECTION_PAIR_OVERLAP_THRESHOLD = 0.26
 
 TEXT_EXPANSION_JSON_SCHEMA = {
     "name": "expanded_text",
@@ -316,6 +319,59 @@ def ensure_generation_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_combined_learning_sections_user_video
                 ON combined_learning_sections (user_id, video_source_id)
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS generation_novelty_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    source_id INTEGER,
+                    document_source_ids_json TEXT DEFAULT '',
+                    section_type TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    similarity_to_prior REAL DEFAULT 0.0,
+                    overlap_sentences_count INTEGER DEFAULT 0,
+                    total_sentences_count INTEGER DEFAULT 0,
+                    expansion_applied INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_novelty_ledger_user_run
+                ON generation_novelty_ledger (user_id, run_id, section_type)
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS generation_quality_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    section_type TEXT NOT NULL,
+                    pair_key TEXT NOT NULL,
+                    overlap_ratio REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_quality_metrics_run
+                ON generation_quality_metrics (user_id, run_id, section_type)
                 """
             )
         )
@@ -787,6 +843,174 @@ def _enforce_section_novelty(current_text: str, prior_texts: list[str]) -> str:
     if _section_redundancy_ratio(deduplicated, prior_texts) <= SECTION_REDUNDANCY_RATIO_THRESHOLD:
         return deduplicated
     return deduplicated
+
+
+def _content_hash(text_value: str) -> str:
+    normalized = _normalize_continuous_prose(text_value)
+    return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _redundancy_stats(current_text: str, prior_texts: list[str]) -> tuple[int, int, float]:
+    current_sentences = _split_into_sentences(current_text)
+    if not current_sentences:
+        return 0, 0, 0.0
+
+    prior_sentences: list[str] = []
+    for value in prior_texts:
+        prior_sentences.extend(_split_into_sentences(value))
+
+    if not prior_sentences:
+        return 0, len(current_sentences), 0.0
+
+    overlap_count = 0
+    for sentence in current_sentences:
+        sentence_norm = sentence.lower()
+        for prior_sentence in prior_sentences:
+            prior_norm = prior_sentence.lower()
+            if sentence_norm == prior_norm:
+                overlap_count += 1
+                break
+            if SequenceMatcher(None, sentence_norm, prior_norm).ratio() >= SECTION_SIMILARITY_THRESHOLD:
+                overlap_count += 1
+                break
+            if _token_overlap_ratio(sentence_norm, prior_norm) >= SECTION_TOKEN_OVERLAP_THRESHOLD:
+                overlap_count += 1
+                break
+
+    total = len(current_sentences)
+    return overlap_count, total, (overlap_count / float(total)) if total else 0.0
+
+
+def _pairwise_overlap_ratio(left_text: str, right_text: str) -> float:
+    left = _normalize_continuous_prose(left_text)
+    right = _normalize_continuous_prose(right_text)
+    if not left or not right:
+        return 0.0
+    return max(_section_redundancy_ratio(left, [right]), _section_redundancy_ratio(right, [left]))
+
+
+def _record_novelty_ledger_entry(
+    *,
+    user_id: str,
+    run_id: str,
+    source_id: int | None,
+    document_source_ids: list[int],
+    section_type: str,
+    section_text: str,
+    prior_texts: list[str],
+    expansion_applied: bool,
+) -> None:
+    overlap_count, total_count, overlap_ratio = _redundancy_stats(section_text, prior_texts)
+
+    with db_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO generation_novelty_ledger (
+                    user_id,
+                    run_id,
+                    source_id,
+                    document_source_ids_json,
+                    section_type,
+                    content_hash,
+                    similarity_to_prior,
+                    overlap_sentences_count,
+                    total_sentences_count,
+                    expansion_applied
+                ) VALUES (
+                    :user_id,
+                    :run_id,
+                    :source_id,
+                    :document_source_ids_json,
+                    :section_type,
+                    :content_hash,
+                    :similarity_to_prior,
+                    :overlap_sentences_count,
+                    :total_sentences_count,
+                    :expansion_applied
+                )
+                """
+            ),
+            {
+                "user_id": user_id,
+                "run_id": run_id,
+                "source_id": source_id,
+                "document_source_ids_json": _serialize_ids(document_source_ids),
+                "section_type": section_type,
+                "content_hash": _content_hash(section_text),
+                "similarity_to_prior": overlap_ratio,
+                "overlap_sentences_count": overlap_count,
+                "total_sentences_count": total_count,
+                "expansion_applied": 1 if expansion_applied else 0,
+            },
+        )
+
+
+def _record_pairwise_quality_metric(
+    *,
+    run_id: str,
+    user_id: str,
+    section_type: str,
+    pair_key: str,
+    overlap_ratio: float,
+) -> None:
+    with db_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO generation_quality_metrics (
+                    run_id,
+                    user_id,
+                    section_type,
+                    pair_key,
+                    overlap_ratio
+                ) VALUES (
+                    :run_id,
+                    :user_id,
+                    :section_type,
+                    :pair_key,
+                    :overlap_ratio
+                )
+                """
+            ),
+            {
+                "run_id": run_id,
+                "user_id": user_id,
+                "section_type": section_type,
+                "pair_key": pair_key,
+                "overlap_ratio": overlap_ratio,
+            },
+        )
+
+
+def _assert_pairwise_uniqueness(
+    *,
+    run_id: str,
+    user_id: str,
+    section_group: str,
+    section_texts: dict[str, str],
+    max_overlap_ratio: float,
+) -> None:
+    labels = [label for label, text_value in section_texts.items() if _normalize_continuous_prose(text_value)]
+    for index, left_label in enumerate(labels):
+        for right_label in labels[index + 1:]:
+            overlap_ratio = _pairwise_overlap_ratio(
+                section_texts[left_label],
+                section_texts[right_label],
+            )
+            pair_key = f"{left_label}::{right_label}"
+            _record_pairwise_quality_metric(
+                run_id=run_id,
+                user_id=user_id,
+                section_type=section_group,
+                pair_key=pair_key,
+                overlap_ratio=overlap_ratio,
+            )
+            if overlap_ratio > max_overlap_ratio:
+                raise ValueError(
+                    f"{section_group} overlap gate failed for {pair_key}: "
+                    f"{overlap_ratio:.3f} > {max_overlap_ratio:.3f}"
+                )
 
 
 def _expand_nonredundant_text(
@@ -1313,6 +1537,21 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         user_id,
         run_id,
     )
+    reflection_points = [
+        point.model_copy(
+            update={
+                "explanation": _enforce_section_novelty(
+                    point.explanation,
+                    [summary_text, deep_dive_text],
+                ),
+                "under_the_hood": _enforce_section_novelty(
+                    point.under_the_hood,
+                    [summary_text, deep_dive_text, point.explanation],
+                ),
+            }
+        )
+        for point in reflection_points
+    ]
     under_surface_explainer, diagnostic_checklist, key_term_explanations = _generate_under_surface_pack(
         summary_text=summary_text,
         deep_dive_text=deep_dive_text,
@@ -1360,6 +1599,88 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         )
 
     under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
+
+    reflection_text = " ".join(
+        " ".join(
+            part
+            for part in [point.question, point.explanation, point.under_the_hood]
+            if part
+        )
+        for point in reflection_points
+    ).strip()
+
+    source_section_texts = {
+        "summary": summary_text,
+        "deep_dive": deep_dive_text,
+        "under_surface": under_surface_explainer,
+        "reflection": reflection_text,
+    }
+    try:
+        _assert_pairwise_uniqueness(
+            run_id=run_id,
+            user_id=user_id,
+            section_group=f"source:{source_id}",
+            section_texts=source_section_texts,
+            max_overlap_ratio=SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD,
+        )
+    except Exception as exc:
+        try:
+            refined_deep_dive = _expand_nonredundant_text(
+                run_id=run_id,
+                stage_name=f"source_role_refine_deep:{source_type}",
+                user_id=user_id,
+                context_label=f"{source_type} deep dive role-separation refinement",
+                base_text=deep_dive_text,
+                avoid_texts=[summary_text, under_surface_explainer, reflection_text],
+                grounding_chunks=grounding_chunks,
+                key_terms=key_terms,
+                extra_context=(
+                    "Keep this section focused on mechanism-level explanation only. "
+                    "Do not restate reflection content or practical checklist language."
+                ),
+            )
+            if refined_deep_dive:
+                deep_dive_text = _truncate_to_max_words(
+                    _enforce_section_novelty(refined_deep_dive, [summary_text, under_surface_explainer, reflection_text]),
+                    max_words=MAX_DEEP_DIVE_WORDS,
+                )
+
+            refined_under_surface = _expand_nonredundant_text(
+                run_id=run_id,
+                stage_name=f"source_role_refine_under:{source_type}",
+                user_id=user_id,
+                context_label=f"{source_type} under-surface role-separation refinement",
+                base_text=under_surface_explainer,
+                avoid_texts=[summary_text, deep_dive_text, reflection_text],
+                grounding_chunks=under_surface_chunks,
+                key_terms=key_terms,
+                extra_context=(
+                    "Keep this section focused on first-principles and theoretical lens only. "
+                    "Do not repeat deep-dive sequence descriptions or reflection prompts."
+                ),
+            )
+            if refined_under_surface:
+                under_surface_explainer = _enforce_section_novelty(
+                    refined_under_surface,
+                    [summary_text, deep_dive_text, reflection_text],
+                )
+
+            _assert_pairwise_uniqueness(
+                run_id=run_id,
+                user_id=user_id,
+                section_group=f"source:{source_id}",
+                section_texts={
+                    "summary": summary_text,
+                    "deep_dive": deep_dive_text,
+                    "under_surface": under_surface_explainer,
+                    "reflection": reflection_text,
+                },
+                max_overlap_ratio=SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD,
+            )
+        except Exception as refinement_exc:
+            raise ValueError(
+                f"Source section uniqueness gate failed for source {source_id}: {refinement_exc}"
+            ) from exc
 
     section = SourceLearningSection(
         source_id=source_id,
@@ -2234,6 +2555,90 @@ def _build_noncomparative_insights_and_quiz(
     return insights_section, quiz_section
 
 
+def _build_source_section_text_map(section: SourceLearningSection) -> dict[str, str]:
+    reflection_text = " ".join(
+        " ".join(
+            part
+            for part in [point.question.strip(), point.explanation.strip(), point.under_the_hood.strip()]
+            if part
+        )
+        for point in section.reflection_points
+    ).strip()
+    key_term_text = " ".join(
+        f"{entry.term.strip()}: {entry.explanation.strip()}"
+        for entry in section.key_term_explanations
+        if entry.term.strip() and entry.explanation.strip()
+    ).strip()
+    checklist_text = " ".join(item.strip() for item in section.diagnostic_checklist if item.strip()).strip()
+
+    return {
+        "summary": section.summary_text,
+        "deep_dive": section.deep_dive_text,
+        "under_surface": section.under_surface_explainer,
+        "reflection": reflection_text,
+        "key_terms": key_term_text,
+        "diagnostics": checklist_text,
+    }
+
+
+def _build_cross_section_text_map(
+    insights: CombinedInsightSection,
+    quiz: CombinedQuizSection,
+) -> dict[str, str]:
+    intersections_text = " ".join(
+        " ".join(
+            part
+            for part in [
+                entry.intersection_title.strip(),
+                entry.why_it_matters.strip(),
+                entry.integrated_explanation.strip(),
+                " ".join(sentence.text.strip() for sentence in entry.attributed_sentences if sentence.text.strip()),
+            ]
+            if part
+        )
+        for entry in insights.intersections
+    ).strip()
+
+    scenarios_text = " ".join(
+        " ".join(
+            part
+            for part in [
+                scenario.scenario_title.strip(),
+                scenario.scenario_prompt.strip(),
+                " ".join(step.strip() for step in scenario.transfer_steps if step.strip()),
+                scenario.common_pitfall.strip(),
+            ]
+            if part
+        )
+        for scenario in insights.application_scenarios
+    ).strip()
+
+    quiz_explanations = " ".join(
+        " ".join(
+            part
+            for part in [
+                question.explanation.strip(),
+                question.under_the_hood.strip(),
+                " ".join(item.strip() for item in question.source_evidence if item.strip()),
+            ]
+            if part
+        )
+        for question in quiz.questions
+    ).strip()
+
+    return {
+        "intersections": intersections_text,
+        "bridge": insights.layman_bridge,
+        "integrated_analysis": " ".join(
+            part
+            for part in [insights.synthesis_text, insights.comparative_analysis]
+            if part.strip()
+        ).strip(),
+        "scenarios": scenarios_text,
+        "quiz": quiz_explanations,
+    }
+
+
 def generate_tailored_learning(
     video_source_id: int | None,
     document_source_ids: list[int],
@@ -2313,6 +2718,30 @@ def generate_tailored_learning(
     if not all_sections:
         raise ValueError("No source learning sections were generated.")
 
+    for section in all_sections:
+        section_text_map = _build_source_section_text_map(section)
+        source_prior_map: dict[str, list[str]] = {
+            "summary": [],
+            "deep_dive": [section.summary_text],
+            "under_surface": [section.summary_text, section.deep_dive_text],
+            "reflection": [section.summary_text, section.deep_dive_text, section.under_surface_explainer],
+            "key_terms": [section.summary_text, section.deep_dive_text],
+            "diagnostics": [section.summary_text, section.deep_dive_text, section.under_surface_explainer],
+        }
+        for section_type, text_value in section_text_map.items():
+            if not _normalize_continuous_prose(text_value):
+                continue
+            _record_novelty_ledger_entry(
+                user_id=user_id,
+                run_id=run_id,
+                source_id=section.source_id,
+                document_source_ids=[],
+                section_type=f"source:{section_type}",
+                section_text=text_value,
+                prior_texts=source_prior_map.get(section_type, []),
+                expansion_applied=False,
+            )
+
     if video_section is not None and normalized_document_ids:
         cached_combined = None
         if CACHE_PROCESSED_SOURCES:
@@ -2331,52 +2760,136 @@ def generate_tailored_learning(
 
         relationship_insights = _load_relationship_insights(source_ids, user_id)
 
+        cache_was_accepted = False
         if cached_combined is not None:
-            insights_section, quiz_section = cached_combined
-        else:
-            insights_section = _generate_combined_insights(
-                video_section=video_section,
-                document_sections=document_sections,
-                relationship_insights=relationship_insights,
+            cached_insights, cached_quiz = cached_combined
+            try:
+                _assert_pairwise_uniqueness(
+                    run_id=run_id,
+                    user_id=user_id,
+                    section_group="cross-source",
+                    section_texts=_build_cross_section_text_map(cached_insights, cached_quiz),
+                    max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
+                )
+                insights_section, quiz_section = cached_insights, cached_quiz
+                cache_was_accepted = True
+            except Exception as exc:
+                log_generation_stage_event(
+                    run_id=run_id,
+                    user_id=user_id,
+                    stage_name="combined_learning_cache_gate",
+                    attempt_number=1,
+                    status="failed",
+                    details=_trim_error_detail(str(exc)),
+                )
+
+        if not cache_was_accepted:
+            last_error: str | None = None
+            for combined_attempt in range(1, GENERATION_MAX_STAGE_ATTEMPTS + 1):
+                try:
+                    insights_section = _generate_combined_insights(
+                        video_section=video_section,
+                        document_sections=document_sections,
+                        relationship_insights=relationship_insights,
+                        user_id=user_id,
+                        run_id=run_id,
+                    )
+                    quiz_section = _generate_combined_quiz(
+                        video_section=video_section,
+                        document_sections=document_sections,
+                        insights_section=insights_section,
+                        relationship_insights=relationship_insights,
+                        user_id=user_id,
+                        run_id=run_id,
+                    )
+                    comparative_analysis = _generate_comparative_analysis(
+                        video_section=video_section,
+                        document_sections=document_sections,
+                        insights_section=insights_section,
+                        relationship_insights=relationship_insights,
+                        user_id=user_id,
+                        run_id=run_id,
+                    )
+                    application_scenarios = _generate_application_scenarios(
+                        video_section=video_section,
+                        document_sections=document_sections,
+                        insights_section=insights_section,
+                        relationship_insights=relationship_insights,
+                        user_id=user_id,
+                        run_id=run_id,
+                    )
+                    candidate_insights = insights_section.model_copy(
+                        update={
+                            "comparative_analysis": comparative_analysis,
+                            "application_scenarios": application_scenarios,
+                        }
+                    )
+                    _assert_pairwise_uniqueness(
+                        run_id=run_id,
+                        user_id=user_id,
+                        section_group="cross-source",
+                        section_texts=_build_cross_section_text_map(candidate_insights, quiz_section),
+                        max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
+                    )
+                    insights_section = candidate_insights
+                    _store_combined_learning_sections(
+                        user_id=user_id,
+                        video_source_id=normalized_video_id,
+                        document_source_ids=normalized_document_ids,
+                        insights=insights_section,
+                        quiz=quiz_section,
+                    )
+                    break
+                except Exception as exc:
+                    last_error = str(exc)
+                    log_generation_stage_event(
+                        run_id=run_id,
+                        user_id=user_id,
+                        stage_name="cross_section_uniqueness_gate",
+                        attempt_number=combined_attempt,
+                        status="failed",
+                        details=_trim_error_detail(last_error),
+                    )
+                    if combined_attempt >= GENERATION_MAX_STAGE_ATTEMPTS:
+                        raise GenerationStageError(
+                            run_id=run_id,
+                            stage_name="cross_section_uniqueness_gate",
+                            attempt_number=combined_attempt,
+                            reason=_trim_error_detail(last_error or "unknown error"),
+                        ) from exc
+
+        cross_section_text_map = _build_cross_section_text_map(insights_section, quiz_section)
+        cross_prior_map: dict[str, list[str]] = {
+            "intersections": [],
+            "bridge": [cross_section_text_map.get("intersections", "")],
+            "integrated_analysis": [
+                cross_section_text_map.get("intersections", ""),
+                cross_section_text_map.get("bridge", ""),
+            ],
+            "scenarios": [
+                cross_section_text_map.get("intersections", ""),
+                cross_section_text_map.get("bridge", ""),
+                cross_section_text_map.get("integrated_analysis", ""),
+            ],
+            "quiz": [
+                cross_section_text_map.get("intersections", ""),
+                cross_section_text_map.get("bridge", ""),
+                cross_section_text_map.get("integrated_analysis", ""),
+                cross_section_text_map.get("scenarios", ""),
+            ],
+        }
+        for section_type, text_value in cross_section_text_map.items():
+            if not _normalize_continuous_prose(text_value):
+                continue
+            _record_novelty_ledger_entry(
                 user_id=user_id,
                 run_id=run_id,
-            )
-            quiz_section = _generate_combined_quiz(
-                video_section=video_section,
-                document_sections=document_sections,
-                insights_section=insights_section,
-                relationship_insights=relationship_insights,
-                user_id=user_id,
-                run_id=run_id,
-            )
-            comparative_analysis = _generate_comparative_analysis(
-                video_section=video_section,
-                document_sections=document_sections,
-                insights_section=insights_section,
-                relationship_insights=relationship_insights,
-                user_id=user_id,
-                run_id=run_id,
-            )
-            application_scenarios = _generate_application_scenarios(
-                video_section=video_section,
-                document_sections=document_sections,
-                insights_section=insights_section,
-                relationship_insights=relationship_insights,
-                user_id=user_id,
-                run_id=run_id,
-            )
-            insights_section = insights_section.model_copy(
-                update={
-                    "comparative_analysis": comparative_analysis,
-                    "application_scenarios": application_scenarios,
-                }
-            )
-            _store_combined_learning_sections(
-                user_id=user_id,
-                video_source_id=normalized_video_id,
+                source_id=None,
                 document_source_ids=normalized_document_ids,
-                insights=insights_section,
-                quiz=quiz_section,
+                section_type=f"cross:{section_type}",
+                section_text=text_value,
+                prior_texts=cross_prior_map.get(section_type, []),
+                expansion_applied=False,
             )
     else:
         log_generation_stage_event(
