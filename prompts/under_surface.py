@@ -9,7 +9,9 @@ Rules:
 5) Cover progression-aware behavior: foundational stage, integration stage, and edge-case stage.
 6) diagnostic_checklist should provide practical checks at each stage (foundational, integration, edge-case).
 7) key_term_explanations should deepen mental models by connecting terms to underlying mechanisms.
-8) Prefer depth over brevity while staying grounded and coherent (roughly 700-1300 words).
+8) Prefer depth over brevity while staying grounded and coherent (roughly 1100-2200 words).
+9) Add new information not already explicit in the deep dive by introducing mechanism-level links, practical implications, and edge-case interactions.
+10) Output continuous paragraph prose only for under_surface_explainer: no markdown headings, no bullet lists, no numbered lists.
 """.strip()
 
 

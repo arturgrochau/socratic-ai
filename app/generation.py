@@ -55,7 +55,7 @@ from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_P
 from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 6
+GENERATION_SCHEMA_VERSION = 7
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 MAX_UNDER_SURFACE_GROUNDING_CHUNKS = 6
@@ -69,6 +69,20 @@ DEDUPLICATION_TOKEN_OVERLAP_THRESHOLD = 0.58
 DEDUPLICATION_MIN_CHAR_RATIO = 0.35
 DEDUPLICATION_MIN_TOKEN_LENGTH = 4
 OUTLINE_MODEL_MIN_GROUNDING_ROWS = 12
+MAX_EXPANSION_GROUNDING_CHARS = 8000
+
+TEXT_EXPANSION_JSON_SCHEMA = {
+    "name": "expanded_text",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "expanded_text": {"type": "string"},
+        },
+        "required": ["expanded_text"],
+    },
+}
 
 
 class GenerationStageError(RuntimeError):
@@ -644,6 +658,106 @@ def _deduplicate_section_text(current_text: str, prior_texts: list[str]) -> str:
     return deduplicated
 
 
+def _truncate_for_prompt(text_value: str, *, limit: int = 900) -> str:
+    normalized = " ".join(str(text_value or "").split()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def _normalize_continuous_prose(text_value: str) -> str:
+    raw_lines = str(text_value or "").splitlines()
+    cleaned_lines: list[str] = []
+
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+
+        # Drop markdown heading/list markers but keep the content.
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
+        line = re.sub(r"^>\s+", "", line)
+        line = re.sub(r"^\*\*(.+?)\*\*$", r"\1", line)
+
+        if line:
+            cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return ""
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in cleaned_lines:
+        if line == "":
+            if current:
+                paragraphs.append(" ".join(current).strip())
+                current = []
+            continue
+        current.append(line)
+
+    if current:
+        paragraphs.append(" ".join(current).strip())
+
+    prose = "\n\n".join(part for part in paragraphs if part).strip()
+    prose = re.sub(r"\n{3,}", "\n\n", prose)
+    return prose
+
+
+def _expand_nonredundant_text(
+    *,
+    run_id: str,
+    stage_name: str,
+    user_id: str,
+    context_label: str,
+    base_text: str,
+    avoid_texts: list[str],
+    grounding_chunks: list[str],
+    key_terms: list[str] | None = None,
+    extra_context: str = "",
+) -> str:
+    trimmed_grounding = "\n\n".join(grounding_chunks)
+    if len(trimmed_grounding) > MAX_EXPANSION_GROUNDING_CHARS:
+        trimmed_grounding = trimmed_grounding[:MAX_EXPANSION_GROUNDING_CHARS].rstrip() + "..."
+
+    avoid_block = "\n\n".join(
+        _truncate_for_prompt(value, limit=700)
+        for value in avoid_texts
+        if str(value or "").strip()
+    )
+
+    key_terms_text = ", ".join(term for term in (key_terms or []) if term.strip())
+
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=stage_name,
+        user_id=user_id,
+        system_prompt=(
+            "You rewrite and deepen grounded learning text. Return only JSON. "
+            "Write continuous paragraph prose with no markdown headings or bullet lists. "
+            "The output must be non-redundant against the forbidden overlap text while adding new, mechanism-level explanation."
+        ),
+        user_prompt=(
+            f"Context label: {context_label}\n\n"
+            f"Base draft to improve:\n{_truncate_for_prompt(base_text, limit=2400)}\n\n"
+            f"Forbidden overlap text (do not restate these claims with similar phrasing):\n{avoid_block or '[none]'}\n\n"
+            f"Key terms to connect (optional): {key_terms_text or '[none]'}\n\n"
+            f"Extra context:\n{extra_context or '[none]'}\n\n"
+            f"Grounding chunks:\n{trimmed_grounding or '[none]'}\n\n"
+            "Rewrite into a richer layman-friendly but technically faithful explanation. "
+            "Prioritize causal chains, assumptions, constraints, tradeoffs, and edge-case behavior. "
+            "Avoid repeating base-draft phrasing; add fresh structure and examples from grounded context."
+        ),
+        response_schema=TEXT_EXPANSION_JSON_SCHEMA,
+        required_keys=["expanded_text"],
+    )
+    return str(payload.get("expanded_text") or "").strip()
+
+
 def _generate_source_title(summary_text: str, source_type: str, user_id: str, run_id: str) -> str:
     payload = _run_structured_generation_step(
         run_id=run_id,
@@ -1094,6 +1208,39 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         under_surface_explainer,
         [summary_text, deep_dive_text],
     )
+    under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
+
+    try:
+        expanded_under_surface = _expand_nonredundant_text(
+            run_id=run_id,
+            stage_name=f"source_under_surface_expand:{source_type}",
+            user_id=user_id,
+            context_label=f"{source_type} under-surface explainer",
+            base_text=under_surface_explainer,
+            avoid_texts=[summary_text, deep_dive_text],
+            grounding_chunks=under_surface_chunks,
+            key_terms=key_terms,
+            extra_context=(
+                f"Progression outline:\n{_truncate_for_prompt(progression_outline, limit=1200)}"
+            ),
+        )
+        expanded_under_surface = _deduplicate_section_text(
+            _normalize_continuous_prose(expanded_under_surface),
+            [summary_text, deep_dive_text, under_surface_explainer],
+        )
+        if expanded_under_surface:
+            under_surface_explainer = expanded_under_surface
+    except Exception as exc:
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_under_surface_expand:{source_type}",
+            attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
+            status="skipped",
+            details=f"fallback_to_first_pass={_trim_error_detail(str(exc))}",
+        )
+
+    under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
 
     section = SourceLearningSection(
         source_id=source_id,
@@ -1221,7 +1368,9 @@ def _generate_combined_insights(
 
         intersection_title = str(raw_intersection.get("intersection_title", "")).strip()
         why_it_matters = str(raw_intersection.get("why_it_matters", "")).strip()
-        integrated_explanation = str(raw_intersection.get("integrated_explanation", "")).strip()
+        integrated_explanation = _normalize_continuous_prose(
+            str(raw_intersection.get("integrated_explanation", "")).strip()
+        )
         if not intersection_title or not why_it_matters or not integrated_explanation:
             continue
 
@@ -1279,14 +1428,118 @@ def _generate_combined_insights(
             )
             parallels.extend(legacy_sentences)
 
-    layman_bridge = str(payload.get("layman_bridge", "")).strip()
-    synthesis_text = str(payload.get("synthesis_text", "")).strip()
+    layman_bridge = _normalize_continuous_prose(str(payload.get("layman_bridge", "")).strip())
+    synthesis_text = _normalize_continuous_prose(str(payload.get("synthesis_text", "")).strip())
     if len(intersections) < 1:
         raise ValueError("Model returned too few integrated cross-source intersections.")
     if not layman_bridge:
         raise ValueError("Model returned an empty layman bridge.")
     if not synthesis_text:
         raise ValueError("Model returned an empty synthesis text.")
+
+    source_background = [
+        video_section.summary_text,
+        video_section.deep_dive_text,
+        video_section.under_surface_explainer,
+    ] + [
+        value
+        for section in document_sections
+        for value in [section.summary_text, section.deep_dive_text, section.under_surface_explainer]
+    ]
+    shared_grounding_chunks = [
+        (
+            f"{section.source_type.title()} [{section.generated_title}]\n"
+            f"Summary: {_truncate_for_prompt(section.summary_text, limit=320)}\n"
+            f"Deep dive: {_truncate_for_prompt(section.deep_dive_text, limit=380)}\n"
+            f"Under surface: {_truncate_for_prompt(section.under_surface_explainer, limit=380)}"
+        )
+        for section in [video_section, *document_sections]
+    ]
+
+    refined_intersections: list[InsightIntersection] = []
+    for index, intersection in enumerate(intersections, start=1):
+        try:
+            expanded_intersection = _expand_nonredundant_text(
+                run_id=run_id,
+                stage_name=f"combined_intersection_expand:{index}",
+                user_id=user_id,
+                context_label=f"cross-source intersection: {intersection.intersection_title}",
+                base_text=intersection.integrated_explanation,
+                avoid_texts=[
+                    intersection.why_it_matters,
+                    layman_bridge,
+                    *source_background,
+                ],
+                grounding_chunks=shared_grounding_chunks,
+                key_terms=[
+                    term
+                    for sentence in intersection.attributed_sentences
+                    for term in sentence.emphasis_terms
+                ],
+            )
+            expanded_intersection = _deduplicate_section_text(
+                _normalize_continuous_prose(expanded_intersection),
+                [intersection.why_it_matters, *source_background],
+            )
+            if expanded_intersection:
+                refined_intersections.append(
+                    intersection.model_copy(update={"integrated_explanation": expanded_intersection})
+                )
+                continue
+        except Exception:
+            pass
+
+        refined_intersections.append(
+            intersection.model_copy(
+                update={
+                    "integrated_explanation": _normalize_continuous_prose(
+                        _deduplicate_section_text(
+                            intersection.integrated_explanation,
+                            [intersection.why_it_matters, *source_background],
+                        )
+                    )
+                }
+            )
+        )
+
+    intersections = refined_intersections
+
+    try:
+        expanded_synthesis = _expand_nonredundant_text(
+            run_id=run_id,
+            stage_name="combined_synthesis_expand",
+            user_id=user_id,
+            context_label="cross-source synthesis",
+            base_text=synthesis_text,
+            avoid_texts=[
+                layman_bridge,
+                *[entry.why_it_matters for entry in intersections],
+                *source_background,
+            ],
+            grounding_chunks=shared_grounding_chunks,
+            key_terms=[
+                term
+                for entry in intersections
+                for sentence in entry.attributed_sentences
+                for term in sentence.emphasis_terms
+            ],
+            extra_context=(
+                "Relationship insights:\n"
+                + "\n".join(_truncate_for_prompt(item, limit=260) for item in relationship_insights[:8])
+            ),
+        )
+        expanded_synthesis = _normalize_continuous_prose(
+            _deduplicate_section_text(
+                expanded_synthesis,
+                [layman_bridge, *[entry.integrated_explanation for entry in intersections], *source_background],
+            )
+        )
+        if expanded_synthesis:
+            synthesis_text = expanded_synthesis
+    except Exception:
+        synthesis_text = _normalize_continuous_prose(synthesis_text)
+
+    layman_bridge = _normalize_continuous_prose(layman_bridge)
 
     return CombinedInsightSection(
         intersections=intersections,
@@ -1381,9 +1634,58 @@ def _generate_comparative_analysis(
         response_schema=COMPARATIVE_ANALYSIS_JSON_SCHEMA,
         required_keys=["comparative_analysis"],
     )
-    comparative_analysis = str(result.get("comparative_analysis", "")).strip()
+    comparative_analysis = _normalize_continuous_prose(str(result.get("comparative_analysis", "")).strip())
     if not comparative_analysis:
         raise ValueError("Model returned empty comparative analysis text.")
+
+    source_background = [
+        video_section.summary_text,
+        video_section.deep_dive_text,
+        insights_section.synthesis_text,
+    ] + [
+        value
+        for section in document_sections
+        for value in [section.summary_text, section.deep_dive_text]
+    ]
+    grounding_chunks = [
+        (
+            f"{section.source_type.title()} [{section.generated_title}]\n"
+            f"Summary: {_truncate_for_prompt(section.summary_text, limit=320)}\n"
+            f"Deep dive: {_truncate_for_prompt(section.deep_dive_text, limit=360)}"
+        )
+        for section in [video_section, *document_sections]
+    ]
+
+    try:
+        expanded_analysis = _expand_nonredundant_text(
+            run_id=run_id,
+            stage_name="comparative_analysis_expand",
+            user_id=user_id,
+            context_label="cross-source comparative deepening",
+            base_text=comparative_analysis,
+            avoid_texts=[insights_section.layman_bridge, insights_section.synthesis_text, *source_background],
+            grounding_chunks=grounding_chunks,
+            key_terms=[
+                term
+                for entry in insights_section.intersections
+                for sentence in entry.attributed_sentences
+                for term in sentence.emphasis_terms
+            ],
+            extra_context=(
+                "Relationship insights:\n"
+                + "\n".join(_truncate_for_prompt(item, limit=260) for item in relationship_insights[:8])
+            ),
+        )
+        expanded_analysis = _normalize_continuous_prose(
+            _deduplicate_section_text(
+                expanded_analysis,
+                [insights_section.synthesis_text, insights_section.layman_bridge, *source_background],
+            )
+        )
+        if expanded_analysis:
+            comparative_analysis = expanded_analysis
+    except Exception:
+        comparative_analysis = _normalize_continuous_prose(comparative_analysis)
 
     return comparative_analysis
 
@@ -1415,10 +1717,27 @@ def _generate_application_scenarios(
         response_schema=APPLICATION_SCENARIOS_JSON_SCHEMA,
         required_keys=["application_scenarios"],
     )
-    scenarios = [
-        ApplicationScenario.model_validate(item)
-        for item in result.get("application_scenarios", [])
-    ]
+    scenarios: list[ApplicationScenario] = []
+    for item in result.get("application_scenarios", []):
+        try:
+            scenario = ApplicationScenario.model_validate(item)
+        except Exception:
+            continue
+
+        normalized_steps: list[str] = []
+        for step in scenario.transfer_steps:
+            normalized_step = _normalize_continuous_prose(step)
+            if normalized_step:
+                normalized_steps.append(normalized_step)
+        scenarios.append(
+            scenario.model_copy(
+                update={
+                    "scenario_prompt": _normalize_continuous_prose(scenario.scenario_prompt),
+                    "transfer_steps": normalized_steps,
+                    "common_pitfall": _normalize_continuous_prose(scenario.common_pitfall),
+                }
+            )
+        )
     if len(scenarios) < 2:
         raise ValueError("Model returned too few application scenarios.")
 

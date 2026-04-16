@@ -5,8 +5,9 @@ Rules:
 1) Scenarios must be realistic and clearly connected to the provided materials.
 2) Each scenario must include a practical prompt and ordered transfer steps.
 3) Surface one common pitfall that a strong student might still make.
-4) Keep each scenario concise, specific, and non-overlapping with the others.
-5) Keep scenario text compact; avoid unnecessarily long prose.
+4) Keep each scenario specific and non-overlapping with the others.
+5) Make each scenario actionable and mechanism-aware, not generic advice.
+6) Prefer 3-4 scenarios when there is enough cross-source material.
 """.strip()
 
 
@@ -20,20 +21,20 @@ APPLICATION_SCENARIOS_JSON_SCHEMA = {
             "application_scenarios": {
                 "type": "array",
                 "minItems": 2,
-                "maxItems": 3,
+                "maxItems": 4,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
                         "scenario_title": {"type": "string", "maxLength": 180},
-                        "scenario_prompt": {"type": "string", "maxLength": 900},
+                        "scenario_prompt": {"type": "string", "maxLength": 1300},
                         "transfer_steps": {
                             "type": "array",
                             "minItems": 3,
-                            "maxItems": 5,
-                            "items": {"type": "string", "maxLength": 360},
+                            "maxItems": 6,
+                            "items": {"type": "string", "maxLength": 520},
                         },
-                        "common_pitfall": {"type": "string", "maxLength": 700},
+                        "common_pitfall": {"type": "string", "maxLength": 1100},
                     },
                     "required": [
                         "scenario_title",

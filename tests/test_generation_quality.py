@@ -5,11 +5,13 @@ import unittest
 from app.generation import (
     _compute_distributed_row_positions,
     _deduplicate_section_text,
+    _normalize_continuous_prose,
     _should_use_model_progression_outline,
 )
 from frontend.app import (
     _build_quick_quiz_prompt,
     _compose_assistant_chat_message,
+    _normalize_continuous_text_for_display,
     _resolve_source_label_map,
     _should_show_cross_source_section,
 )
@@ -68,6 +70,14 @@ class DeduplicationTests(unittest.TestCase):
         result = _deduplicate_section_text(current_text, prior_texts)
         self.assertNotIn("dopamine drives short-term reward seeking", result.lower())
         self.assertIn("process-level milestones", result.lower())
+
+    def test_generation_prose_normalizer_removes_markdown_artifacts(self) -> None:
+        raw = "###Mechanism\n- First causal step\n- Second causal step\n\n## Why this matters"
+        normalized = _normalize_continuous_prose(raw)
+        self.assertNotIn("###", normalized)
+        self.assertNotIn("- First", normalized)
+        self.assertIn("First causal step", normalized)
+        self.assertIn("Second causal step", normalized)
 
 
 class ProgressionOutlineEfficiencyTests(unittest.TestCase):
@@ -136,6 +146,14 @@ class ChatBehaviorTests(unittest.TestCase):
             include_follow_up=True,
         )
         self.assertIn("Socratic next question", composed)
+
+    def test_frontend_continuous_text_normalizer_removes_headers(self) -> None:
+        raw = "##Core idea\n###Why it works\n1. First point\n2. Second point"
+        normalized = _normalize_continuous_text_for_display(raw)
+        self.assertNotIn("##", normalized)
+        self.assertNotIn("1.", normalized)
+        self.assertIn("Core idea", normalized)
+        self.assertIn("Second point", normalized)
 
 
 class SourceLabelFormattingTests(unittest.TestCase):

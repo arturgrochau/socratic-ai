@@ -36,6 +36,17 @@ The app is intentionally retrieval-first and stage-based instead of one-shot cha
 - Mixed mode uses full comparative stages (intersections, quiz, comparative analysis, scenarios).
 - Non-comparative mode uses deterministic, grounded synthesis objects and skips comparative model calls.
 
+### Depth and Non-Redundancy Strategy
+
+- Source-level under-surface generation now runs in two passes:
+  - pass 1: structured under-surface generation (diagnostic checklist + key term breakdown)
+  - pass 2: non-redundant expansion pass that explicitly avoids repeating summary/deep-dive text while adding mechanism-level explanation
+- Under-surface text is normalized to continuous prose (no markdown heading/list artifacts) before storage and rendering.
+- Cross-source intersections and synthesis are now refined for depth and novelty:
+  - intersection explanations get non-redundant expansion against source summaries/deep dives
+  - synthesis and comparative analysis get additional expansion/refinement passes with overlap suppression
+- Cross-source prompt schemas were widened so responses can carry more useful detail without truncating important context.
+
 4. Interaction
 - `/ask` uses source-scoped retrieval and generated context.
 - Streamlit quick actions can auto-navigate to chat and auto-submit the generated query.
@@ -46,6 +57,9 @@ The app is intentionally retrieval-first and stage-based instead of one-shot cha
 - After a source is saved, the input is replaced by a selected-state card plus replace button.
 - Step 1 and Step 2 each provide an explicit skip button.
 - Step 3 enables generation only when at least one source is selected.
+- Source and cross-source sections include “Elaborate further” actions that auto-jump to the chatbox and auto-send context-rich prompts.
+- New assistant responses in chat auto-scroll into view and get a brief highlight flash for visibility.
+- Cross-source grounded evidence is rendered as mechanism-grounded evidence cards with source attribution and concept signals.
 
 ## Cost Expectations (gpt-4o-mini + current defaults)
 

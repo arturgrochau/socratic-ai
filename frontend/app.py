@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 def _resolve_timeout_seconds() -> int:
@@ -86,6 +87,8 @@ def _init_state() -> None:
         st.session_state.wizard_video_url_input = ""
     if "auto_submit_query" not in st.session_state:
         st.session_state.auto_submit_query = ""
+    if "flash_latest_assistant" not in st.session_state:
+        st.session_state.flash_latest_assistant = False
 
 
 def _request_headers() -> dict[str, str]:
@@ -165,6 +168,7 @@ def _reset_builder() -> None:
     st.session_state.wizard_video_url = ""
     st.session_state.wizard_video_url_input = ""
     st.session_state.auto_submit_query = ""
+    st.session_state.flash_latest_assistant = False
 
 
 def _file_extension(filename: str) -> str:
@@ -234,6 +238,31 @@ def _queue_chat_navigation(prefill: str, *, auto_submit: bool = False) -> None:
     st.session_state.pending_dashboard_section = "Socratic Chatbox"
 
 
+def _render_chat_scroll_and_flash() -> None:
+        components.html(
+                """
+                <script>
+                    const parentDoc = window.parent.document;
+                    const messages = parentDoc.querySelectorAll('[data-testid="stChatMessage"]');
+                    if (messages.length > 0) {
+                        const last = messages[messages.length - 1];
+                        last.scrollIntoView({ behavior: "smooth", block: "center" });
+                        const previousBoxShadow = last.style.boxShadow;
+                        const previousBackground = last.style.backgroundColor;
+                        last.style.transition = "box-shadow 180ms ease, background-color 380ms ease";
+                        last.style.boxShadow = "0 0 0 2px rgba(250, 176, 5, 0.85)";
+                        last.style.backgroundColor = "rgba(255, 243, 205, 0.55)";
+                        setTimeout(() => {
+                            last.style.boxShadow = previousBoxShadow;
+                            last.style.backgroundColor = previousBackground;
+                        }, 1300);
+                    }
+                </script>
+                """,
+                height=0,
+        )
+
+
 def _slugify_token(value: str, *, fallback: str = "item") -> str:
     token = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
     return token or fallback
@@ -244,6 +273,42 @@ def _shorten_inline_text(text_value: str, *, max_chars: int) -> str:
     if len(normalized) <= max_chars:
         return normalized
     return normalized[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _normalize_continuous_text_for_display(text_value: str) -> str:
+    lines = str(text_value or "").splitlines()
+    cleaned_lines: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
+        line = re.sub(r"^>\s+", "", line)
+        if line:
+            cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return ""
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in cleaned_lines:
+        if line == "":
+            if current:
+                paragraphs.append(" ".join(current).strip())
+                current = []
+            continue
+        current.append(line)
+    if current:
+        paragraphs.append(" ".join(current).strip())
+
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
 
 
 def _strip_socratic_follow_up(text_value: str) -> str:
@@ -417,6 +482,7 @@ def _run_upload_process_and_generate(
     st.session_state.ask_messages = []
     st.session_state.ask_prefill = ""
     st.session_state.auto_submit_query = ""
+    st.session_state.flash_latest_assistant = False
     st.session_state.generation_result = generation_payload
     st.session_state.wizard_step = 3
     st.session_state.dashboard_section = "Cross-Source Synthesis & Assessment"
@@ -554,7 +620,8 @@ def _render_reflection_points(
             st.markdown(_format_long_prose_markdown(explanation))
         if under_the_hood:
             with st.expander(f"Why this works under the surface (point {index})"):
-                st.markdown(_format_long_prose_markdown(under_the_hood, max_sentences_per_paragraph=4))
+                cleaned_under_the_hood = _normalize_continuous_text_for_display(under_the_hood)
+                st.markdown(_format_long_prose_markdown(cleaned_under_the_hood, max_sentences_per_paragraph=4))
                 if st.button(
                     "Elaborate further in chat",
                     key=f"elaborate_reflection_{source_key}_{index}",
@@ -650,8 +717,9 @@ def _render_source_learning_section(section_payload: dict) -> None:
     under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
     if under_surface_text:
         with st.expander("Why this works under the surface"):
+            normalized_under_surface = _normalize_continuous_text_for_display(under_surface_text)
             formatted_under_surface = _format_long_prose_markdown(
-                under_surface_text,
+                normalized_under_surface,
                 max_sentences_per_paragraph=4,
             )
             st.markdown(_bold_keywords_in_text(formatted_under_surface, normalized_terms))
@@ -681,7 +749,7 @@ def _render_source_learning_section(section_payload: dict) -> None:
                 _queue_chat_navigation(
                     _build_elaboration_chat_prompt(
                         context_label=source_label,
-                        under_surface_text=under_surface_text,
+                        under_surface_text=normalized_under_surface,
                         key_terms=normalized_terms,
                     ),
                     auto_submit=True,
@@ -750,9 +818,9 @@ def _bold_keywords_in_text(text_value: str, keywords: list[str]) -> str:
 
 def _render_grouped_evidence(
     attributed_sentences: list[dict],
-    valid_source_ids: set[int],
+    source_label_map: dict[int, str],
 ) -> None:
-    evidence_quotes: list[str] = []
+    evidence_items: list[tuple[str, str, list[str]]] = []
     seen_quotes: set[str] = set()
 
     for item in attributed_sentences:
@@ -760,7 +828,7 @@ def _render_grouped_evidence(
             continue
 
         source_id = int(item.get("source_id", 0) or 0)
-        if source_id <= 0 or source_id not in valid_source_ids:
+        if source_id <= 0 or source_id not in source_label_map:
             continue
 
         quote_text = " ".join(str(item.get("text", "")).split()).strip()
@@ -780,17 +848,32 @@ def _render_grouped_evidence(
         if len(quote_text) > 240:
             quote_text = quote_text[:237].rstrip() + "..."
 
-        evidence_quotes.append(quote_text)
+        emphasis_terms = [
+            str(term).strip()
+            for term in (item.get("emphasis_terms", []) or [])
+            if str(term).strip()
+        ]
+        source_label = source_label_map.get(source_id, f"Source {source_id}")
+        evidence_items.append((source_label, quote_text, emphasis_terms))
 
-    if not evidence_quotes:
+    if not evidence_items:
         return
 
-    with st.expander("Show source-grounded evidence", expanded=False):
-        for quote in evidence_quotes[:8]:
-            st.markdown(f"- \"{quote}\"")
-        hidden_count = len(evidence_quotes) - 8
+    with st.expander("Show grounded mechanism evidence", expanded=False):
+        for source_label, quote, emphasis_terms in evidence_items[:8]:
+            st.markdown(f"**{source_label}**")
+            st.markdown(f"Evidence snippet: \"{quote}\"")
+            if emphasis_terms:
+                joined_terms = ", ".join(f"**{term}**" for term in emphasis_terms[:4])
+                st.markdown(
+                    "Mechanism signal: this snippet grounds the explanation around "
+                    f"{joined_terms}."
+                )
+            st.markdown("")
+
+        hidden_count = len(evidence_items) - 8
         if hidden_count > 0:
-            st.caption(f"+ {hidden_count} more supporting quote(s)")
+            st.caption(f"+ {hidden_count} more grounded evidence snippet(s)")
 
 
 def _submit_chat_query(
@@ -828,6 +911,7 @@ def _submit_chat_query(
             include_follow_up=not suppress_follow_up,
         )
         st.session_state.ask_messages.append({"role": "assistant", "content": assistant_text})
+        st.session_state.flash_latest_assistant = True
     except Exception as exc:
         error_text = str(exc)
         st.session_state.ask_messages.append(
@@ -839,6 +923,7 @@ def _submit_chat_query(
                 ),
             }
         )
+        st.session_state.flash_latest_assistant = True
 
     st.rerun()
 
@@ -870,10 +955,10 @@ def _build_intersection_chat_prefill(
     keyword_text = ", ".join(emphasis_terms[:6])
     quote_text = " | ".join(quote_fragments)
     return (
-        f"In the intersection '{title}', help me understand this better: {why_it_matters}. "
+        f"Elaborate further on intersection '{title}' by focusing on how it works under the surface: {why_it_matters}. "
         f"Key concepts: {keyword_text or 'none listed'}. "
         f"Evidence snippets: {quote_text or 'none provided'}. "
-        "Please answer my question directly first, then briefly connect the idea to how I should think about applying it."
+        "Please answer directly first, expand mechanism-level reasoning in plain language, and end with one concrete application check."
     ).strip()
 
 def _render_ask_tab(has_user_id: bool) -> None:
@@ -902,6 +987,10 @@ def _render_ask_tab(has_user_id: bool) -> None:
     for message in st.session_state.ask_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+
+    if st.session_state.flash_latest_assistant:
+        _render_chat_scroll_and_flash()
+        st.session_state.flash_latest_assistant = False
 
     if st.session_state.ask_messages and st.session_state.ask_messages[-1]["role"] == "assistant":
         col_elaborate, col_quiz = st.columns(2)
@@ -1038,7 +1127,13 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                             f"**Why it matters:** {_bold_keywords_in_text(why_it_matters, emphasis_terms)}"
                         )
                     if integrated_explanation:
-                        st.markdown(_bold_keywords_in_text(integrated_explanation, emphasis_terms))
+                        cleaned_integrated = _normalize_continuous_text_for_display(integrated_explanation)
+                        st.markdown(
+                            _bold_keywords_in_text(
+                                _format_long_prose_markdown(cleaned_integrated, max_sentences_per_paragraph=4),
+                                emphasis_terms,
+                            )
+                        )
 
                     if emphasis_terms:
                         concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
@@ -1046,11 +1141,11 @@ def _render_generation_tabs(has_user_id: bool) -> None:
 
                     _render_grouped_evidence(
                         attributed_sentences,
-                        valid_source_ids=set(source_label_map.keys()),
+                        source_label_map=source_label_map,
                     )
 
                     ask_about_intersection = st.button(
-                        "Ask about this intersection",
+                        "Elaborate further",
                         key=f"ask_intersection_{index}",
                         use_container_width=False,
                     )
@@ -1085,11 +1180,11 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         st.caption(f"Key concepts: {concept_list}")
                     _render_grouped_evidence(
                         normalized_parallels,
-                        valid_source_ids=set(source_label_map.keys()),
+                        source_label_map=source_label_map,
                     )
 
                     ask_about_core = st.button(
-                        "Ask about this intersection",
+                        "Elaborate further",
                         key="ask_core_intersection",
                         use_container_width=False,
                     )
@@ -1106,17 +1201,21 @@ def _render_generation_tabs(has_user_id: bool) -> None:
 
         layman_bridge = str(insights_payload.get("layman_bridge", "")).strip()
         if layman_bridge:
-            st.info(layman_bridge)
+            st.markdown("### Bridge in Plain Language")
+            cleaned_bridge = _normalize_continuous_text_for_display(layman_bridge)
+            st.markdown(_format_long_prose_markdown(cleaned_bridge, max_sentences_per_paragraph=4))
 
         synthesis_text = str(insights_payload.get("synthesis_text", "")).strip()
         if synthesis_text:
             st.markdown("### Synthesis")
-            st.markdown(synthesis_text)
+            cleaned_synthesis = _normalize_continuous_text_for_display(synthesis_text)
+            st.markdown(_format_long_prose_markdown(cleaned_synthesis, max_sentences_per_paragraph=4))
 
         comparative_analysis = str(insights_payload.get("comparative_analysis") or "").strip()
         if comparative_analysis:
             st.markdown("### Comparative Deepening")
-            st.markdown(comparative_analysis)
+            cleaned_comparative = _normalize_continuous_text_for_display(comparative_analysis)
+            st.markdown(_format_long_prose_markdown(cleaned_comparative, max_sentences_per_paragraph=4))
 
         application_scenarios = insights_payload.get("application_scenarios", []) or []
         if application_scenarios:
