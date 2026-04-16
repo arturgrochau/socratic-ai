@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from difflib import SequenceMatcher
 
 from sqlalchemy import text
 
@@ -52,6 +53,9 @@ DEEPENING_QUERY_PATTERNS = [
     "deepen this",
     "tell me more",
 ]
+REDUNDANCY_SIMILARITY_THRESHOLD = 0.88
+REDUNDANCY_TOKEN_OVERLAP_THRESHOLD = 0.62
+REDUNDANCY_MIN_CHAR_RATIO = 0.45
 
 
 def ensure_interaction_tables() -> None:
@@ -123,6 +127,102 @@ def _truncate_text(text_value: str, max_chars: int) -> str:
     return normalized[: max_chars - 3].rstrip() + "..."
 
 
+def _split_sentences(text_value: str) -> list[str]:
+    normalized = " ".join(str(text_value or "").split()).strip()
+    if not normalized:
+        return []
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", normalized)
+        if sentence.strip()
+    ]
+
+
+def _token_overlap_ratio(left: str, right: str) -> float:
+    left_tokens = {token for token in re.findall(r"[A-Za-z0-9']+", left.lower()) if len(token) >= 4}
+    right_tokens = {token for token in re.findall(r"[A-Za-z0-9']+", right.lower()) if len(token) >= 4}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / float(min(len(left_tokens), len(right_tokens)))
+
+
+def _sanitize_continuous_text(text_value: str) -> str:
+    lines = str(text_value or "").splitlines()
+    cleaned_lines: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+
+        line = line.replace("\u2014", " - ").replace("\u2013", " - ")
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
+        line = re.sub(r"^>\s+", "", line)
+        line = re.sub(r"#{2,}", "", line)
+        line = re.sub(r"\s{2,}", " ", line).strip()
+
+        if line:
+            cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return ""
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in cleaned_lines:
+        if line == "":
+            if current:
+                paragraphs.append(" ".join(current).strip())
+                current = []
+            continue
+        current.append(line)
+    if current:
+        paragraphs.append(" ".join(current).strip())
+
+    return "\n\n".join(part for part in paragraphs if part).strip()
+
+
+def _strip_redundant_sentences(current_text: str, reference_text: str) -> str:
+    current_sentences = _split_sentences(current_text)
+    if len(current_sentences) < 2:
+        return current_text
+
+    reference_sentences = _split_sentences(reference_text)
+    if not reference_sentences:
+        return current_text
+
+    kept_sentences: list[str] = []
+    for sentence in current_sentences:
+        sentence_norm = sentence.lower()
+        duplicate = False
+        for reference in [*reference_sentences, *kept_sentences]:
+            reference_norm = reference.lower()
+            if sentence_norm == reference_norm:
+                duplicate = True
+                break
+            if SequenceMatcher(None, sentence_norm, reference_norm).ratio() >= REDUNDANCY_SIMILARITY_THRESHOLD:
+                duplicate = True
+                break
+            if _token_overlap_ratio(sentence_norm, reference_norm) >= REDUNDANCY_TOKEN_OVERLAP_THRESHOLD:
+                duplicate = True
+                break
+        if not duplicate:
+            kept_sentences.append(sentence)
+
+    if not kept_sentences:
+        return current_text
+
+    deduped = " ".join(kept_sentences).strip()
+    if len(deduped) < int(len(current_text) * REDUNDANCY_MIN_CHAR_RATIO):
+        return current_text
+    return deduped
+
+
 def _has_meaningful_text(value: str) -> bool:
     return bool(value and value.strip() and value.strip() != "[None available]")
 
@@ -184,6 +284,7 @@ def _expand_followup_query(query: str, recent_turns: list[InteractionTurnRecord]
     last_turn = recent_turns[-1]
     return (
         f"{query}. Focus on the previous discussion topic. "
+        "Do not restate the previous assistant answer with paraphrasing; add new mechanism-level details, constraints, or edge cases. "
         f"Previous user question: {last_turn.query}. "
         f"Previous assistant answer (truncated): {_truncate_text(last_turn.answer, 820)}"
     ).strip()
@@ -499,7 +600,7 @@ def _build_best_effort_answer(
         if "unrelated" in bridge_note.lower():
             bridge_note = ""
 
-    merged_signal = _truncate_text(' '.join(first_principles_bits), 900 if long_form else 520)
+    merged_signal = _truncate_text(" ".join(first_principles_bits), 900 if long_form else 520)
     direct_response = (
         f"For your question about '{query}', "
         f"{merged_signal if merged_signal else 'the available material has limited direct signal, but there are still useful grounded cues.'}"
@@ -513,14 +614,16 @@ def _build_best_effort_answer(
         )
 
     if long_form:
-        return (
+        return _sanitize_continuous_text(
+            (
             f"{direct_response}\n\n"
             "To go deeper, trace the causal chain step by step, identify which assumptions are fixed, "
             "and check what breaks when those assumptions are relaxed.\n\n"
             f"{reflective_tail}"
-        ).strip()
+            ).strip()
+        )
 
-    return f"{direct_response}\n\n{reflective_tail}".strip()
+    return _sanitize_continuous_text(f"{direct_response}\n\n{reflective_tail}".strip())
 
 
 def _run_unified_completion(
@@ -757,11 +860,19 @@ def handle_user_query(
             long_form=long_form,
         )
 
+    answer = _sanitize_continuous_text(answer)
+
     if not follow_up_question:
         follow_up_question = None
+    else:
+        follow_up_question = _sanitize_continuous_text(follow_up_question)
+
+    if _is_deepening_query(normalized_query) and recent_turns and answer:
+        previous_answer = _sanitize_continuous_text(recent_turns[-1].answer)
+        answer = _sanitize_continuous_text(_strip_redundant_sentences(answer, previous_answer))
 
     if retrieved_context is not None and not _is_insufficient_answer(answer):
-        learning_bridge = _build_learning_bridge(retrieved_context)
+        learning_bridge = _sanitize_continuous_text(_build_learning_bridge(retrieved_context) or "")
         if learning_bridge and learning_bridge not in answer:
             answer = f"{answer}\n\n{learning_bridge}".strip()
 

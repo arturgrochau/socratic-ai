@@ -10,6 +10,8 @@ Rules:
 6) Keep the output bounded (single focused analysis, no repetition loops).
 7) Prefer continuous prose with no markdown headings or list formatting.
 8) Add first-principles mechanism explanation and explicit transfer guidance for practice.
+9) Avoid repeating claims already made in synthesis or intersection summaries unless introducing a new mechanism or boundary condition.
+10) Do not use em dashes; use commas, periods, or parentheses.
 """.strip()
 
 

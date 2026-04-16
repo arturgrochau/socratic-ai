@@ -70,6 +70,7 @@ DEDUPLICATION_MIN_CHAR_RATIO = 0.35
 DEDUPLICATION_MIN_TOKEN_LENGTH = 4
 OUTLINE_MODEL_MIN_GROUNDING_ROWS = 12
 MAX_EXPANSION_GROUNDING_CHARS = 8000
+MAX_DEEP_DIVE_WORDS = 900
 
 TEXT_EXPANSION_JSON_SCHEMA = {
     "name": "expanded_text",
@@ -676,6 +677,9 @@ def _normalize_continuous_prose(text_value: str) -> str:
                 cleaned_lines.append("")
             continue
 
+        # Remove disallowed dash styling and markdown residue, including leaked inline hashes.
+        line = line.replace("\u2014", " - ").replace("\u2013", " - ")
+
         # Drop markdown heading/list markers but keep the content.
         line = re.sub(r"^#{1,6}\s*", "", line)
         line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
@@ -683,6 +687,8 @@ def _normalize_continuous_prose(text_value: str) -> str:
         line = re.sub(r"^\d+\.\s+", "", line)
         line = re.sub(r"^>\s+", "", line)
         line = re.sub(r"^\*\*(.+?)\*\*$", r"\1", line)
+        line = re.sub(r"#{2,}", "", line)
+        line = re.sub(r"\s{2,}", " ", line).strip()
 
         if line:
             cleaned_lines.append(line)
@@ -706,6 +712,40 @@ def _normalize_continuous_prose(text_value: str) -> str:
     prose = "\n\n".join(part for part in paragraphs if part).strip()
     prose = re.sub(r"\n{3,}", "\n\n", prose)
     return prose
+
+
+def _truncate_to_max_words(text_value: str, *, max_words: int) -> str:
+    normalized = _normalize_continuous_prose(text_value)
+    if not normalized:
+        return ""
+
+    words = normalized.split()
+    if len(words) <= max_words:
+        return normalized
+
+    sentences = _split_into_sentences(normalized)
+    if not sentences:
+        return " ".join(words[:max_words]).strip()
+
+    kept_sentences: list[str] = []
+    running_words = 0
+    for sentence in sentences:
+        sentence_words = sentence.split()
+        if not sentence_words:
+            continue
+
+        if kept_sentences and running_words + len(sentence_words) > max_words:
+            break
+        if not kept_sentences and len(sentence_words) > max_words:
+            return " ".join(sentence_words[:max_words]).strip()
+
+        kept_sentences.append(sentence)
+        running_words += len(sentence_words)
+
+    if not kept_sentences:
+        return " ".join(words[:max_words]).strip()
+
+    return " ".join(kept_sentences).strip()
 
 
 def _expand_nonredundant_text(
@@ -802,7 +842,10 @@ def _generate_source_deep_dive(
         response_schema=SOURCE_DEEP_DIVE_JSON_SCHEMA,
         required_keys=["deep_dive_text", "key_terms"],
     )
-    deep_dive_text = str(payload.get("deep_dive_text", "")).strip()
+    deep_dive_text = _truncate_to_max_words(
+        _normalize_continuous_prose(str(payload.get("deep_dive_text", "")).strip()),
+        max_words=MAX_DEEP_DIVE_WORDS,
+    )
     key_terms = [
         str(term).strip()
         for term in payload.get("key_terms", [])
@@ -1183,7 +1226,10 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         user_id,
         run_id,
     )
-    deep_dive_text = _deduplicate_section_text(deep_dive_text, [summary_text])
+    deep_dive_text = _truncate_to_max_words(
+        _normalize_continuous_prose(_deduplicate_section_text(deep_dive_text, [summary_text])),
+        max_words=MAX_DEEP_DIVE_WORDS,
+    )
 
     reflection_points = _generate_reflection_points(
         summary_text,
@@ -1457,6 +1503,7 @@ def _generate_combined_insights(
     ]
 
     refined_intersections: list[InsightIntersection] = []
+    prior_intersection_explanations: list[str] = []
     for index, intersection in enumerate(intersections, start=1):
         try:
             expanded_intersection = _expand_nonredundant_text(
@@ -1468,6 +1515,7 @@ def _generate_combined_insights(
                 avoid_texts=[
                     intersection.why_it_matters,
                     layman_bridge,
+                    *prior_intersection_explanations,
                     *source_background,
                 ],
                 grounding_chunks=shared_grounding_chunks,
@@ -1479,28 +1527,27 @@ def _generate_combined_insights(
             )
             expanded_intersection = _deduplicate_section_text(
                 _normalize_continuous_prose(expanded_intersection),
-                [intersection.why_it_matters, *source_background],
+                [intersection.why_it_matters, *prior_intersection_explanations, *source_background],
             )
             if expanded_intersection:
                 refined_intersections.append(
                     intersection.model_copy(update={"integrated_explanation": expanded_intersection})
                 )
+                prior_intersection_explanations.append(expanded_intersection)
                 continue
         except Exception:
             pass
 
-        refined_intersections.append(
-            intersection.model_copy(
-                update={
-                    "integrated_explanation": _normalize_continuous_prose(
-                        _deduplicate_section_text(
-                            intersection.integrated_explanation,
-                            [intersection.why_it_matters, *source_background],
-                        )
-                    )
-                }
+        fallback_intersection = _normalize_continuous_prose(
+            _deduplicate_section_text(
+                intersection.integrated_explanation,
+                [intersection.why_it_matters, *prior_intersection_explanations, *source_background],
             )
         )
+        refined_intersections.append(
+            intersection.model_copy(update={"integrated_explanation": fallback_intersection})
+        )
+        prior_intersection_explanations.append(fallback_intersection)
 
     intersections = refined_intersections
 
@@ -1663,7 +1710,13 @@ def _generate_comparative_analysis(
             user_id=user_id,
             context_label="cross-source comparative deepening",
             base_text=comparative_analysis,
-            avoid_texts=[insights_section.layman_bridge, insights_section.synthesis_text, *source_background],
+            avoid_texts=[
+                insights_section.layman_bridge,
+                insights_section.synthesis_text,
+                *[entry.why_it_matters for entry in insights_section.intersections],
+                *[entry.integrated_explanation for entry in insights_section.intersections],
+                *source_background,
+            ],
             grounding_chunks=grounding_chunks,
             key_terms=[
                 term
@@ -1686,6 +1739,17 @@ def _generate_comparative_analysis(
             comparative_analysis = expanded_analysis
     except Exception:
         comparative_analysis = _normalize_continuous_prose(comparative_analysis)
+
+    comparative_analysis = _normalize_continuous_prose(
+        _deduplicate_section_text(
+            comparative_analysis,
+            [
+                insights_section.synthesis_text,
+                insights_section.layman_bridge,
+                *[entry.integrated_explanation for entry in insights_section.intersections],
+            ],
+        )
+    )
 
     return comparative_analysis
 

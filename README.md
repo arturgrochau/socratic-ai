@@ -2,6 +2,10 @@
 
 Socratic AI turns your sources into a grounded learning workflow with generation plus chat follow-up. It supports three intake modes: video only, documents only, or video plus documents.
 
+## Learning Goal
+
+The product goal is structured, engaged learning rather than passive summarization. It is designed to help you build concepts on top of each other, connect intertwined ideas across sources, and move from first-principles understanding to practical transfer. Deep dives, cross-source synthesis, and Socratic chat all push toward mechanism-level clarity without repetitive restatement.
+
 ## Design Choice (Short Version)
 
 The app is intentionally retrieval-first and stage-based instead of one-shot chat. Ingestion stores transcript and document chunks, processing builds source concepts and summaries, and generation produces structured learning artifacts. This keeps answers tied to your material, makes failures observable by stage, and allows selective skipping of expensive comparative calls when a run has only one source type.

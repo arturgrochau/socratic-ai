@@ -11,6 +11,9 @@ Rules:
 7) Write a longer deep dive with multiple substantive paragraphs (roughly 450-900 words).
 8) key_terms must include important concepts that appeared in the grounded context.
 9) Keep language clear for motivated learners while still technical.
+10) Do not use markdown headers, list markers, or inline hash artifacts such as ### anywhere in deep_dive_text.
+11) Do not use em dashes. Use commas, periods, or parentheses instead.
+12) Start directly with explanation content; do not begin with a title-like opening line.
 """.strip()
 
 

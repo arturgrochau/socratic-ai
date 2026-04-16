@@ -13,6 +13,8 @@ Rules:
 9) Keep outputs bounded and focused: concise titles, compact attributed sentences, and no unnecessary repetition.
 10) Avoid markdown headings and list formatting inside layman_bridge and synthesis_text.
 11) For each integrated_explanation, include mechanism-level explanation, contrast points, and at least one practical implication.
+12) Minimize redundancy across intersections, layman_bridge, and synthesis_text; each section must add new information.
+13) Do not use em dashes; use commas, periods, or parentheses.
 """.strip()
 
 

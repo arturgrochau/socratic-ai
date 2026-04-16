@@ -22,6 +22,18 @@ MODEL_RATES_PER_MILLION = {
 }
 
 
+def _assert_clean_continuous_text(field_name: str, text_value: str) -> None:
+    value = str(text_value or "").strip()
+    if not value:
+        raise RuntimeError(f"{field_name} is empty.")
+
+    if "###" in value or "\n#" in value:
+        raise RuntimeError(f"{field_name} contains leaked markdown heading/hash artifacts.")
+
+    if "\u2014" in value:
+        raise RuntimeError(f"{field_name} contains disallowed em-dash characters.")
+
+
 def _headers(user_id: str) -> dict[str, str]:
     return {"X-User-ID": user_id}
 
@@ -177,6 +189,9 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         raise RuntimeError("Generation payload is missing video deep-dive text.")
     if len(video_deep_dive) < 500:
         raise RuntimeError("Video deep-dive text is too short for elaborate mode.")
+    _assert_clean_continuous_text("Video deep dive", video_deep_dive)
+    if len(video_deep_dive.split()) > 920:
+        raise RuntimeError("Video deep-dive text exceeded expected max-length guardrail.")
 
     video_key_terms = video.get("key_terms") or []
     if len(video_key_terms) < 5:
@@ -187,6 +202,7 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         raise RuntimeError("Generation payload is missing video under-surface explainer text.")
     if len(video_under_surface) < 600:
         raise RuntimeError("Video under-surface explainer is too short for elaborate mode.")
+    _assert_clean_continuous_text("Video under-surface explainer", video_under_surface)
 
     video_diagnostic = video.get("diagnostic_checklist") or []
     if len(video_diagnostic) < 4:
@@ -216,6 +232,9 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         deep_dive_text = str(document.get("deep_dive_text", "")).strip()
         if not deep_dive_text:
             raise RuntimeError("Generation payload has a document section without deep-dive text.")
+        _assert_clean_continuous_text("Document deep dive", deep_dive_text)
+        if len(deep_dive_text.split()) > 920:
+            raise RuntimeError("Document deep-dive text exceeded expected max-length guardrail.")
 
         if len(document.get("key_terms") or []) < 5:
             raise RuntimeError("Generation payload has a document section with too few key terms.")
@@ -225,6 +244,7 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
             raise RuntimeError("Generation payload has a document section without under-surface explainer text.")
         if len(under_surface) < 500:
             raise RuntimeError("Document under-surface explainer is too short for elaborate mode.")
+        _assert_clean_continuous_text("Document under-surface explainer", under_surface)
 
         diagnostic = document.get("diagnostic_checklist") or []
         if len(diagnostic) < 4:
@@ -276,14 +296,17 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
 
     if not str(insights.get("layman_bridge", "")).strip():
         raise RuntimeError("Generation payload has no layman bridge explanation.")
+    _assert_clean_continuous_text("Layman bridge", str(insights.get("layman_bridge", "")).strip())
     if not str(insights.get("synthesis_text", "")).strip():
         raise RuntimeError("Generation payload has no synthesis text.")
+    _assert_clean_continuous_text("Synthesis text", str(insights.get("synthesis_text", "")).strip())
 
     comparative_analysis = str(insights.get("comparative_analysis", "")).strip()
     if not comparative_analysis:
         raise RuntimeError("Generation payload has no comparative analysis text.")
     if len(comparative_analysis) < 280:
         raise RuntimeError("Comparative analysis text is too short for elaborate mode.")
+    _assert_clean_continuous_text("Comparative analysis", comparative_analysis)
 
     application_scenarios = insights.get("application_scenarios") or []
     if len(application_scenarios) < 2:

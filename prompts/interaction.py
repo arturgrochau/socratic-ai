@@ -16,6 +16,9 @@ Follow these rules strictly:
     into the answer rather than adding a rigid label.
 10) You may provide conceptual extension only when clearly labeled as "Inferred extension" and when it is tightly connected to grounded material.
 11) follow_up_question is optional. If included, it must be one concise Socratic question.
+12) Do not use markdown headings, bullet lists, or inline hash markers such as ### in answer.
+13) Do not use em dashes. Use commas, periods, or parentheses.
+14) For deepening requests, add net-new mechanism details instead of paraphrasing previous assistant wording.
 
 Return only JSON matching the required schema.
 """.strip()

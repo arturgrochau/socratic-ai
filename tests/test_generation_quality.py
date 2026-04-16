@@ -7,9 +7,13 @@ from app.generation import (
     _deduplicate_section_text,
     _normalize_continuous_prose,
     _should_use_model_progression_outline,
+    _truncate_to_max_words,
 )
 from frontend.app import (
+    _build_first_principles_evidence_summary,
+    _build_quick_elaboration_prompt,
     _build_quick_quiz_prompt,
+    _build_quiz_grading_prompt,
     _compose_assistant_chat_message,
     _normalize_continuous_text_for_display,
     _resolve_source_label_map,
@@ -72,12 +76,18 @@ class DeduplicationTests(unittest.TestCase):
         self.assertIn("process-level milestones", result.lower())
 
     def test_generation_prose_normalizer_removes_markdown_artifacts(self) -> None:
-        raw = "###Mechanism\n- First causal step\n- Second causal step\n\n## Why this matters"
+        raw = "###Mechanism\n- First causal step\n- Second causal step\n\n## Why this matters\nSignal###Leak\nA \u2014 B"
         normalized = _normalize_continuous_prose(raw)
         self.assertNotIn("###", normalized)
         self.assertNotIn("- First", normalized)
+        self.assertNotIn("\u2014", normalized)
         self.assertIn("First causal step", normalized)
         self.assertIn("Second causal step", normalized)
+
+    def test_word_truncation_respects_limit(self) -> None:
+        raw = " ".join(f"word{index}" for index in range(1, 1201))
+        truncated = _truncate_to_max_words(raw, max_words=900)
+        self.assertLessEqual(len(truncated.split()), 900)
 
 
 class ProgressionOutlineEfficiencyTests(unittest.TestCase):
@@ -131,6 +141,21 @@ class ChatBehaviorTests(unittest.TestCase):
         self.assertIn("Deeper explanation.", prompt)
         self.assertNotIn("Socratic next question", prompt)
 
+    def test_quiz_grading_prompt_blocks_next_question(self) -> None:
+        prompt = _build_quiz_grading_prompt(
+            ask_messages=[{"role": "assistant", "content": "Question: Explain x."}],
+            user_answer="My attempt is ...",
+        )
+        self.assertIn("Do not ask another quiz question", prompt)
+        self.assertIn("My answer:", prompt)
+
+    def test_quick_elaboration_prompt_requests_non_redundant_depth(self) -> None:
+        prompt = _build_quick_elaboration_prompt(
+            [{"role": "assistant", "content": "This is the previous explanation."}]
+        )
+        self.assertIn("Do not restate or paraphrase prior wording", prompt)
+        self.assertIn("net-new causal steps", prompt)
+
     def test_assistant_message_can_suppress_follow_up_in_quiz_mode(self) -> None:
         composed = _compose_assistant_chat_message(
             "Here is your quiz question.",
@@ -148,12 +173,24 @@ class ChatBehaviorTests(unittest.TestCase):
         self.assertIn("Socratic next question", composed)
 
     def test_frontend_continuous_text_normalizer_removes_headers(self) -> None:
-        raw = "##Core idea\n###Why it works\n1. First point\n2. Second point"
+        raw = "##Core idea\n###Why it works\n1. First point\n2. Second point\ninline###hash\nA \u2014 B"
         normalized = _normalize_continuous_text_for_display(raw)
         self.assertNotIn("##", normalized)
         self.assertNotIn("1.", normalized)
+        self.assertNotIn("\u2014", normalized)
+        self.assertNotIn("###", normalized)
         self.assertIn("Core idea", normalized)
         self.assertIn("Second point", normalized)
+
+    def test_first_principles_evidence_summary_omits_source_labels(self) -> None:
+        summary = _build_first_principles_evidence_summary(
+            [
+                ("Video: Test", "Mechanism starts with delayed feedback.", ["feedback"]),
+                ("Document: Notes", "Constraint pressure changes the strategy.", ["constraint"]),
+            ]
+        )
+        self.assertIn("Mechanism starts", summary)
+        self.assertNotIn("Video:", summary)
 
 
 class SourceLabelFormattingTests(unittest.TestCase):

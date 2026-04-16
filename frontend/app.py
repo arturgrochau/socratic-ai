@@ -89,6 +89,12 @@ def _init_state() -> None:
         st.session_state.auto_submit_query = ""
     if "flash_latest_assistant" not in st.session_state:
         st.session_state.flash_latest_assistant = False
+    if "quiz_mode_active" not in st.session_state:
+        st.session_state.quiz_mode_active = False
+    if "quiz_awaiting_answer" not in st.session_state:
+        st.session_state.quiz_awaiting_answer = False
+    if "quiz_turn_count" not in st.session_state:
+        st.session_state.quiz_turn_count = 0
 
 
 def _request_headers() -> dict[str, str]:
@@ -285,11 +291,14 @@ def _normalize_continuous_text_for_display(text_value: str) -> str:
                 cleaned_lines.append("")
             continue
 
+        line = line.replace("\u2014", " - ").replace("\u2013", " - ")
         line = re.sub(r"^#{1,6}\s*", "", line)
         line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
         line = re.sub(r"^[-*]\s+", "", line)
         line = re.sub(r"^\d+\.\s+", "", line)
         line = re.sub(r"^>\s+", "", line)
+        line = re.sub(r"#{2,}", "", line)
+        line = re.sub(r"\s{2,}", " ", line).strip()
         if line:
             cleaned_lines.append(line)
 
@@ -343,11 +352,55 @@ def _build_quick_quiz_prompt(ask_messages: list[dict]) -> str:
         compact_context = "No prior assistant explanation in this session."
 
     return (
-        "Run a chat-graded quiz grounded in the uploaded material and our recent conversation. "
+        "Start quiz mode using grounded material and our recent conversation. "
         "Ask exactly one challenging question now and do not reveal the answer yet. "
-        "After I answer in my next message, grade my response on a 0-10 scale, explain what I got right and wrong, "
-        "cite the strongest source-grounded evidence from the materials, and give one focused improvement tip. "
+        "Do not add extra headers, markdown bullets, or answer keys. "
         f"Recent assistant context: {compact_context}"
+    ).strip()
+
+
+def _build_quiz_grading_prompt(*, ask_messages: list[dict], user_answer: str) -> str:
+    recent_context = _extract_recent_assistant_context(ask_messages, limit=2)
+    compact_context = _shorten_inline_text(recent_context, max_chars=900)
+    compact_answer = _shorten_inline_text(user_answer, max_chars=700)
+    if not compact_context:
+        compact_context = "No prior assistant explanation in this session."
+
+    return (
+        "Continue quiz mode. Grade my latest quiz answer now. "
+        "Return a 0-10 score, then concise feedback in this order: what I got right, what I missed, one correction from grounded evidence, and one improvement tip. "
+        "Do not ask another quiz question in this message. "
+        "Do not use markdown headings or bullet lists. "
+        f"My answer: {compact_answer}. "
+        f"Recent assistant context: {compact_context}"
+    ).strip()
+
+
+def _build_quiz_continue_prompt(ask_messages: list[dict]) -> str:
+    recent_context = _extract_recent_assistant_context(ask_messages, limit=2)
+    compact_context = _shorten_inline_text(recent_context, max_chars=850)
+    if not compact_context:
+        compact_context = "No prior assistant explanation in this session."
+
+    return (
+        "Continue quiz mode. Ask exactly one new, more elaborate question connected to recent material. "
+        "You may connect the question to another source when grounded evidence supports it. "
+        "Do not reveal the answer yet and do not include grading in this message. "
+        f"Recent assistant context: {compact_context}"
+    ).strip()
+
+
+def _build_quick_elaboration_prompt(ask_messages: list[dict]) -> str:
+    recent_context = _extract_recent_assistant_context(ask_messages, limit=1)
+    compact_context = _shorten_inline_text(recent_context, max_chars=820)
+    if not compact_context:
+        compact_context = "No prior assistant explanation in this session."
+
+    return (
+        "Elaborate further on your previous answer with deeper mechanism-level detail in plain language. "
+        "Do not restate or paraphrase prior wording. Add net-new causal steps, assumptions, constraints, edge cases, and one practical diagnostic check. "
+        "Do not use markdown headings or bullet lists. "
+        f"Previous assistant answer context: {compact_context}"
     ).strip()
 
 
@@ -378,7 +431,8 @@ def _build_elaboration_chat_prompt(
         prompt_bits.append(f"Key terms: {terms_text}.")
 
     prompt_bits.append(
-        "Answer directly first, then expand the mechanism step by step in plain language, and end with one practical check I can apply."
+        "Answer directly first, then expand the mechanism step by step in plain language, and end with one practical check I can apply. "
+        "Do not repeat prior phrasing or examples; add net-new detail and avoid markdown headers or lists."
     )
     return " ".join(prompt_bits).strip()
 
@@ -699,6 +753,7 @@ def _render_source_learning_section(section_payload: dict) -> None:
         generated_title,
         "summary",
     )
+    summary_text = _normalize_continuous_text_for_display(summary_text)
     st.markdown(summary_text)
 
     deep_dive_text = _clean_block(
@@ -707,6 +762,7 @@ def _render_source_learning_section(section_payload: dict) -> None:
         "deep_dive",
     )
     if deep_dive_text:
+        deep_dive_text = _normalize_continuous_text_for_display(deep_dive_text)
         st.markdown("### Deep Dive")
         st.markdown(_format_long_prose_markdown(deep_dive_text))
 
@@ -771,12 +827,12 @@ def _render_ask_result() -> None:
         return
 
     st.subheader("Answer")
-    st.markdown(str(st.session_state.ask_result.get("answer", "")).strip())
+    st.markdown(_normalize_continuous_text_for_display(str(st.session_state.ask_result.get("answer", "")).strip()))
 
     follow_up_question = (st.session_state.ask_result.get("follow_up_question") or "").strip()
     if follow_up_question:
         st.subheader("Follow-up Question")
-        st.markdown(follow_up_question)
+        st.markdown(_normalize_continuous_text_for_display(follow_up_question))
 
 
 def _collect_emphasis_terms(
@@ -814,6 +870,35 @@ def _bold_keywords_in_text(text_value: str, keywords: list[str]) -> str:
         pattern = re.compile(rf"(?i)(?<![A-Za-z0-9])({re.escape(keyword)})(?![A-Za-z0-9])")
         highlighted = pattern.sub(lambda match: f"**{match.group(0)}**", highlighted)
     return highlighted
+
+
+def _build_first_principles_evidence_summary(
+    evidence_items: list[tuple[str, str, list[str]]],
+) -> str:
+    if not evidence_items:
+        return ""
+
+    quote_fragments: list[str] = []
+    for _, quote_text, _ in evidence_items[:3]:
+        fragment = _normalize_continuous_text_for_display(quote_text)
+        if not fragment:
+            continue
+        quote_fragments.append(fragment)
+
+    if not quote_fragments:
+        return ""
+
+    if len(quote_fragments) == 1:
+        body = quote_fragments[0]
+    elif len(quote_fragments) == 2:
+        body = f"{quote_fragments[0]} This connects to: {quote_fragments[1]}"
+    else:
+        body = (
+            f"{quote_fragments[0]} This mechanism continues as: {quote_fragments[1]} "
+            f"A practical implication is: {quote_fragments[2]}"
+        )
+
+    return _format_long_prose_markdown(_normalize_continuous_text_for_display(body), max_sentences_per_paragraph=4)
 
 
 def _render_grouped_evidence(
@@ -860,20 +945,35 @@ def _render_grouped_evidence(
         return
 
     with st.expander("Show grounded mechanism evidence", expanded=False):
-        for source_label, quote, emphasis_terms in evidence_items[:8]:
-            st.markdown(f"**{source_label}**")
-            st.markdown(f"Evidence snippet: \"{quote}\"")
-            if emphasis_terms:
-                joined_terms = ", ".join(f"**{term}**" for term in emphasis_terms[:4])
-                st.markdown(
-                    "Mechanism signal: this snippet grounds the explanation around "
-                    f"{joined_terms}."
-                )
-            st.markdown("")
+        keyword_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for _, _, terms in evidence_items:
+            for term in terms:
+                normalized = term.lower().strip()
+                if not normalized or normalized in seen_terms:
+                    continue
+                seen_terms.add(normalized)
+                keyword_terms.append(term.strip())
+                if len(keyword_terms) >= 8:
+                    break
+            if len(keyword_terms) >= 8:
+                break
 
-        hidden_count = len(evidence_items) - 8
-        if hidden_count > 0:
-            st.caption(f"+ {hidden_count} more grounded evidence snippet(s)")
+        if keyword_terms:
+            joined_keywords = ", ".join(f"**{term}**" for term in keyword_terms)
+            st.markdown(f"First-principles keywords: {joined_keywords}")
+
+        summary = _build_first_principles_evidence_summary(evidence_items)
+        if summary:
+            st.markdown(summary)
+
+        with st.expander("Show raw grounding snippets", expanded=False):
+            for source_label, quote, _ in evidence_items[:8]:
+                st.markdown(f"{source_label}: \"{quote}\"")
+
+            hidden_count = len(evidence_items) - 8
+            if hidden_count > 0:
+                st.caption(f"+ {hidden_count} more grounding snippet(s)")
 
 
 def _submit_chat_query(
@@ -958,7 +1058,8 @@ def _build_intersection_chat_prefill(
         f"Elaborate further on intersection '{title}' by focusing on how it works under the surface: {why_it_matters}. "
         f"Key concepts: {keyword_text or 'none listed'}. "
         f"Evidence snippets: {quote_text or 'none provided'}. "
-        "Please answer directly first, expand mechanism-level reasoning in plain language, and end with one concrete application check."
+        "Please answer directly first, expand mechanism-level reasoning from first principles in plain language, and end with one concrete application check. "
+        "Do not repeat prior phrasing and do not use markdown headings or list formatting."
     ).strip()
 
 def _render_ask_tab(has_user_id: bool) -> None:
@@ -992,15 +1093,43 @@ def _render_ask_tab(has_user_id: bool) -> None:
         _render_chat_scroll_and_flash()
         st.session_state.flash_latest_assistant = False
 
-    if st.session_state.ask_messages and st.session_state.ask_messages[-1]["role"] == "assistant":
+    if st.session_state.quiz_mode_active:
+        if st.session_state.quiz_awaiting_answer:
+            st.info("Quiz mode is active. Answer the current quiz question below to receive grading.")
+        else:
+            st.success(
+                f"Quiz feedback complete for {int(st.session_state.quiz_turn_count)} question(s). Continue for another question or exit quiz mode."
+            )
+            col_continue_quiz, col_exit_quiz = st.columns(2)
+            with col_continue_quiz:
+                if st.button("Continue quiz", key="quick_action_quiz_continue"):
+                    st.session_state.quiz_awaiting_answer = True
+                    _submit_chat_query(
+                        _build_quiz_continue_prompt(st.session_state.ask_messages),
+                        suppress_follow_up=True,
+                        display_query="Continue quiz.",
+                    )
+            with col_exit_quiz:
+                if st.button("Exit quiz mode", key="quick_action_quiz_exit"):
+                    st.session_state.quiz_mode_active = False
+                    st.session_state.quiz_awaiting_answer = False
+                    st.session_state.quiz_turn_count = 0
+                    st.rerun()
+
+    if (
+        st.session_state.ask_messages
+        and st.session_state.ask_messages[-1]["role"] == "assistant"
+        and not st.session_state.quiz_mode_active
+    ):
         col_elaborate, col_quiz = st.columns(2)
         with col_elaborate:
             if st.button("Elaborate further", key="quick_action_elaborate"):
-                _submit_chat_query(
-                    "Elaborate further on your previous answer with more technical depth explained in plain language."
-                )
+                _submit_chat_query(_build_quick_elaboration_prompt(st.session_state.ask_messages))
         with col_quiz:
             if st.button("Quiz me on this", key="quick_action_quiz"):
+                st.session_state.quiz_mode_active = True
+                st.session_state.quiz_awaiting_answer = True
+                st.session_state.quiz_turn_count = 0
                 quick_quiz_prompt = _build_quick_quiz_prompt(st.session_state.ask_messages)
                 _submit_chat_query(
                     quick_quiz_prompt,
@@ -1034,6 +1163,26 @@ def _render_ask_tab(has_user_id: bool) -> None:
     if not ask_query:
         st.warning("Enter a question before sending.")
         return
+
+    if st.session_state.quiz_mode_active and st.session_state.quiz_awaiting_answer:
+        grading_prompt = _build_quiz_grading_prompt(
+            ask_messages=st.session_state.ask_messages,
+            user_answer=ask_query,
+        )
+        st.session_state.quiz_awaiting_answer = False
+        st.session_state.quiz_turn_count = int(st.session_state.quiz_turn_count) + 1
+        _submit_chat_query(
+            grading_prompt,
+            suppress_follow_up=True,
+            display_query=ask_query,
+        )
+        return
+
+    if st.session_state.quiz_mode_active and not st.session_state.quiz_awaiting_answer:
+        # Any non-quiz submission exits quiz mode and returns to normal chat flow.
+        st.session_state.quiz_mode_active = False
+        st.session_state.quiz_awaiting_answer = False
+        st.session_state.quiz_turn_count = 0
 
     _submit_chat_query(ask_query)
 
