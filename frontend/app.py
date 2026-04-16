@@ -234,6 +234,104 @@ def _queue_chat_navigation(prefill: str, *, auto_submit: bool = False) -> None:
     st.session_state.pending_dashboard_section = "Socratic Chatbox"
 
 
+def _slugify_token(value: str, *, fallback: str = "item") -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    return token or fallback
+
+
+def _shorten_inline_text(text_value: str, *, max_chars: int) -> str:
+    normalized = " ".join(str(text_value or "").split()).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _strip_socratic_follow_up(text_value: str) -> str:
+    marker = "**Socratic next question:**"
+    cleaned = str(text_value or "")
+    if marker in cleaned:
+        cleaned = cleaned.split(marker, 1)[0]
+    return cleaned.strip()
+
+
+def _extract_recent_assistant_context(ask_messages: list[dict], *, limit: int = 2) -> str:
+    assistant_fragments: list[str] = []
+    for message in reversed(ask_messages):
+        if str(message.get("role") or "") != "assistant":
+            continue
+        cleaned = _strip_socratic_follow_up(str(message.get("content") or ""))
+        if not cleaned:
+            continue
+        assistant_fragments.append(cleaned)
+        if len(assistant_fragments) >= limit:
+            break
+
+    if not assistant_fragments:
+        return ""
+    return "\n\n".join(reversed(assistant_fragments))
+
+
+def _build_quick_quiz_prompt(ask_messages: list[dict]) -> str:
+    recent_context = _extract_recent_assistant_context(ask_messages, limit=2)
+    compact_context = _shorten_inline_text(recent_context, max_chars=900)
+    if not compact_context:
+        compact_context = "No prior assistant explanation in this session."
+
+    return (
+        "Run a chat-graded quiz grounded in the uploaded material and our recent conversation. "
+        "Ask exactly one challenging question now and do not reveal the answer yet. "
+        "After I answer in my next message, grade my response on a 0-10 scale, explain what I got right and wrong, "
+        "cite the strongest source-grounded evidence from the materials, and give one focused improvement tip. "
+        f"Recent assistant context: {compact_context}"
+    ).strip()
+
+
+def _build_elaboration_chat_prompt(
+    *,
+    context_label: str,
+    under_surface_text: str,
+    key_terms: list[str],
+    point_question: str = "",
+    point_explanation: str = "",
+    depth_level: str = "",
+) -> str:
+    compact_under_surface = _shorten_inline_text(under_surface_text, max_chars=480)
+    compact_explanation = _shorten_inline_text(point_explanation, max_chars=260)
+    terms_text = ", ".join(term.strip() for term in key_terms[:6] if term.strip())
+
+    prompt_bits = [
+        f"Elaborate further on: {context_label}.",
+        f"Under-the-surface focus: {compact_under_surface or 'n/a'}.",
+    ]
+    if point_question:
+        prompt_bits.append(f"Reflection question: {point_question}.")
+    if compact_explanation:
+        prompt_bits.append(f"Current explanation: {compact_explanation}.")
+    if depth_level:
+        prompt_bits.append(f"Target depth: {depth_level}.")
+    if terms_text:
+        prompt_bits.append(f"Key terms: {terms_text}.")
+
+    prompt_bits.append(
+        "Answer directly first, then expand the mechanism step by step in plain language, and end with one practical check I can apply."
+    )
+    return " ".join(prompt_bits).strip()
+
+
+def _compose_assistant_chat_message(
+    answer_text: str,
+    follow_up_question: str,
+    *,
+    include_follow_up: bool = True,
+) -> str:
+    normalized_answer = str(answer_text or "").strip()
+    normalized_follow_up = str(follow_up_question or "").strip()
+
+    if include_follow_up and normalized_follow_up:
+        return f"{normalized_answer}\n\n**Socratic next question:** {normalized_follow_up}".strip()
+    return normalized_answer or "I could not generate an answer this time. Please try rephrasing your question."
+
+
 def _run_upload_process_and_generate(
     video_upload: dict[str, str | bytes] | None,
     video_url: str,
@@ -330,17 +428,17 @@ def _resolve_source_label_map(video_payload: dict | None, document_payloads: lis
     if video_payload:
         video_source_id = int(video_payload.get("source_id", 0) or 0)
         if video_source_id > 0:
-            video_label = (
+            video_title = (
                 str(video_payload.get("source_name") or video_payload.get("generated_title") or "Video").strip()
                 or "Video"
             )
-            label_map[video_source_id] = video_label
+            label_map[video_source_id] = f"Video: {video_title}"
 
     for index, document_payload in enumerate(document_payloads, start=1):
         source_id = int(document_payload.get("source_id", 0) or 0)
         if source_id <= 0:
             continue
-        document_label = (
+        document_title = (
             str(
                 document_payload.get("source_name")
                 or document_payload.get("generated_title")
@@ -348,7 +446,7 @@ def _resolve_source_label_map(video_payload: dict | None, document_payloads: lis
             ).strip()
             or f"Document {index}"
         )
-        label_map[source_id] = document_label
+        label_map[source_id] = f"Document: {document_title}"
 
     return label_map
 
@@ -428,7 +526,13 @@ def _format_long_prose_markdown(text_value: str, *, max_sentences_per_paragraph:
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
 
 
-def _render_reflection_points(reflection_points: list[dict] | list[str]) -> None:
+def _render_reflection_points(
+    reflection_points: list[dict] | list[str],
+    *,
+    source_label: str,
+    source_key: str,
+    key_terms: list[str],
+) -> None:
     if not reflection_points:
         st.write("No reflection points available.")
         return
@@ -451,10 +555,32 @@ def _render_reflection_points(reflection_points: list[dict] | list[str]) -> None
         if under_the_hood:
             with st.expander(f"Why this works under the surface (point {index})"):
                 st.markdown(_format_long_prose_markdown(under_the_hood, max_sentences_per_paragraph=4))
+                if st.button(
+                    "Elaborate further in chat",
+                    key=f"elaborate_reflection_{source_key}_{index}",
+                    use_container_width=False,
+                ):
+                    _queue_chat_navigation(
+                        _build_elaboration_chat_prompt(
+                            context_label=f"{source_label} | reflection point {index}",
+                            under_surface_text=under_the_hood,
+                            key_terms=key_terms,
+                            point_question=question,
+                            point_explanation=explanation,
+                            depth_level=depth_level,
+                        ),
+                        auto_submit=True,
+                    )
+                    st.rerun()
 
 
 def _render_source_learning_section(section_payload: dict) -> None:
     generated_title = str(section_payload.get("generated_title", "Untitled")).strip() or "Untitled"
+    source_type = str(section_payload.get("source_type") or "source").strip().lower()
+    source_prefix = "Video" if source_type == "video" else "Document" if source_type == "document" else "Source"
+    source_label = f"{source_prefix}: {generated_title}"
+    source_key = _slugify_token(f"{source_prefix}_{section_payload.get('source_id', '0')}_{generated_title}")
+    source_name = str(section_payload.get("source_name") or "").strip()
 
     def _normalize(value: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
@@ -498,7 +624,9 @@ def _render_source_learning_section(section_payload: dict) -> None:
 
         return cleaned_text
 
-    st.subheader(generated_title)
+    st.subheader(source_label)
+    if source_name and _normalize(source_name) != _normalize(generated_title):
+        st.caption(source_name)
     summary_text = _clean_block(
         str(section_payload.get("summary_text", "")),
         generated_title,
@@ -545,9 +673,29 @@ def _render_source_learning_section(section_payload: dict) -> None:
                     if term and explanation:
                         st.markdown(f"- **{term}**: {explanation}")
 
+            if st.button(
+                "Elaborate further in chat",
+                key=f"elaborate_under_surface_{source_key}",
+                use_container_width=False,
+            ):
+                _queue_chat_navigation(
+                    _build_elaboration_chat_prompt(
+                        context_label=source_label,
+                        under_surface_text=under_surface_text,
+                        key_terms=normalized_terms,
+                    ),
+                    auto_submit=True,
+                )
+                st.rerun()
+
     reflection_points = section_payload.get("reflection_points", []) or []
     st.markdown("### Socratic Reflection Points")
-    _render_reflection_points(reflection_points)
+    _render_reflection_points(
+        reflection_points,
+        source_label=source_label,
+        source_key=source_key,
+        key_terms=normalized_terms,
+    )
 
 
 def _render_ask_result() -> None:
@@ -645,12 +793,19 @@ def _render_grouped_evidence(
             st.caption(f"+ {hidden_count} more supporting quote(s)")
 
 
-def _submit_chat_query(ask_query: str) -> None:
+def _submit_chat_query(
+    ask_query: str,
+    *,
+    suppress_follow_up: bool = False,
+    display_query: str | None = None,
+) -> None:
     query_text = ask_query.strip()
     if not query_text:
         return
 
-    st.session_state.ask_messages.append({"role": "user", "content": query_text})
+    display_text = str(display_query or query_text).strip() or query_text
+
+    st.session_state.ask_messages.append({"role": "user", "content": display_text})
     try:
         with st.spinner("Thinking..."):
             st.session_state.ask_result = _post_json(
@@ -667,13 +822,11 @@ def _submit_chat_query(ask_query: str) -> None:
         follow_up_question = str(
             st.session_state.ask_result.get("follow_up_question") or ""
         ).strip()
-        if follow_up_question:
-            assistant_text = (
-                f"{answer_text}\n\n"
-                f"**Socratic next question:** {follow_up_question}"
-            ).strip()
-        else:
-            assistant_text = answer_text or "I could not generate an answer this time. Please try rephrasing your question."
+        assistant_text = _compose_assistant_chat_message(
+            answer_text,
+            follow_up_question,
+            include_follow_up=not suppress_follow_up,
+        )
         st.session_state.ask_messages.append({"role": "assistant", "content": assistant_text})
     except Exception as exc:
         error_text = str(exc)
@@ -759,8 +912,11 @@ def _render_ask_tab(has_user_id: bool) -> None:
                 )
         with col_quiz:
             if st.button("Quiz me on this", key="quick_action_quiz"):
+                quick_quiz_prompt = _build_quick_quiz_prompt(st.session_state.ask_messages)
                 _submit_chat_query(
-                    "Quiz me on what you just explained. Ask one challenging question first, then explain the answer."
+                    quick_quiz_prompt,
+                    suppress_follow_up=True,
+                    display_query="Quiz me on this.",
                 )
 
     st.caption("Type your question below, then click Send.")
@@ -845,6 +1001,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             document_labels = []
             for index, section_payload in enumerate(document_payloads, start=1):
                 title = str(section_payload.get("generated_title", f"Document {index}")).strip()
+                title = f"Document: {title}"
                 document_labels.append(title[:40] if len(title) > 40 else title)
 
             document_tabs = st.tabs(document_labels)
@@ -1227,19 +1384,27 @@ def main() -> None:
         has_document_source = bool(selected_documents)
         has_any_source = has_video_source or has_document_source
 
+        summary_bits: list[str] = []
         if selected_video is not None:
-            st.write(f"Video: {selected_video['name']}")
+            summary_bits.append("Video source selected")
         elif selected_video_url:
-            st.write(f"YouTube: {selected_video_url}")
-        else:
-            st.info("Video: skipped")
+            summary_bits.append("YouTube source selected")
 
         if selected_documents:
-            st.write("Documents:")
-            for upload in selected_documents:
-                st.markdown(f"- {upload['name']}")
-        else:
-            st.info("Documents: skipped")
+            summary_bits.append(f"{len(selected_documents)} document(s) selected")
+
+        if summary_bits:
+            st.write(" | ".join(summary_bits))
+
+        if has_any_source:
+            with st.expander("Review selected sources", expanded=False):
+                if selected_video is not None:
+                    st.markdown(f"- Video: {selected_video['name']}")
+                elif selected_video_url:
+                    st.markdown(f"- YouTube: {selected_video_url}")
+
+                for upload in selected_documents:
+                    st.markdown(f"- Document: {upload['name']}")
 
         if not has_any_source:
             st.warning("Add at least one source before generating tailored learning.")

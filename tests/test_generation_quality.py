@@ -7,7 +7,12 @@ from app.generation import (
     _deduplicate_section_text,
     _should_use_model_progression_outline,
 )
-from frontend.app import _should_show_cross_source_section
+from frontend.app import (
+    _build_quick_quiz_prompt,
+    _compose_assistant_chat_message,
+    _resolve_source_label_map,
+    _should_show_cross_source_section,
+)
 
 
 class DistributedGroundingSelectionTests(unittest.TestCase):
@@ -97,6 +102,55 @@ class CrossSourceVisibilityTests(unittest.TestCase):
             quiz_payload={"questions": []},
         )
         self.assertTrue(should_show)
+
+
+class ChatBehaviorTests(unittest.TestCase):
+    def test_quick_quiz_prompt_uses_recent_assistant_context(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "Initial explanation."},
+            {"role": "user", "content": "Tell me more."},
+            {
+                "role": "assistant",
+                "content": "Deeper explanation.\n\n**Socratic next question:** What would you test next?",
+            },
+        ]
+
+        prompt = _build_quick_quiz_prompt(messages)
+
+        self.assertIn("Ask exactly one challenging question now", prompt)
+        self.assertIn("Deeper explanation.", prompt)
+        self.assertNotIn("Socratic next question", prompt)
+
+    def test_assistant_message_can_suppress_follow_up_in_quiz_mode(self) -> None:
+        composed = _compose_assistant_chat_message(
+            "Here is your quiz question.",
+            "What assumption is most fragile?",
+            include_follow_up=False,
+        )
+        self.assertEqual(composed, "Here is your quiz question.")
+
+    def test_assistant_message_includes_follow_up_outside_quiz_mode(self) -> None:
+        composed = _compose_assistant_chat_message(
+            "Explanation.",
+            "What changes if constraints tighten?",
+            include_follow_up=True,
+        )
+        self.assertIn("Socratic next question", composed)
+
+
+class SourceLabelFormattingTests(unittest.TestCase):
+    def test_source_label_map_uses_type_prefixed_labels(self) -> None:
+        labels = _resolve_source_label_map(
+            {"source_id": 7, "generated_title": "Loss Landscapes"},
+            [
+                {"source_id": 10, "generated_title": "Optimization Notes"},
+                {"source_id": 11, "source_name": "Paper Appendix"},
+            ],
+        )
+
+        self.assertEqual(labels[7], "Video: Loss Landscapes")
+        self.assertEqual(labels[10], "Document: Optimization Notes")
+        self.assertEqual(labels[11], "Document: Paper Appendix")
 
 
 if __name__ == "__main__":
