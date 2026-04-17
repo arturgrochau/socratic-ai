@@ -56,7 +56,7 @@ from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_P
 from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 8
+GENERATION_SCHEMA_VERSION = 9
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 MAX_UNDER_SURFACE_GROUNDING_CHUNKS = 6
@@ -77,6 +77,9 @@ SECTION_SIMILARITY_THRESHOLD = 0.82
 SECTION_TOKEN_OVERLAP_THRESHOLD = 0.50
 SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD = 0.32
 CROSS_SECTION_PAIR_OVERLAP_THRESHOLD = 0.26
+SECTION_CLAIM_OVERLAP_THRESHOLD = 0.24
+MAX_CLAIMS_PER_SECTION = 24
+MIN_CLAIM_CHARS = 28
 
 TEXT_EXPANSION_JSON_SCHEMA = {
     "name": "expanded_text",
@@ -364,6 +367,40 @@ def ensure_generation_tables() -> None:
                     overlap_ratio REAL DEFAULT 0.0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS generation_claim_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    source_id INTEGER,
+                    document_source_ids_json TEXT DEFAULT '',
+                    section_type TEXT NOT NULL,
+                    claim_hash TEXT NOT NULL,
+                    claim_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_claim_ledger_user_run
+                ON generation_claim_ledger (user_id, run_id, section_type)
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_claim_ledger_claim_hash
+                ON generation_claim_ledger (user_id, claim_hash)
                 """
             )
         )
@@ -850,6 +887,72 @@ def _content_hash(text_value: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def _extract_claims(text_value: str, *, limit: int = MAX_CLAIMS_PER_SECTION) -> list[str]:
+    claims: list[str] = []
+    seen: set[str] = set()
+    for sentence in _split_into_sentences(_normalize_continuous_prose(text_value)):
+        claim = " ".join(sentence.split()).strip()
+        if len(claim) < MIN_CLAIM_CHARS:
+            continue
+        normalized = claim.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        claims.append(claim)
+        if len(claims) >= limit:
+            break
+    return claims
+
+
+def _record_claim_ledger_entries(
+    *,
+    user_id: str,
+    run_id: str,
+    source_id: int | None,
+    document_source_ids: list[int],
+    section_type: str,
+    section_text: str,
+) -> None:
+    claims = _extract_claims(section_text)
+    if not claims:
+        return
+
+    with db_engine.begin() as connection:
+        for claim in claims:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO generation_claim_ledger (
+                        user_id,
+                        run_id,
+                        source_id,
+                        document_source_ids_json,
+                        section_type,
+                        claim_hash,
+                        claim_text
+                    ) VALUES (
+                        :user_id,
+                        :run_id,
+                        :source_id,
+                        :document_source_ids_json,
+                        :section_type,
+                        :claim_hash,
+                        :claim_text
+                    )
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "run_id": run_id,
+                    "source_id": source_id,
+                    "document_source_ids_json": _serialize_ids(document_source_ids),
+                    "section_type": section_type,
+                    "claim_hash": hashlib.sha256(claim.lower().encode("utf-8", errors="ignore")).hexdigest(),
+                    "claim_text": claim,
+                },
+            )
+
+
 def _redundancy_stats(current_text: str, prior_texts: list[str]) -> tuple[int, int, float]:
     current_sentences = _split_into_sentences(current_text)
     if not current_sentences:
@@ -887,6 +990,18 @@ def _pairwise_overlap_ratio(left_text: str, right_text: str) -> float:
     if not left or not right:
         return 0.0
     return max(_section_redundancy_ratio(left, [right]), _section_redundancy_ratio(right, [left]))
+
+
+def _pairwise_claim_overlap_ratio(left_text: str, right_text: str) -> float:
+    left_claims = {claim.lower() for claim in _extract_claims(left_text)}
+    right_claims = {claim.lower() for claim in _extract_claims(right_text)}
+    if not left_claims or not right_claims:
+        return 0.0
+    shared = left_claims.intersection(right_claims)
+    baseline = float(min(len(left_claims), len(right_claims)))
+    if baseline <= 0.0:
+        return 0.0
+    return len(shared) / baseline
 
 
 def _record_novelty_ledger_entry(
@@ -945,6 +1060,15 @@ def _record_novelty_ledger_entry(
             },
         )
 
+    _record_claim_ledger_entries(
+        user_id=user_id,
+        run_id=run_id,
+        source_id=source_id,
+        document_source_ids=document_source_ids,
+        section_type=section_type,
+        section_text=section_text,
+    )
+
 
 def _record_pairwise_quality_metric(
     *,
@@ -990,6 +1114,8 @@ def _assert_pairwise_uniqueness(
     section_group: str,
     section_texts: dict[str, str],
     max_overlap_ratio: float,
+    max_claim_overlap_ratio: float = SECTION_CLAIM_OVERLAP_THRESHOLD,
+    enable_claim_gate: bool = False,
 ) -> None:
     labels = [label for label, text_value in section_texts.items() if _normalize_continuous_prose(text_value)]
     for index, left_label in enumerate(labels):
@@ -1011,6 +1137,24 @@ def _assert_pairwise_uniqueness(
                     f"{section_group} overlap gate failed for {pair_key}: "
                     f"{overlap_ratio:.3f} > {max_overlap_ratio:.3f}"
                 )
+
+            if enable_claim_gate:
+                claim_overlap_ratio = _pairwise_claim_overlap_ratio(
+                    section_texts[left_label],
+                    section_texts[right_label],
+                )
+                _record_pairwise_quality_metric(
+                    run_id=run_id,
+                    user_id=user_id,
+                    section_type=section_group,
+                    pair_key=f"{pair_key}::claims",
+                    overlap_ratio=claim_overlap_ratio,
+                )
+                if claim_overlap_ratio > max_claim_overlap_ratio:
+                    raise ValueError(
+                        f"{section_group} claim overlap gate failed for {pair_key}: "
+                        f"{claim_overlap_ratio:.3f} > {max_claim_overlap_ratio:.3f}"
+                    )
 
 
 def _expand_nonredundant_text(
@@ -2770,6 +2914,7 @@ def generate_tailored_learning(
                     section_group="cross-source",
                     section_texts=_build_cross_section_text_map(cached_insights, cached_quiz),
                     max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
+                    enable_claim_gate=True,
                 )
                 insights_section, quiz_section = cached_insights, cached_quiz
                 cache_was_accepted = True
@@ -2830,6 +2975,7 @@ def generate_tailored_learning(
                         section_group="cross-source",
                         section_texts=_build_cross_section_text_map(candidate_insights, quiz_section),
                         max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
+                        enable_claim_gate=True,
                     )
                     insights_section = candidate_insights
                     _store_combined_learning_sections(

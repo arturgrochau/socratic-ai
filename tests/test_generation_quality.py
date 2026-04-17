@@ -6,7 +6,9 @@ from app.generation import (
     _compute_distributed_row_positions,
     _deduplicate_section_text,
     _enforce_section_novelty,
+    _extract_claims,
     _normalize_continuous_prose,
+    _pairwise_claim_overlap_ratio,
     _section_redundancy_ratio,
     _should_use_model_progression_outline,
     _truncate_to_max_words,
@@ -115,6 +117,33 @@ class DeduplicationTests(unittest.TestCase):
         right = "Constraint-sensitive behavior and boundary conditions are emphasized by the model."
         score = _pairwise_overlap_ratio(left, right)
         self.assertGreater(score, 0.5)
+
+    def test_extract_claims_filters_short_or_duplicate_sentences(self) -> None:
+        text = (
+            "Short. "
+            "This mechanism predicts learning-rate collapse under delayed feedback loops. "
+            "This mechanism predicts learning-rate collapse under delayed feedback loops. "
+            "A second substantive claim appears when constraints tighten and variance rises."
+        )
+
+        claims = _extract_claims(text)
+
+        self.assertEqual(len(claims), 2)
+        self.assertTrue(any("learning-rate collapse" in claim for claim in claims))
+        self.assertTrue(any("constraints tighten" in claim for claim in claims))
+
+    def test_pairwise_claim_overlap_ratio_detects_shared_claims(self) -> None:
+        left = (
+            "Delayed rewards distort optimization in early training phases. "
+            "Regularization restores stability under noisy constraints."
+        )
+        right = (
+            "Regularization restores stability under noisy constraints. "
+            "Constraint shocks can still destabilize downstream transfer."
+        )
+
+        ratio = _pairwise_claim_overlap_ratio(left, right)
+        self.assertAlmostEqual(ratio, 0.5, places=2)
 
 
 class ProgressionOutlineEfficiencyTests(unittest.TestCase):

@@ -131,6 +131,13 @@ Run end-to-end validator:
 
 ```bash
 python scripts/validate_pipeline.py --api-base-url http://127.0.0.1:8000
+
+# Repeated-run redundancy audit (cross-source overlap telemetry)
+python scripts/evaluate_redundancy.py \
+  --api-base-url http://127.0.0.1:8000 \
+  --video /path/to/video.mp4 \
+  --document /path/to/document.pdf \
+  --iterations 10
 ```
 
 ## Key Files
@@ -142,6 +149,7 @@ python scripts/validate_pipeline.py --api-base-url http://127.0.0.1:8000
 - `app/generation.py` : mixed-mode comparative path and non-comparative cost-saving path.
 - `app/cost_logging.py` : token usage logging per stage/model.
 - `scripts/validate_pipeline.py` : integration and usage summary checks.
+- `scripts/evaluate_redundancy.py` : repeated-run overlap and claim-overlap audit with aggregate stats.
 
 ## Operational Notes
 
