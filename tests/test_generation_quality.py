@@ -352,6 +352,40 @@ class ControllerGuardTests(unittest.TestCase):
         )
         self.assertTrue(mapping_claims)
 
+    def test_progressive_cross_stage_allows_mixed_decision_transfer_language(self) -> None:
+        stage_texts = {
+            "mapping": "The sources connect through calibration assumptions and shared reliability framing.",
+            "constraint": "A constraint emerges when load increases, and failure risk rises under tighter windows.",
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": (
+                "When applying these transfer steps, decide which control to prioritize first. "
+                "Which recommendation best limits implication risk under shifting constraints?"
+            ),
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
+    def test_progressive_cross_stage_rejects_decision_stage_without_decision_signal(self) -> None:
+        stage_texts = {
+            "mapping": "The sources connect through calibration assumptions and shared reliability framing.",
+            "constraint": "A constraint emerges when load increases, and failure risk rises under tighter windows.",
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Transfer mitigation and adaptation continue across scenarios with repeated application steps.",
+        }
+
+        with self.assertRaises(ValueError):
+            _assert_progressive_cross_structure(
+                stage_texts=stage_texts,
+                source_texts=["Baseline source summary content."],
+                mapping_lock_claims=None,
+            )
+
 
 class CrossSourceVisibilityTests(unittest.TestCase):
     def test_single_source_never_shows_cross_source_section(self) -> None:

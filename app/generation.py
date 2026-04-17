@@ -174,7 +174,18 @@ CROSS_STAGE_ROLE_PATTERNS: dict[str, tuple[str, ...]] = {
     "mapping": (r"\bconnect(s|ion|ed)?\b", r"\blink(s|ed|age)?\b", r"\bbridge\b", r"\balign(s|ment)?\b"),
     "constraint": (r"\bconstraint(s)?\b", r"\bbreakdown\b", r"\bfail(s|ure|ed|ing)?\b", r"\btrade[- ]?off\b"),
     "transfer": (r"\btransfer(s|red|ring)?\b", r"\badapt(s|ed|ation)?\b", r"\bapply(ing|ied)?\b", r"\bmitigat(e|ion|es)?\b"),
-    "decision": (r"\bdecid(e|es|ed|ing)\b", r"\bchoose(s|n)?\b", r"\bprioritiz(e|es|ed|ing)\b", r"\bimplication(s)?\b"),
+    "decision": (
+        r"\bdecid(e|es|ed|ing)\b",
+        r"\bchoose(s|n)?\b",
+        r"\bprioritiz(e|es|ed|ing)\b",
+        r"\bimplication(s)?\b",
+        r"\bshould\b",
+        r"\bwould\b",
+        r"\brecommend(ed|ation|ing)?\b",
+        r"\bmost likely\b",
+        r"\bbest\b",
+        r"\bwhich\b",
+    ),
 }
 
 TEXT_EXPANSION_JSON_SCHEMA = {
@@ -1370,6 +1381,13 @@ def _infer_cross_stage_role(text_value: str) -> str:
     return best_role if scores[best_role] > 0 else "unknown"
 
 
+def _cross_stage_role_scores(text_value: str) -> dict[str, int]:
+    return {
+        role: _count_cross_stage_pattern_hits(text_value, patterns)
+        for role, patterns in CROSS_STAGE_ROLE_PATTERNS.items()
+    }
+
+
 def _mapping_claim_overlap_ratio(left_claims: list[str], right_claims: list[str]) -> float:
     left = {claim.lower() for claim in left_claims if claim.strip()}
     right = {claim.lower() for claim in right_claims if claim.strip()}
@@ -1429,7 +1447,28 @@ def _assert_progressive_cross_structure(
         if not stage_text:
             continue
 
+        role_scores = _cross_stage_role_scores(stage_text)
+        expected_score = role_scores.get(expected_role, 0)
+        if expected_score <= 0:
+            raise ValueError(
+                f"cross-source progression failed: stage '{stage_name}' missing required '{expected_role}' signal"
+            )
+
         inferred_role = _infer_cross_stage_role(stage_text)
+        if stage_name == "decision":
+            transfer_score = role_scores.get("transfer", 0)
+            # Quiz explanations can mention transfer actions, but they must still contain
+            # a strong decision/implication signal to pass this stage.
+            if inferred_role == "transfer" and expected_score + 1 < transfer_score:
+                raise ValueError(
+                    f"cross-source progression failed: stage '{stage_name}' resolved to '{inferred_role}'"
+                )
+            if inferred_role not in {"decision", "transfer"}:
+                raise ValueError(
+                    f"cross-source progression failed: stage '{stage_name}' resolved to '{inferred_role}'"
+                )
+            continue
+
         if inferred_role != expected_role:
             raise ValueError(
                 f"cross-source progression failed: stage '{stage_name}' resolved to '{inferred_role}'"

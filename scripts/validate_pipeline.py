@@ -94,7 +94,18 @@ def _infer_cross_role(text_value: str) -> str:
         "mapping": (r"\bconnect(s|ion|ed)?\b", r"\blink(s|ed|age)?\b", r"\bbridge\b", r"\balign(s|ment)?\b"),
         "constraint": (r"\bconstraint(s)?\b", r"\bbreakdown\b", r"\bfail(s|ure|ed|ing)?\b", r"\btrade[- ]?off\b"),
         "transfer": (r"\btransfer(s|red|ring)?\b", r"\badapt(s|ed|ation)?\b", r"\bmitigat(e|ion|es)?\b"),
-        "decision": (r"\bdecid(e|es|ed|ing)\b", r"\bchoose(s|n)?\b", r"\bimplication(s)?\b", r"\bprioritiz(e|es|ed|ing)\b"),
+        "decision": (
+            r"\bdecid(e|es|ed|ing)\b",
+            r"\bchoose(s|n)?\b",
+            r"\bimplication(s)?\b",
+            r"\bprioritiz(e|es|ed|ing)\b",
+            r"\bshould\b",
+            r"\bwould\b",
+            r"\brecommend(ed|ation|ing)?\b",
+            r"\bmost likely\b",
+            r"\bbest\b",
+            r"\bwhich\b",
+        ),
     }
     scores = {
         role: sum(1 for pattern in patterns if re.search(pattern, " ".join(str(text_value or "").lower().split())))
@@ -102,6 +113,31 @@ def _infer_cross_role(text_value: str) -> str:
     }
     best_role = max(scores, key=scores.get)
     return best_role if scores[best_role] > 0 else "unknown"
+
+
+def _cross_role_scores(text_value: str) -> dict[str, int]:
+    role_patterns = {
+        "mapping": (r"\bconnect(s|ion|ed)?\b", r"\blink(s|ed|age)?\b", r"\bbridge\b", r"\balign(s|ment)?\b"),
+        "constraint": (r"\bconstraint(s)?\b", r"\bbreakdown\b", r"\bfail(s|ure|ed|ing)?\b", r"\btrade[- ]?off\b"),
+        "transfer": (r"\btransfer(s|red|ring)?\b", r"\badapt(s|ed|ation)?\b", r"\bmitigat(e|ion|es)?\b"),
+        "decision": (
+            r"\bdecid(e|es|ed|ing)\b",
+            r"\bchoose(s|n)?\b",
+            r"\bimplication(s)?\b",
+            r"\bprioritiz(e|es|ed|ing)\b",
+            r"\bshould\b",
+            r"\bwould\b",
+            r"\brecommend(ed|ation|ing)?\b",
+            r"\bmost likely\b",
+            r"\bbest\b",
+            r"\bwhich\b",
+        ),
+    }
+    normalized = " ".join(str(text_value or "").lower().split())
+    return {
+        role: sum(1 for pattern in patterns if re.search(pattern, normalized))
+        for role, patterns in role_patterns.items()
+    }
 
 
 def _assert_cross_progression_structure(insights: dict[str, Any], quiz: dict[str, Any]) -> None:
@@ -173,8 +209,18 @@ def _assert_cross_progression_structure(insights: dict[str, Any], quiz: dict[str
         raise RuntimeError("Cross progression failed: constraint stage role drift.")
     if transfer_text and _infer_cross_role(transfer_text) != "transfer":
         raise RuntimeError("Cross progression failed: transfer stage role drift.")
-    if decision_text and _infer_cross_role(decision_text) != "decision":
-        raise RuntimeError("Cross progression failed: decision stage role drift.")
+    if decision_text:
+        decision_scores = _cross_role_scores(decision_text)
+        decision_signal = decision_scores.get("decision", 0)
+        transfer_signal = decision_scores.get("transfer", 0)
+        inferred_decision_role = _infer_cross_role(decision_text)
+
+        if decision_signal <= 0:
+            raise RuntimeError("Cross progression failed: decision stage missing decision signal.")
+        if inferred_decision_role == "transfer" and decision_signal + 1 < transfer_signal:
+            raise RuntimeError("Cross progression failed: decision stage role drift.")
+        if inferred_decision_role not in {"decision", "transfer"}:
+            raise RuntimeError("Cross progression failed: decision stage role drift.")
 
 
 def _headers(user_id: str) -> dict[str, str]:
@@ -244,6 +290,7 @@ def _upload_and_process(
             raise RuntimeError(
                 "Upload timed out while backend was ingesting sources. "
                 "If using video, this is commonly Whisper/transcoding latency. "
+                "If running documents-only, this usually indicates backend saturation or a blocked upload worker. "
                 "Try --documents-only with --session-check-only for fast isolation checks "
                 "or increase --request-timeout."
             ) from exc
