@@ -4,14 +4,19 @@ import unittest
 
 from app.generation import (
     _assert_interaction_stage_progression,
+    _assert_progressive_cross_structure,
     _apply_source_hard_cuts,
+    _build_progressive_cross_stage_texts,
     _build_source_intent_map,
     _classify_interaction_types,
+    _classify_deep_dive_operation,
     _compute_distributed_row_positions,
     _deduplicate_section_text,
     _enforce_section_novelty,
     _extract_claims,
     _extract_variable_families,
+    _filter_deep_dive_sentences,
+    _filter_under_surface_sentences,
     _normalize_continuous_prose,
     _pairwise_claim_overlap_ratio,
     _section_redundancy_ratio,
@@ -22,7 +27,14 @@ from app.generation import (
     _pairwise_overlap_ratio,
 )
 from app.interaction import _expand_followup_query, _strip_redundant_sentences
-from app.models import InteractionTurnRecord, ReflectionPoint
+from app.models import (
+    AttributedSentence,
+    CombinedInsightSection,
+    CombinedQuizSection,
+    InsightIntersection,
+    InteractionTurnRecord,
+    ReflectionPoint,
+)
 from frontend.app import (
     _build_first_principles_evidence_summary,
     _build_quick_elaboration_prompt,
@@ -260,6 +272,85 @@ class ControllerGuardTests(unittest.TestCase):
             max_source_restatement_ratio=0.9,
         )
         self.assertIn("dependency", stage_types)
+
+    def test_classify_deep_dive_operation(self) -> None:
+        self.assertEqual(
+            _classify_deep_dive_operation("The system fails when delay exceeds the threshold."),
+            "failure_mode",
+        )
+        self.assertEqual(
+            _classify_deep_dive_operation("Intervention requires calibrating the boundary window."),
+            "intervention",
+        )
+
+    def test_filter_deep_dive_sentences_removes_explanatory_lines(self) -> None:
+        filtered = _filter_deep_dive_sentences(
+            (
+                "A constraint means the model has limited headroom. "
+                "The system fails when delayed updates cross the stability threshold. "
+                "Intervention mitigates collapse by recalibrating update cadence."
+            ),
+            ["The summary already introduced baseline mechanism behavior."],
+        )
+        self.assertNotIn("means the model", filtered.lower())
+        self.assertIn("fails when", filtered.lower())
+        self.assertIn("intervention", filtered.lower())
+
+    def test_filter_under_surface_sentences_keeps_assumption_extension(self) -> None:
+        filtered = _filter_under_surface_sentences(
+            (
+                "This concept refers to delayed feedback. "
+                "An implicit assumption breaks under distribution drift unless calibration is refreshed."
+            ),
+            ["Delayed feedback appears in the summary."],
+        )
+        self.assertNotIn("refers to", filtered.lower())
+        self.assertIn("implicit assumption", filtered.lower())
+
+    def test_progressive_cross_stage_map_and_validation(self) -> None:
+        insights = CombinedInsightSection(
+            intersections=[
+                InsightIntersection(
+                    intersection_title="Signal coupling",
+                    why_it_matters="Sources connect around calibration reliability.",
+                    integrated_explanation="The sources align on how calibration links upstream delay and downstream stability.",
+                    attributed_sentences=[
+                        AttributedSentence(
+                            text="Calibration links delay and stability under load.",
+                            source_id=1,
+                            source_type="video",
+                            emphasis_terms=["calibration"],
+                        ),
+                        AttributedSentence(
+                            text="Document notes connect latency windows to reliability.",
+                            source_id=2,
+                            source_type="document",
+                            emphasis_terms=["latency"],
+                        ),
+                    ],
+                )
+            ],
+            layman_bridge="The two sources connect through a shared calibration bridge.",
+            synthesis_text="A constraint appears when throughput rises and breakdown risk grows.",
+            comparative_analysis="Trade-off pressure appears because stability improves at the expense of latency.",
+            application_scenarios=[],
+            model_name="gpt-4o-mini",
+            schema_version=10,
+        )
+        quiz = CombinedQuizSection(
+            questions=[],
+            study_advice="Decide which control to prioritize when implication risk increases.",
+            model_name="gpt-4o-mini",
+            schema_version=10,
+        )
+
+        stage_texts = _build_progressive_cross_stage_texts(insights, quiz)
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Summary context unrelated to mapping wording."],
+            mapping_lock_claims=None,
+        )
+        self.assertTrue(mapping_claims)
 
 
 class CrossSourceVisibilityTests(unittest.TestCase):

@@ -8,6 +8,9 @@ Rules:
 4) This stage owns friction scenarios only: each scenario must expose where one source's output creates a constraint for another source's method.
 5) Do not restate connection, dependency, or tradeoff summaries; focus on interaction breakdown points and mitigation actions.
 6) Prefer 3-4 scenarios when there is enough cross-source material.
+7) Assume mapping and constraint analysis are already known, do not reintroduce them.
+8) Remove any scenario sentence that does not add transfer adaptation or mitigation value.
+9) If a scenario could be swapped with another stage without changing meaning, it is invalid.
 """.strip()
 
 

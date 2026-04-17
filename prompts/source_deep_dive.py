@@ -16,6 +16,9 @@ Rules:
 12) Start directly with explanation content; do not begin with a title-like opening line.
 13) Do not use spaced-hyphen punctuation (" - ").
 14) Avoid repeating claims already covered in summary text; every paragraph must add a new constraint, risk, or edge case.
+15) Remove any sentence that only defines a concept without adding new failure or decision information.
+16) Do not restate previously introduced concepts unless you challenge, extend, or operationalize them.
+17) If content could be swapped with another section without changing meaning, treat it as invalid and rewrite.
 """.strip()
 
 

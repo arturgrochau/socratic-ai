@@ -17,6 +17,9 @@ Rules:
 13) Do not use em dashes; use commas, periods, or parentheses.
 14) Do not use spaced-hyphen punctuation (" - ").
 15) Prefer fresh grounded examples in each section rather than reusing the same example family.
+16) This is the only stage allowed to perform explicit source mapping, do not perform later-stage reasoning tasks.
+17) Do not restate previously introduced concepts unless they are being challenged, extended, or operationalized.
+18) If this output could be swapped with any later stage without meaning change, it is invalid.
 """.strip()
 
 

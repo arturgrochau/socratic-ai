@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from contextlib import ExitStack
@@ -35,6 +36,128 @@ def _assert_clean_continuous_text(field_name: str, text_value: str) -> None:
 
     if " - " in value:
         raise RuntimeError(f"{field_name} contains disallowed spaced-hyphen punctuation.")
+
+
+def _contains_regex(text_value: str, patterns: tuple[str, ...]) -> bool:
+    normalized = " ".join(str(text_value or "").lower().split())
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _assert_deep_dive_operation_purity(field_name: str, text_value: str) -> None:
+    value = " ".join(str(text_value or "").split()).strip()
+    if not value:
+        return
+
+    sentences = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", value) if segment.strip()]
+    explanatory_patterns = (
+        r"\brefers to\b",
+        r"\bmeans that\b",
+        r"\bis defined as\b",
+        r"\bin other words\b",
+        r"\bthis concept\b",
+    )
+    operation_patterns = (
+        r"\bconstraint(s)?\b",
+        r"\bfail(s|ure|ed|ing)?\b",
+        r"\btrade[- ]?off\b",
+        r"\binterven(e|tion|ing)\b",
+        r"\bmitigat(e|ion|es)?\b",
+        r"\bprevent(s|ed|ing)?\b",
+    )
+
+    for sentence in sentences:
+        if _contains_regex(sentence, explanatory_patterns):
+            raise RuntimeError(f"{field_name} contains explanatory leakage: {sentence[:120]}")
+        if not _contains_regex(sentence, operation_patterns):
+            raise RuntimeError(f"{field_name} contains non-operational sentence: {sentence[:120]}")
+
+
+def _infer_cross_role(text_value: str) -> str:
+    role_patterns = {
+        "mapping": (r"\bconnect(s|ion|ed)?\b", r"\blink(s|ed|age)?\b", r"\bbridge\b", r"\balign(s|ment)?\b"),
+        "constraint": (r"\bconstraint(s)?\b", r"\bbreakdown\b", r"\bfail(s|ure|ed|ing)?\b", r"\btrade[- ]?off\b"),
+        "transfer": (r"\btransfer(s|red|ring)?\b", r"\badapt(s|ed|ation)?\b", r"\bmitigat(e|ion|es)?\b"),
+        "decision": (r"\bdecid(e|es|ed|ing)\b", r"\bchoose(s|n)?\b", r"\bimplication(s)?\b", r"\bprioritiz(e|es|ed|ing)\b"),
+    }
+    scores = {
+        role: sum(1 for pattern in patterns if re.search(pattern, " ".join(str(text_value or "").lower().split())))
+        for role, patterns in role_patterns.items()
+    }
+    best_role = max(scores, key=scores.get)
+    return best_role if scores[best_role] > 0 else "unknown"
+
+
+def _assert_cross_progression_structure(insights: dict[str, Any], quiz: dict[str, Any]) -> None:
+    intersections = insights.get("intersections") or []
+    mapping_text = " ".join(
+        [
+            " ".join(
+                part
+                for part in [
+                    str(item.get("intersection_title", "") or "").strip(),
+                    str(item.get("why_it_matters", "") or "").strip(),
+                    str(item.get("integrated_explanation", "") or "").strip(),
+                ]
+                if part
+            )
+            for item in intersections
+            if isinstance(item, dict)
+        ]
+    ).strip()
+    mapping_text = " ".join(part for part in [mapping_text, str(insights.get("layman_bridge", "") or "").strip()] if part)
+    constraint_text = " ".join(
+        part
+        for part in [
+            str(insights.get("synthesis_text", "") or "").strip(),
+            str(insights.get("comparative_analysis", "") or "").strip(),
+        ]
+        if part
+    )
+    transfer_text = " ".join(
+        [
+            " ".join(
+                part
+                for part in [
+                    str(item.get("scenario_title", "") or "").strip(),
+                    str(item.get("scenario_prompt", "") or "").strip(),
+                    str(item.get("common_pitfall", "") or "").strip(),
+                ]
+                if part
+            )
+            for item in (insights.get("application_scenarios") or [])
+            if isinstance(item, dict)
+        ]
+    ).strip()
+    decision_text = " ".join(
+        [
+            " ".join(
+                part
+                for part in [
+                    str(item.get("question", "") or "").strip(),
+                    str(item.get("explanation", "") or "").strip(),
+                    str(item.get("under_the_hood", "") or "").strip(),
+                ]
+                if part
+            )
+            for item in (quiz.get("questions") or [])
+            if isinstance(item, dict)
+        ]
+    ).strip()
+    decision_text = " ".join(part for part in [decision_text, str(quiz.get("study_advice", "") or "").strip()] if part)
+
+    if not mapping_text:
+        raise RuntimeError("Cross progression failed: mapping stage is empty.")
+    if not constraint_text:
+        raise RuntimeError("Cross progression failed: constraint stage is empty.")
+
+    if _infer_cross_role(mapping_text) != "mapping":
+        raise RuntimeError("Cross progression failed: mapping stage role drift.")
+    if _infer_cross_role(constraint_text) != "constraint":
+        raise RuntimeError("Cross progression failed: constraint stage role drift.")
+    if transfer_text and _infer_cross_role(transfer_text) != "transfer":
+        raise RuntimeError("Cross progression failed: transfer stage role drift.")
+    if decision_text and _infer_cross_role(decision_text) != "decision":
+        raise RuntimeError("Cross progression failed: decision stage role drift.")
 
 
 def _headers(user_id: str) -> dict[str, str]:
@@ -190,6 +313,7 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
     video_deep_dive = str(video.get("deep_dive_text", "")).strip()
     if video_deep_dive:
         _assert_clean_continuous_text("Video deep dive", video_deep_dive)
+        _assert_deep_dive_operation_purity("Video deep dive", video_deep_dive)
         if len(video_deep_dive.split()) > 920:
             raise RuntimeError("Video deep-dive text exceeded expected max-length guardrail.")
 
@@ -230,6 +354,7 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         deep_dive_text = str(document.get("deep_dive_text", "")).strip()
         if deep_dive_text:
             _assert_clean_continuous_text("Document deep dive", deep_dive_text)
+            _assert_deep_dive_operation_purity("Document deep dive", deep_dive_text)
             if len(deep_dive_text.split()) > 920:
                 raise RuntimeError("Document deep-dive text exceeded expected max-length guardrail.")
 
@@ -335,6 +460,8 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
 
     if questions and not str(quiz.get("study_advice", "")).strip():
         raise RuntimeError("Generation payload has quiz questions but no study advice.")
+
+    _assert_cross_progression_structure(insights, quiz)
 
     return {
         "video_title": str(video.get("generated_title", ""))[:120],

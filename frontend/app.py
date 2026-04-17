@@ -723,6 +723,7 @@ def _render_integrated_cross_source_analysis(
     layman_bridge: str,
     synthesis_text: str,
     comparative_analysis: str,
+    emphasis_terms: list[str],
 ) -> None:
     cleaned_bridge = _normalize_continuous_text_for_display(layman_bridge)
     cleaned_synthesis = _normalize_continuous_text_for_display(synthesis_text)
@@ -731,19 +732,19 @@ def _render_integrated_cross_source_analysis(
     if not any([cleaned_bridge, cleaned_synthesis, cleaned_comparative]):
         return
 
-    st.markdown("### Cross-Source Interaction Ladder")
+    constraint_parts = [part for part in [cleaned_synthesis, cleaned_comparative] if part]
+    if cleaned_bridge and not constraint_parts:
+        constraint_parts.append(cleaned_bridge)
 
-    if cleaned_synthesis:
-        st.markdown("#### Dependency Path")
-        st.markdown(_format_long_prose_markdown(cleaned_synthesis, max_sentences_per_paragraph=4))
-
-    if cleaned_comparative and _text_overlap_ratio(cleaned_comparative, cleaned_synthesis) < 0.72:
-        st.markdown("#### Trade-Off Boundaries")
-        st.markdown(_format_long_prose_markdown(cleaned_comparative, max_sentences_per_paragraph=4))
-
-    if cleaned_bridge and _text_overlap_ratio(cleaned_bridge, cleaned_synthesis) < 0.65:
-        st.markdown("#### Connection Anchor")
-        st.markdown(_format_long_prose_markdown(cleaned_bridge, max_sentences_per_paragraph=3))
+    if constraint_parts:
+        st.markdown("### 2) Constraint or Breakdown")
+        merged_constraint_text = " ".join(constraint_parts).strip()
+        st.markdown(
+            _bold_keywords_in_text(
+                _format_long_prose_markdown(merged_constraint_text, max_sentences_per_paragraph=4),
+                emphasis_terms,
+            )
+        )
 
 
 def _render_reflection_points(
@@ -855,6 +856,10 @@ def _render_source_learning_section(section_payload: dict) -> None:
     )
     _render_structured_summary(summary_text)
 
+    key_terms = section_payload.get("key_terms", []) or []
+    normalized_terms = [str(term) for term in key_terms]
+    _render_key_terms(normalized_terms)
+
     deep_dive_text = _clean_block(
         str(section_payload.get("deep_dive_text", "")),
         generated_title,
@@ -863,11 +868,12 @@ def _render_source_learning_section(section_payload: dict) -> None:
     if deep_dive_text:
         deep_dive_text = _normalize_continuous_text_for_display(deep_dive_text)
         st.markdown("### Deep Dive")
-        st.markdown(_format_long_prose_markdown(deep_dive_text))
-
-    key_terms = section_payload.get("key_terms", []) or []
-    normalized_terms = [str(term) for term in key_terms]
-    _render_key_terms(normalized_terms)
+        st.markdown(
+            _bold_keywords_in_text(
+                _format_long_prose_markdown(deep_dive_text),
+                normalized_terms,
+            )
+        )
 
     under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
     if under_surface_text:
@@ -1054,14 +1060,6 @@ def _render_grouped_evidence(
         summary = _build_first_principles_evidence_summary(evidence_items)
         if summary:
             st.markdown(summary)
-
-        with st.expander("Show raw grounding snippets", expanded=False):
-            for source_label, quote, _ in evidence_items[:8]:
-                st.markdown(f"{source_label}: \"{quote}\"")
-
-            hidden_count = len(evidence_items) - 8
-            if hidden_count > 0:
-                st.caption(f"+ {hidden_count} more grounding snippet(s)")
 
 
 def _submit_chat_query(
@@ -1336,9 +1334,10 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                     _render_source_learning_section(section_payload)
 
     if selected_section == "Cross-Source Synthesis & Assessment":
-        st.markdown("### Connection Layer")
+        st.markdown("### 1) Mapping")
 
         intersections = insights_payload.get("intersections", []) or []
+        all_cross_attributed_sentences: list[dict] = []
         if intersections:
             for index, intersection in enumerate(intersections, start=1):
                 if not isinstance(intersection, dict):
@@ -1357,6 +1356,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         if isinstance(item, dict)
                         and int(item.get("source_id", 0) or 0) in source_label_map
                     ]
+                    all_cross_attributed_sentences.extend(attributed_sentences)
                     emphasis_terms = _collect_emphasis_terms(attributed_sentences)
 
                     if why_it_matters:
@@ -1411,6 +1411,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         if isinstance(item, dict)
                         and int(item.get("source_id", 0) or 0) in source_label_map
                     ]
+                    all_cross_attributed_sentences.extend(normalized_parallels)
                     emphasis_terms = _collect_emphasis_terms(normalized_parallels)
                     if emphasis_terms:
                         concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
@@ -1436,6 +1437,8 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             else:
                 st.write("No intersections available.")
 
+        cross_emphasis_terms = _collect_emphasis_terms(all_cross_attributed_sentences)
+
         layman_bridge = str(insights_payload.get("layman_bridge", "")).strip()
         synthesis_text = str(insights_payload.get("synthesis_text", "")).strip()
         comparative_analysis = str(insights_payload.get("comparative_analysis") or "").strip()
@@ -1443,11 +1446,12 @@ def _render_generation_tabs(has_user_id: bool) -> None:
             layman_bridge=layman_bridge,
             synthesis_text=synthesis_text,
             comparative_analysis=comparative_analysis,
+            emphasis_terms=cross_emphasis_terms,
         )
 
         application_scenarios = insights_payload.get("application_scenarios", []) or []
         if application_scenarios:
-            st.markdown("### Friction Scenarios")
+            st.markdown("### 3) Transfer and Adaptation")
             for index, scenario in enumerate(application_scenarios, start=1):
                 if not isinstance(scenario, dict):
                     continue
@@ -1467,7 +1471,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                     if common_pitfall:
                         st.warning(f"Common pitfall: {common_pitfall}")
 
-        st.markdown("### Knowledge Check")
+        st.markdown("### 4) Decision and Implication")
         questions = quiz_payload.get("questions", []) or []
         if not questions:
             st.write("No quiz questions available.")

@@ -14,6 +14,9 @@ Rules:
 10) Do not use em dashes; use commas, periods, or parentheses.
 11) Do not use spaced-hyphen punctuation (" - ").
 12) Use a new grounded example angle rather than repeating intersection examples verbatim.
+13) Do not perform source mapping in this stage, assume mapping is already established.
+14) Remove any sentence that could be deleted without losing a new constraint or breakdown insight.
+15) If this analysis could be swapped with mapping, transfer, or decision sections, it is invalid.
 """.strip()
 
 

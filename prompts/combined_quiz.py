@@ -13,6 +13,9 @@ Rules:
 6) under_the_hood must add one new edge condition or tradeoff angle not already stated in prior synthesis text.
 6) source_evidence should cite concrete facts/sections from the provided payload and avoid repeating the same quote pattern across many questions.
 7) Keep question bodies and explanations concise enough to avoid excessively large JSON payloads.
+8) Assume mapping, constraint, and transfer stages are already known, do not reteach them.
+9) Remove any explanation sentence that does not add new decision, implication, or edge-condition value.
+10) If question explanations could be swapped with earlier narrative sections without meaning change, output is invalid.
 """.strip()
 
 

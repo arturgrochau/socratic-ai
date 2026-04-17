@@ -19,6 +19,10 @@ LINKING_MODEL = os.getenv("LINKING_MODEL", "gpt-4o-mini")
 RETRIEVAL_MODEL = os.getenv("RETRIEVAL_MODEL", "text-embedding-3-small")
 INTERACTION_MODEL = os.getenv("INTERACTION_MODEL", "gpt-4o-mini")
 GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-4o-mini")
+GENERATION_CRITIC_MODEL = os.getenv("GENERATION_CRITIC_MODEL", "gpt-4o")
+ENABLE_GENERATION_CRITIC_FALLBACK = os.getenv("ENABLE_GENERATION_CRITIC_FALLBACK", "true").lower() == "true"
+MAX_SOURCE_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_SOURCE_CRITIC_CALLS_PER_RUN", "1"))
+MAX_CROSS_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_CROSS_CRITIC_CALLS_PER_RUN", "1"))
 USER_ID_HEADER = os.getenv("USER_ID_HEADER", "X-User-ID")
 ENABLE_COST_LOGGING = os.getenv("ENABLE_COST_LOGGING", "true").lower() == "true"
 CACHE_PROCESSED_SOURCES = os.getenv("CACHE_PROCESSED_SOURCES", "true").lower() == "true"

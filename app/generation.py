@@ -26,7 +26,16 @@ from app.models import (
     SourceLearningSection,
 )
 from app.processing import get_source_metadata, load_existing_source_summary, process_source
-from config import CACHE_PROCESSED_SOURCES, GENERATION_MODEL, db_engine, openai_client
+from config import (
+    CACHE_PROCESSED_SOURCES,
+    ENABLE_GENERATION_CRITIC_FALLBACK,
+    GENERATION_CRITIC_MODEL,
+    GENERATION_MODEL,
+    MAX_CROSS_CRITIC_CALLS_PER_RUN,
+    MAX_SOURCE_CRITIC_CALLS_PER_RUN,
+    db_engine,
+    openai_client,
+)
 from prompts.combined_insights import (
     COMBINED_INSIGHTS_JSON_SCHEMA,
     COMBINED_INSIGHTS_SYSTEM_PROMPT,
@@ -102,6 +111,72 @@ INTERACTION_TYPE_PATTERNS: dict[str, tuple[str, ...]] = {
     "tradeoff": (r"\btrade[- ]?off(s)?\b", r"\bat the expense of\b", r"\bdegrade(s|d|ation)?\b"),
 }
 
+DEEP_DIVE_OPERATION_PATTERNS: dict[str, tuple[str, ...]] = {
+    "constraint": (
+        r"\bconstraint(s)?\b",
+        r"\blimit(s|ation)?\b",
+        r"\bboundary\b",
+        r"\bthreshold(s)?\b",
+        r"\bbottleneck(s)?\b",
+    ),
+    "failure_mode": (
+        r"\bfail(s|ure|ed|ing)?\b",
+        r"\bbreak(s|down)?\b",
+        r"\bcollapse(s|d)?\b",
+        r"\bdegrad(e|es|ed|ation)\b",
+        r"\bunstable\b",
+    ),
+    "intervention": (
+        r"\binterven(e|tion|ing)\b",
+        r"\bmitigat(e|es|ed|ion)\b",
+        r"\bprevent(s|ed|ing)?\b",
+        r"\bcalibrat(e|es|ed|ion)\b",
+        r"\badjust(s|ed|ment)?\b",
+        r"\btune(s|d|ing)?\b",
+        r"\brecover(y|ies)?\b",
+    ),
+}
+
+EXPLANATORY_RESTATEMENT_PATTERNS: tuple[str, ...] = (
+    r"\brefers to\b",
+    r"\bmeans that\b",
+    r"\bis defined as\b",
+    r"\bin other words\b",
+    r"\bput simply\b",
+    r"\bthis concept\b",
+)
+
+DECISION_VALUE_PATTERNS: tuple[str, ...] = (
+    r"\bshould\b",
+    r"\bmust\b",
+    r"\bdecid(e|es|ed|ing)\b",
+    r"\bprioritiz(e|es|ed|ing)\b",
+    r"\btrade[- ]?off\b",
+    r"\bwhen\b",
+    r"\bif\b",
+    r"\bunless\b",
+)
+
+EXTENSION_MARKER_PATTERNS: tuple[str, ...] = (
+    r"\bhowever\b",
+    r"\bunless\b",
+    r"\bexcept\b",
+    r"\bunder\b",
+    r"\bwhen\b",
+    r"\bif\b",
+    r"\btrade[- ]?off\b",
+    r"\bchalleng(e|es|ed|ing)\b",
+    r"\bextend(s|ed|ing)?\b",
+    r"\boperationaliz(e|es|ed|ing)\b",
+)
+
+CROSS_STAGE_ROLE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "mapping": (r"\bconnect(s|ion|ed)?\b", r"\blink(s|ed|age)?\b", r"\bbridge\b", r"\balign(s|ment)?\b"),
+    "constraint": (r"\bconstraint(s)?\b", r"\bbreakdown\b", r"\bfail(s|ure|ed|ing)?\b", r"\btrade[- ]?off\b"),
+    "transfer": (r"\btransfer(s|red|ring)?\b", r"\badapt(s|ed|ation)?\b", r"\bapply(ing|ied)?\b", r"\bmitigat(e|ion|es)?\b"),
+    "decision": (r"\bdecid(e|es|ed|ing)\b", r"\bchoose(s|n)?\b", r"\bprioritiz(e|es|ed|ing)\b", r"\bimplication(s)?\b"),
+}
+
 TEXT_EXPANSION_JSON_SCHEMA = {
     "name": "expanded_text",
     "strict": True,
@@ -114,6 +189,8 @@ TEXT_EXPANSION_JSON_SCHEMA = {
         "required": ["expanded_text"],
     },
 }
+
+_CRITIC_BUDGET_BY_RUN: dict[str, dict[str, int]] = {}
 
 
 class GenerationStageError(RuntimeError):
@@ -135,6 +212,24 @@ class GenerationStageError(RuntimeError):
         )
 
 
+def _resolve_critic_bucket(stage_name: str) -> str | None:
+    lowered = str(stage_name or "").lower()
+    if lowered.startswith("source_") or lowered.startswith("source:"):
+        return "source"
+    if lowered.startswith("combined_") or lowered.startswith("cross") or lowered.startswith("comparative") or lowered.startswith("application_"):
+        return "cross"
+    return None
+
+
+def _ensure_critic_budget(run_id: str) -> dict[str, int]:
+    if run_id not in _CRITIC_BUDGET_BY_RUN:
+        _CRITIC_BUDGET_BY_RUN[run_id] = {
+            "source": max(int(MAX_SOURCE_CRITIC_CALLS_PER_RUN), 0),
+            "cross": max(int(MAX_CROSS_CRITIC_CALLS_PER_RUN), 0),
+        }
+    return _CRITIC_BUDGET_BY_RUN[run_id]
+
+
 def _trim_error_detail(error_text: str) -> str:
     compact = " ".join(str(error_text).split())
     if len(compact) <= MAX_STAGE_ERROR_CHARS:
@@ -152,6 +247,8 @@ def _run_structured_generation_step(
     response_schema: dict[str, Any],
     required_keys: list[str] | None = None,
 ) -> dict[str, Any]:
+    last_error_detail = "Retry budget exhausted."
+
     for attempt_number in range(1, GENERATION_MAX_STAGE_ATTEMPTS + 1):
         started = time.perf_counter()
         log_generation_stage_event(
@@ -200,6 +297,7 @@ def _run_structured_generation_step(
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
             error_detail = _trim_error_detail(str(exc))
+            last_error_detail = error_detail
             log_generation_stage_event(
                 run_id=run_id,
                 user_id=user_id,
@@ -209,19 +307,84 @@ def _run_structured_generation_step(
                 duration_ms=duration_ms,
                 error_message=error_detail,
             )
-            if attempt_number >= GENERATION_MAX_STAGE_ATTEMPTS:
-                raise GenerationStageError(
-                    run_id=run_id,
-                    stage_name=stage_name,
-                    attempt_number=attempt_number,
-                    reason=error_detail,
-                ) from exc
+
+    critic_bucket = _resolve_critic_bucket(stage_name)
+    critic_budget = _ensure_critic_budget(run_id)
+    if (
+        ENABLE_GENERATION_CRITIC_FALLBACK
+        and critic_bucket is not None
+        and critic_budget.get(critic_bucket, 0) > 0
+    ):
+        critic_attempt_number = GENERATION_MAX_STAGE_ATTEMPTS + 1
+        started = time.perf_counter()
+        critic_stage_name = f"{stage_name}:critic"
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=critic_stage_name,
+            attempt_number=critic_attempt_number,
+            status="started",
+            details=f"remaining_budget={critic_budget.get(critic_bucket, 0)}",
+        )
+
+        try:
+            completion = openai_client.chat.completions.create(
+                model=GENERATION_CRITIC_MODEL,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_schema", "json_schema": response_schema},
+            )
+            log_api_usage(
+                response=completion,
+                user_id=user_id,
+                call_stage="generation",
+                model_name=GENERATION_CRITIC_MODEL,
+            )
+
+            content = completion.choices[0].message.content
+            payload = parse_json_object(content or "", stage_name=f"{critic_stage_name} attempt {critic_attempt_number}")
+            if required_keys:
+                missing_keys = [key for key in required_keys if key not in payload]
+                if missing_keys:
+                    raise ValueError(f"Missing required keys: {', '.join(missing_keys)}")
+
+            critic_budget[critic_bucket] = max(critic_budget.get(critic_bucket, 0) - 1, 0)
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=critic_stage_name,
+                attempt_number=critic_attempt_number,
+                status="succeeded",
+                duration_ms=duration_ms,
+                details=(
+                    f"fallback_model={GENERATION_CRITIC_MODEL};"
+                    f"remaining_budget={critic_budget.get(critic_bucket, 0)}"
+                ),
+            )
+            return payload
+        except Exception as critic_exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            critic_error = _trim_error_detail(str(critic_exc))
+            last_error_detail = f"mini={last_error_detail}; critic={critic_error}"
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=critic_stage_name,
+                attempt_number=critic_attempt_number,
+                status="failed",
+                duration_ms=duration_ms,
+                error_message=critic_error,
+            )
 
     raise GenerationStageError(
         run_id=run_id,
         stage_name=stage_name,
         attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
-        reason="Retry budget exhausted.",
+        reason=last_error_detail,
     )
 
 
@@ -1075,6 +1238,240 @@ def _source_restatement_ratio(text_value: str, source_texts: list[str]) -> float
         if _normalize_continuous_prose(source_text)
     ]
     return max(ratios) if ratios else 0.0
+
+
+def _contains_pattern(text_value: str, patterns: tuple[str, ...]) -> bool:
+    normalized = _normalize_continuous_prose(text_value).lower()
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _sentence_similarity_to_prior(sentence: str, prior_texts: list[str]) -> float:
+    sentence_norm = _normalize_continuous_prose(sentence).lower()
+    if not sentence_norm:
+        return 0.0
+
+    best = 0.0
+    for prior_text in prior_texts:
+        for prior_sentence in _split_into_sentences(_normalize_continuous_prose(prior_text)):
+            prior_norm = prior_sentence.lower()
+            if not prior_norm:
+                continue
+            best = max(best, SequenceMatcher(None, sentence_norm, prior_norm).ratio())
+            best = max(best, _token_overlap_ratio(sentence_norm, prior_norm))
+    return best
+
+
+def _classify_deep_dive_operation(sentence: str) -> str | None:
+    normalized = _normalize_continuous_prose(sentence).lower()
+    if not normalized:
+        return None
+
+    if _contains_pattern(normalized, DEEP_DIVE_OPERATION_PATTERNS["failure_mode"]):
+        return "failure_mode"
+    if _contains_pattern(normalized, DEEP_DIVE_OPERATION_PATTERNS["intervention"]):
+        return "intervention"
+    if _contains_pattern(normalized, DEEP_DIVE_OPERATION_PATTERNS["constraint"]):
+        return "constraint"
+    return None
+
+
+def _sentence_adds_failure_or_decision_value(sentence: str) -> bool:
+    normalized = _normalize_continuous_prose(sentence).lower()
+    if not normalized:
+        return False
+    if _contains_pattern(normalized, DEEP_DIVE_OPERATION_PATTERNS["failure_mode"]):
+        return True
+    if _contains_pattern(normalized, DEEP_DIVE_OPERATION_PATTERNS["intervention"]):
+        return True
+    return _contains_pattern(normalized, DECISION_VALUE_PATTERNS)
+
+
+def _is_extension_sentence(sentence: str) -> bool:
+    return _contains_pattern(sentence, EXTENSION_MARKER_PATTERNS)
+
+
+def _filter_deep_dive_sentences(deep_dive_text: str, prior_texts: list[str]) -> str:
+    kept: list[str] = []
+    seen_signatures: set[str] = set()
+
+    for sentence in _split_into_sentences(_normalize_continuous_prose(deep_dive_text)):
+        normalized_sentence = " ".join(sentence.split()).strip()
+        if not normalized_sentence:
+            continue
+        signature = normalized_sentence.lower()
+        if signature in seen_signatures:
+            continue
+
+        if _contains_pattern(normalized_sentence, EXPLANATORY_RESTATEMENT_PATTERNS):
+            continue
+
+        operation_type = _classify_deep_dive_operation(normalized_sentence)
+        if operation_type not in {"constraint", "failure_mode", "intervention"}:
+            continue
+
+        if not _sentence_adds_failure_or_decision_value(normalized_sentence):
+            continue
+
+        similarity_to_prior = _sentence_similarity_to_prior(normalized_sentence, [*prior_texts, *kept])
+        if similarity_to_prior >= 0.66 and not _is_extension_sentence(normalized_sentence):
+            continue
+
+        seen_signatures.add(signature)
+        kept.append(normalized_sentence)
+
+    return " ".join(kept).strip()
+
+
+def _filter_under_surface_sentences(under_surface_text: str, prior_texts: list[str]) -> str:
+    kept: list[str] = []
+    seen_signatures: set[str] = set()
+    required_under_surface_families = {"assumption", "theoretical_limit", "stability", "generalization"}
+
+    for sentence in _split_into_sentences(_normalize_continuous_prose(under_surface_text)):
+        normalized_sentence = " ".join(sentence.split()).strip()
+        if not normalized_sentence:
+            continue
+        signature = normalized_sentence.lower()
+        if signature in seen_signatures:
+            continue
+
+        if _contains_pattern(normalized_sentence, EXPLANATORY_RESTATEMENT_PATTERNS):
+            continue
+
+        families = _extract_variable_families(normalized_sentence)
+        if not families.intersection(required_under_surface_families):
+            continue
+
+        similarity_to_prior = _sentence_similarity_to_prior(normalized_sentence, [*prior_texts, *kept])
+        if similarity_to_prior >= 0.68 and not _is_extension_sentence(normalized_sentence):
+            continue
+
+        seen_signatures.add(signature)
+        kept.append(normalized_sentence)
+
+    return " ".join(kept).strip()
+
+
+def _count_cross_stage_pattern_hits(text_value: str, patterns: tuple[str, ...]) -> int:
+    normalized = _normalize_continuous_prose(text_value).lower()
+    if not normalized:
+        return 0
+    return sum(1 for pattern in patterns if re.search(pattern, normalized))
+
+
+def _infer_cross_stage_role(text_value: str) -> str:
+    scores = {
+        role: _count_cross_stage_pattern_hits(text_value, patterns)
+        for role, patterns in CROSS_STAGE_ROLE_PATTERNS.items()
+    }
+    best_role = max(scores, key=scores.get)
+    return best_role if scores[best_role] > 0 else "unknown"
+
+
+def _mapping_claim_overlap_ratio(left_claims: list[str], right_claims: list[str]) -> float:
+    left = {claim.lower() for claim in left_claims if claim.strip()}
+    right = {claim.lower() for claim in right_claims if claim.strip()}
+    if not left or not right:
+        return 0.0
+    shared = left.intersection(right)
+    return len(shared) / float(min(len(left), len(right)))
+
+
+def _build_progressive_cross_stage_texts(
+    insights: CombinedInsightSection,
+    quiz: CombinedQuizSection,
+) -> dict[str, str]:
+    cross_texts = _build_cross_section_text_map(insights, quiz)
+    mapping_text = " ".join(
+        part
+        for part in [cross_texts.get("connection", ""), cross_texts.get("bridge", "")]
+        if _normalize_continuous_prose(part)
+    ).strip()
+    constraint_text = " ".join(
+        part
+        for part in [cross_texts.get("dependency", ""), cross_texts.get("tradeoff", "")]
+        if _normalize_continuous_prose(part)
+    ).strip()
+    transfer_text = cross_texts.get("friction", "")
+    decision_text = " ".join(
+        part
+        for part in [cross_texts.get("quiz", ""), quiz.study_advice]
+        if _normalize_continuous_prose(part)
+    ).strip()
+
+    return {
+        "mapping": mapping_text,
+        "constraint": constraint_text,
+        "transfer": transfer_text,
+        "decision": decision_text,
+    }
+
+
+def _assert_progressive_cross_structure(
+    *,
+    stage_texts: dict[str, str],
+    source_texts: list[str],
+    mapping_lock_claims: list[str] | None,
+) -> list[str]:
+    required_stage_roles = {
+        "mapping": "mapping",
+        "constraint": "constraint",
+        "transfer": "transfer",
+        "decision": "decision",
+    }
+
+    for stage_name, expected_role in required_stage_roles.items():
+        stage_text = _normalize_continuous_prose(stage_texts.get(stage_name, ""))
+        if stage_name in {"mapping", "constraint"} and not stage_text:
+            raise ValueError(f"cross-source progression failed: missing required stage '{stage_name}'")
+        if not stage_text:
+            continue
+
+        inferred_role = _infer_cross_stage_role(stage_text)
+        if inferred_role != expected_role:
+            raise ValueError(
+                f"cross-source progression failed: stage '{stage_name}' resolved to '{inferred_role}'"
+            )
+
+    mapping_text = _normalize_continuous_prose(stage_texts.get("mapping", ""))
+    if not mapping_text:
+        raise ValueError("cross-source progression failed: mapping stage empty")
+
+    mapping_claims = _extract_claims(mapping_text, limit=14)
+    if not mapping_claims:
+        raise ValueError("cross-source progression failed: mapping stage missing substantive claims")
+
+    if mapping_lock_claims is not None:
+        lock_ratio = _mapping_claim_overlap_ratio(mapping_claims, mapping_lock_claims)
+        if lock_ratio < 0.55:
+            raise ValueError(
+                f"cross-source progression failed: mapping drift across retries ({lock_ratio:.3f} < 0.550)"
+            )
+
+    source_restatement_thresholds = {
+        "constraint": 0.45,
+        "transfer": 0.40,
+        "decision": 0.35,
+    }
+    for stage_name, threshold in source_restatement_thresholds.items():
+        stage_text = _normalize_continuous_prose(stage_texts.get(stage_name, ""))
+        if not stage_text:
+            continue
+        restatement_ratio = _source_restatement_ratio(stage_text, source_texts)
+        if restatement_ratio > threshold:
+            raise ValueError(
+                f"cross-source progression failed: stage '{stage_name}' restates sources ({restatement_ratio:.3f} > {threshold:.3f})"
+            )
+
+        mapping_overlap = _section_redundancy_ratio(stage_text, [mapping_text])
+        if mapping_overlap > 0.38:
+            raise ValueError(
+                f"cross-source progression failed: stage '{stage_name}' remaps connection content ({mapping_overlap:.3f} > 0.380)"
+            )
+
+    return mapping_claims
 
 
 def _assert_interaction_stage_progression(
@@ -2054,6 +2451,24 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
                 details=f"fallback_to_first_pass={_trim_error_detail(str(exc))}",
             )
 
+    filtered_deep_dive_text = _filter_deep_dive_sentences(
+        deep_dive_text,
+        [summary_text, progression_outline],
+    )
+    if filtered_deep_dive_text != deep_dive_text:
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_sentence_filter_deep:{source_type}",
+            attempt_number=1,
+            status="succeeded",
+            details=(
+                f"before_sentences={len(_split_into_sentences(deep_dive_text))};"
+                f"after_sentences={len(_split_into_sentences(filtered_deep_dive_text))}"
+            ),
+        )
+    deep_dive_text = filtered_deep_dive_text
+
     if deep_dive_text and not _section_has_required_variables(
         section_text=deep_dive_text,
         prior_texts=[summary_text, progression_outline],
@@ -2144,6 +2559,24 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         )
 
     under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
+
+    filtered_under_surface = _filter_under_surface_sentences(
+        under_surface_explainer,
+        [summary_text, deep_dive_text, reflection_text_pre],
+    )
+    if filtered_under_surface != under_surface_explainer:
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_sentence_filter_under:{source_type}",
+            attempt_number=1,
+            status="succeeded",
+            details=(
+                f"before_sentences={len(_split_into_sentences(under_surface_explainer))};"
+                f"after_sentences={len(_split_into_sentences(filtered_under_surface))}"
+            ),
+        )
+    under_surface_explainer = filtered_under_surface
 
     if under_surface_explainer and not _section_has_required_variables(
         section_text=under_surface_explainer,
@@ -2681,9 +3114,23 @@ def _generate_combined_quiz(
     user_id: str,
     run_id: str,
 ) -> CombinedQuizSection:
+    source_catalog = [
+        {
+            "source_id": video_section.source_id,
+            "source_type": "video",
+            "title": video_section.generated_title,
+        }
+    ] + [
+        {
+            "source_id": section.source_id,
+            "source_type": "document",
+            "title": section.generated_title,
+        }
+        for section in document_sections
+    ]
+
     quiz_payload = {
-        "video": video_section.model_dump(),
-        "documents": [section.model_dump() for section in document_sections],
+        "source_catalog": source_catalog,
         "insights": insights_section.model_dump(),
         "comparative_analysis": comparative_analysis_text,
         "application_scenarios": [entry.model_dump() for entry in application_scenarios],
@@ -2817,10 +3264,35 @@ def _generate_comparative_analysis(
     user_id: str,
     run_id: str,
 ) -> str:
+    source_catalog = [
+        {
+            "source_id": video_section.source_id,
+            "source_type": "video",
+            "title": video_section.generated_title,
+        }
+    ] + [
+        {
+            "source_id": section.source_id,
+            "source_type": "document",
+            "title": section.generated_title,
+        }
+        for section in document_sections
+    ]
+
+    mapping_digest = [
+        {
+            "title": entry.intersection_title,
+            "why_it_matters": _truncate_for_prompt(entry.why_it_matters, limit=340),
+            "integrated_explanation": _truncate_for_prompt(entry.integrated_explanation, limit=420),
+        }
+        for entry in insights_section.intersections
+    ]
+
     payload = {
-        "video": video_section.model_dump(),
-        "documents": [section.model_dump() for section in document_sections],
-        "insights": insights_section.model_dump(),
+        "source_catalog": source_catalog,
+        "mapping_digest": mapping_digest,
+        "layman_bridge": insights_section.layman_bridge,
+        "synthesis_text": insights_section.synthesis_text,
         "relationship_insights": relationship_insights,
     }
 
@@ -2935,10 +3407,34 @@ def _generate_application_scenarios(
     user_id: str,
     run_id: str,
 ) -> list[ApplicationScenario]:
+    source_catalog = [
+        {
+            "source_id": video_section.source_id,
+            "source_type": "video",
+            "title": video_section.generated_title,
+        }
+    ] + [
+        {
+            "source_id": section.source_id,
+            "source_type": "document",
+            "title": section.generated_title,
+        }
+        for section in document_sections
+    ]
+
+    mapping_digest = [
+        {
+            "title": entry.intersection_title,
+            "why_it_matters": _truncate_for_prompt(entry.why_it_matters, limit=300),
+        }
+        for entry in insights_section.intersections
+    ]
+
     payload = {
-        "video": video_section.model_dump(),
-        "documents": [section.model_dump() for section in document_sections],
-        "insights": insights_section.model_dump(),
+        "source_catalog": source_catalog,
+        "mapping_digest": mapping_digest,
+        "layman_bridge": insights_section.layman_bridge,
+        "synthesis_text": insights_section.synthesis_text,
         "comparative_analysis": comparative_analysis_text,
         "relationship_insights": relationship_insights,
     }
@@ -3527,6 +4023,7 @@ def generate_tailored_learning(
             video_section=video_section,
             document_sections=document_sections,
         )
+        mapping_lock_claims: list[str] | None = None
 
         cache_was_accepted = False
         if cached_combined is not None:
@@ -3537,6 +4034,7 @@ def generate_tailored_learning(
                     quiz=cached_quiz,
                 )
                 cached_cross_texts = _build_cross_section_text_map(cached_insights, cached_quiz)
+                cached_progressive_texts = _build_progressive_cross_stage_texts(cached_insights, cached_quiz)
                 source_texts = [
                     video_section.summary_text,
                     video_section.deep_dive_text,
@@ -3585,6 +4083,12 @@ def generate_tailored_learning(
                         raise ValueError("cached cross-source friction stage missing required interaction markers")
                     if _source_restatement_ratio(cached_friction_text, source_texts) > 0.38:
                         raise ValueError("cached cross-source friction stage restates source content too strongly")
+
+                mapping_lock_claims = _assert_progressive_cross_structure(
+                    stage_texts=cached_progressive_texts,
+                    source_texts=source_texts,
+                    mapping_lock_claims=None,
+                )
 
                 _assert_pairwise_uniqueness(
                     run_id=run_id,
@@ -3671,6 +4175,7 @@ def generate_tailored_learning(
                         quiz=quiz_section,
                     )
                     candidate_cross_texts = _build_cross_section_text_map(candidate_insights, quiz_section)
+                    candidate_progressive_texts = _build_progressive_cross_stage_texts(candidate_insights, quiz_section)
 
                     source_texts = [
                         video_section.summary_text,
@@ -3722,6 +4227,14 @@ def generate_tailored_learning(
                             )
                         if _source_restatement_ratio(friction_text, source_texts) > 0.38:
                             raise ValueError("cross-source friction stage restates source content too strongly")
+
+                    current_mapping_claims = _assert_progressive_cross_structure(
+                        stage_texts=candidate_progressive_texts,
+                        source_texts=source_texts,
+                        mapping_lock_claims=mapping_lock_claims,
+                    )
+                    if mapping_lock_claims is None:
+                        mapping_lock_claims = current_mapping_claims
 
                     _assert_pairwise_uniqueness(
                         run_id=run_id,
@@ -3775,6 +4288,27 @@ def generate_tailored_learning(
                             insights=fallback_insights,
                             quiz=fallback_quiz,
                         )
+                        fallback_cross_texts = _build_cross_section_text_map(fallback_insights, fallback_quiz)
+                        fallback_progressive_texts = _build_progressive_cross_stage_texts(fallback_insights, fallback_quiz)
+                        source_texts = [
+                            video_section.summary_text,
+                            video_section.deep_dive_text,
+                            *[section.summary_text for section in document_sections],
+                            *[section.deep_dive_text for section in document_sections],
+                        ]
+                        _assert_progressive_cross_structure(
+                            stage_texts=fallback_progressive_texts,
+                            source_texts=source_texts,
+                            mapping_lock_claims=mapping_lock_claims,
+                        )
+                        _assert_pairwise_uniqueness(
+                            run_id=run_id,
+                            user_id=user_id,
+                            section_group="cross-source",
+                            section_texts=fallback_cross_texts,
+                            max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
+                            enable_claim_gate=True,
+                        )
                         insights_section = fallback_insights
                         quiz_section = fallback_quiz
                         for cut_label in fallback_cuts:
@@ -3795,31 +4329,18 @@ def generate_tailored_learning(
                         )
                         break
 
-        cross_section_text_map = _build_cross_section_text_map(insights_section, quiz_section)
+        cross_section_text_map = _build_progressive_cross_stage_texts(insights_section, quiz_section)
         cross_prior_map: dict[str, list[str]] = {
-            "connection": [],
-            "bridge": [cross_section_text_map.get("connection", "")],
-            "dependency": [
-                cross_section_text_map.get("connection", ""),
-                cross_section_text_map.get("bridge", ""),
+            "mapping": [],
+            "constraint": [cross_section_text_map.get("mapping", "")],
+            "transfer": [
+                cross_section_text_map.get("mapping", ""),
+                cross_section_text_map.get("constraint", ""),
             ],
-            "tradeoff": [
-                cross_section_text_map.get("connection", ""),
-                cross_section_text_map.get("bridge", ""),
-                cross_section_text_map.get("dependency", ""),
-            ],
-            "friction": [
-                cross_section_text_map.get("connection", ""),
-                cross_section_text_map.get("bridge", ""),
-                cross_section_text_map.get("dependency", ""),
-                cross_section_text_map.get("tradeoff", ""),
-            ],
-            "quiz": [
-                cross_section_text_map.get("connection", ""),
-                cross_section_text_map.get("bridge", ""),
-                cross_section_text_map.get("dependency", ""),
-                cross_section_text_map.get("tradeoff", ""),
-                cross_section_text_map.get("friction", ""),
+            "decision": [
+                cross_section_text_map.get("mapping", ""),
+                cross_section_text_map.get("constraint", ""),
+                cross_section_text_map.get("transfer", ""),
             ],
         }
         for section_type, text_value in cross_section_text_map.items():
@@ -3865,6 +4386,8 @@ def generate_tailored_learning(
             f"document_count={len(normalized_document_ids)}"
         ),
     )
+
+    _CRITIC_BUDGET_BY_RUN.pop(run_id, None)
 
     return GenerateTailoredLearningResponse(
         status_message="Tailored Socratic learning generated successfully.",
