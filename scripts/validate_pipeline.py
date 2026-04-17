@@ -6,21 +6,38 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
+from dataclasses import dataclass
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 import requests
+from requests.exceptions import ReadTimeout
 
 
 REQUEST_TIMEOUT = 600
 INSUFFICIENT_CONTEXT_ANSWER = "I don't have enough information in the provided materials to answer that."
+DEFAULT_USER_A = "validation-user-a"
+DEFAULT_USER_B = "validation-user-b"
 
 MODEL_RATES_PER_MILLION = {
     "gpt-4o-mini": (0.15, 0.60),
     "text-embedding-3-small": (0.02, 0.0),
     "whisper-1": (0.0, 0.0),
 }
+
+
+@dataclass
+class UploadedSourceIds:
+    video_source_id: int | None
+    document_source_ids: list[int]
+
+    @property
+    def all_source_ids(self) -> list[int]:
+        if self.video_source_id is None:
+            return list(self.document_source_ids)
+        return [self.video_source_id, *self.document_source_ids]
 
 
 def _assert_clean_continuous_text(field_name: str, text_value: str) -> None:
@@ -201,26 +218,35 @@ def _upload_and_process(
     *,
     api_base_url: str,
     user_id: str,
-    video_path: Path,
+    video_path: Path | None,
     document_paths: list[Path],
-) -> list[int]:
+) -> UploadedSourceIds:
     with ExitStack() as stack:
         files: list[tuple[str, tuple[str, Any, str]]] = []
 
-        video_file = stack.enter_context(video_path.open("rb"))
-        files.append(("video", (video_path.name, video_file, "video/mp4")))
+        if video_path is not None:
+            video_file = stack.enter_context(video_path.open("rb"))
+            files.append(("video", (video_path.name, video_file, "video/mp4")))
 
         for document_path in document_paths:
             document_file = stack.enter_context(document_path.open("rb"))
             mime_type = "application/pdf" if document_path.suffix.lower() == ".pdf" else "text/plain"
             files.append(("documents", (document_path.name, document_file, mime_type)))
 
-        upload_response = requests.post(
-            f"{api_base_url}/upload",
-            headers=_headers(user_id),
-            files=files,
-            timeout=REQUEST_TIMEOUT,
-        )
+        try:
+            upload_response = requests.post(
+                f"{api_base_url}/upload",
+                headers=_headers(user_id),
+                files=files,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except ReadTimeout as exc:
+            raise RuntimeError(
+                "Upload timed out while backend was ingesting sources. "
+                "If using video, this is commonly Whisper/transcoding latency. "
+                "Try --documents-only with --session-check-only for fast isolation checks "
+                "or increase --request-timeout."
+            ) from exc
 
     if upload_response.status_code != 200:
         raise RuntimeError(
@@ -229,7 +255,8 @@ def _upload_and_process(
         )
 
     upload_payload = upload_response.json()
-    video_source_id = int(upload_payload["video"]["source_id"])
+    raw_video = upload_payload.get("video")
+    video_source_id = int(raw_video["source_id"]) if isinstance(raw_video, dict) and raw_video.get("source_id") else None
     document_source_ids = [int(item["source_id"]) for item in upload_payload.get("documents", [])]
 
     _post_json(
@@ -242,16 +269,21 @@ def _upload_and_process(
         },
     )
 
-    return [video_source_id, *document_source_ids]
+    return UploadedSourceIds(
+        video_source_id=video_source_id,
+        document_source_ids=document_source_ids,
+    )
 
 
 def _run_interactions(*, api_base_url: str, user_id: str, source_ids: list[int]) -> dict[str, Any]:
+    session_id = f"validate-{user_id}-{uuid.uuid4().hex[:10]}"
+
     broad = _post_json(
         api_base_url=api_base_url,
         path="/ask",
         user_id=user_id,
         payload={
-            "session_id": f"validate-{user_id}",
+            "session_id": session_id,
             "source_ids": source_ids,
             "query": "What is the video about?",
             "top_k": 8,
@@ -266,7 +298,7 @@ def _run_interactions(*, api_base_url: str, user_id: str, source_ids: list[int])
         path="/ask",
         user_id=user_id,
         payload={
-            "session_id": f"validate-{user_id}",
+            "session_id": session_id,
             "source_ids": source_ids,
             "query": "Explain one important concept in plain language.",
             "top_k": 8,
@@ -282,16 +314,19 @@ def _run_interactions(*, api_base_url: str, user_id: str, source_ids: list[int])
 
 
 def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -> dict[str, Any]:
-    if len(source_ids) < 2:
-        raise RuntimeError("Generation validation requires one video and at least one document source.")
+    if not source_ids:
+        raise RuntimeError("Generation validation requires at least one source.")
+
+    video_source_id = source_ids[0] if len(source_ids) > 1 else None
+    document_source_ids = source_ids[1:] if len(source_ids) > 1 else source_ids
 
     payload = _post_json(
         api_base_url=api_base_url,
         path="/generate-tailored-learning",
         user_id=user_id,
         payload={
-            "video_source_id": int(source_ids[0]),
-            "document_source_ids": [int(source_id) for source_id in source_ids[1:]],
+            "video_source_id": int(video_source_id) if video_source_id is not None else None,
+            "document_source_ids": [int(source_id) for source_id in document_source_ids],
         },
     )
 
@@ -479,7 +514,7 @@ def _assert_user_isolation(*, api_base_url: str, attacker_user_id: str, victim_s
         f"{api_base_url}/ask",
         headers=_headers(attacker_user_id),
         json={
-            "session_id": f"isolation-check-{attacker_user_id}",
+            "session_id": f"isolation-check-{attacker_user_id}-{uuid.uuid4().hex[:10]}",
             "source_ids": victim_source_ids,
             "query": "Try cross-user retrieval.",
             "top_k": 8,
@@ -604,9 +639,14 @@ def _load_generation_stage_summary(db_path: Path) -> list[dict[str, Any]]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Socratic AI end-to-end pipeline.")
     parser.add_argument("--api-base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--user-a", default="validation-user-a")
-    parser.add_argument("--user-b", default="validation-user-b")
+    parser.add_argument("--user-a", default=DEFAULT_USER_A)
+    parser.add_argument("--user-b", default=DEFAULT_USER_B)
     parser.add_argument("--video", default="test_assets/sample_video.mp4")
+    parser.add_argument(
+        "--documents-only",
+        action="store_true",
+        help="Skip video upload to avoid transcription latency; upload only documents.",
+    )
     parser.add_argument(
         "--documents",
         nargs="+",
@@ -618,75 +658,132 @@ def _parse_args() -> argparse.Namespace:
         default=os.getenv("DATABASE_URL", "sqlite:///./app.db"),
         help="Used for reading usage logs when sqlite is enabled.",
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=REQUEST_TIMEOUT,
+        help="Per-request timeout in seconds for API calls.",
+    )
+    parser.add_argument(
+        "--session-check-only",
+        action="store_true",
+        help="Run only upload/process + interaction checks for one user.",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print progress markers to stderr while running.",
+    )
     return parser.parse_args()
 
 
+def _progress(enabled: bool, message: str) -> None:
+    if enabled:
+        print(message, file=sys.stderr, flush=True)
+
+
 def main() -> int:
+    global REQUEST_TIMEOUT
     args = _parse_args()
     project_root = Path(__file__).resolve().parents[1]
+    run_suffix = uuid.uuid4().hex[:10]
+    REQUEST_TIMEOUT = max(int(args.request_timeout), 10)
+
+    effective_user_a = str(args.user_a).strip()
+    effective_user_b = str(args.user_b).strip()
+    if effective_user_a == DEFAULT_USER_A:
+        effective_user_a = f"{effective_user_a}-{run_suffix}"
+    if effective_user_b == DEFAULT_USER_B:
+        effective_user_b = f"{effective_user_b}-{run_suffix}"
+    if effective_user_a == effective_user_b:
+        raise RuntimeError("user-a and user-b must be different after normalization.")
 
     api_base_url = str(args.api_base_url).rstrip("/")
-    video_path = (project_root / str(args.video)).resolve()
+    video_path = None if args.documents_only else (project_root / str(args.video)).resolve()
     document_paths = [(project_root / value).resolve() for value in args.documents]
 
-    if not video_path.exists():
+    if video_path is not None and not video_path.exists():
         raise FileNotFoundError(f"Video path does not exist: {video_path}")
     for document_path in document_paths:
         if not document_path.exists():
             raise FileNotFoundError(f"Document path does not exist: {document_path}")
 
+    if args.documents_only and not document_paths:
+        raise RuntimeError("--documents-only requires at least one document path.")
+
+    if args.documents_only and not args.session_check_only:
+        raise RuntimeError(
+            "--documents-only is intended for fast session isolation checks. "
+            "Use it with --session-check-only."
+        )
+
     result: dict[str, Any] = {
         "api_base_url": api_base_url,
-        "user_a": args.user_a,
-        "user_b": args.user_b,
+        "user_a": effective_user_a,
+        "user_b": effective_user_b,
+        "session_check_only": bool(args.session_check_only),
+        "documents_only": bool(args.documents_only),
+        "request_timeout": REQUEST_TIMEOUT,
         "checks": [],
     }
 
-    source_ids_user_a = _upload_and_process(
+    _progress(args.progress, "[1/5] upload+process user A")
+    source_ids_user_a_bundle = _upload_and_process(
         api_base_url=api_base_url,
-        user_id=args.user_a,
+        user_id=effective_user_a,
         video_path=video_path,
         document_paths=document_paths,
     )
+    source_ids_user_a = source_ids_user_a_bundle.all_source_ids
     result["checks"].append({"name": "upload_process_user_a", "status": "passed"})
 
+    _progress(args.progress, "[2/5] interaction checks user A")
     interactions_user_a = _run_interactions(
         api_base_url=api_base_url,
-        user_id=args.user_a,
+        user_id=effective_user_a,
         source_ids=source_ids_user_a,
     )
     result["checks"].append({"name": "interaction_user_a", "status": "passed"})
 
-    generation_user_a = _run_generation(
-        api_base_url=api_base_url,
-        user_id=args.user_a,
-        source_ids=source_ids_user_a,
-    )
-    result["checks"].append({"name": "generation_user_a", "status": "passed"})
+    generation_user_a: dict[str, Any] | None = None
+    if not args.session_check_only:
+        _progress(args.progress, "[3/5] generation checks user A")
+        generation_user_a = _run_generation(
+            api_base_url=api_base_url,
+            user_id=effective_user_a,
+            source_ids=source_ids_user_a,
+        )
+        result["checks"].append({"name": "generation_user_a", "status": "passed"})
 
-    _upload_and_process(
-        api_base_url=api_base_url,
-        user_id=args.user_b,
-        video_path=video_path,
-        document_paths=document_paths,
-    )
-    result["checks"].append({"name": "upload_process_user_b", "status": "passed"})
+    if not args.session_check_only:
+        _progress(args.progress, "[4/5] upload+process user B")
+        _upload_and_process(
+            api_base_url=api_base_url,
+            user_id=effective_user_b,
+            video_path=video_path,
+            document_paths=document_paths,
+        )
+        result["checks"].append({"name": "upload_process_user_b", "status": "passed"})
 
-    _assert_user_isolation(
-        api_base_url=api_base_url,
-        attacker_user_id=args.user_b,
-        victim_source_ids=source_ids_user_a,
-    )
-    result["checks"].append({"name": "cross_user_isolation", "status": "passed"})
+        _progress(args.progress, "[5/5] cross-user isolation")
+        _assert_user_isolation(
+            api_base_url=api_base_url,
+            attacker_user_id=effective_user_b,
+            victim_source_ids=source_ids_user_a,
+        )
+        result["checks"].append({"name": "cross_user_isolation", "status": "passed"})
 
     result["interaction_previews"] = interactions_user_a
-    result["generation_preview"] = generation_user_a
+    result["generation_preview"] = generation_user_a or {}
 
     sqlite_path = _resolve_sqlite_path(str(args.database_url), project_root)
-    if sqlite_path is None:
+    if sqlite_path is None or args.session_check_only:
         result["usage_summary"] = []
         result["generation_stage_summary"] = []
-        result["usage_note"] = "Skipped usage summary because DATABASE_URL is not sqlite."
+        if sqlite_path is None:
+            result["usage_note"] = "Skipped usage summary because DATABASE_URL is not sqlite."
+        else:
+            result["usage_note"] = "Skipped usage summary in session-check-only mode."
     else:
         result["usage_summary"] = _load_usage_summary(sqlite_path)
         result["generation_stage_summary"] = _load_generation_stage_summary(sqlite_path)
