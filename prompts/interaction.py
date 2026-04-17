@@ -18,7 +18,8 @@ Follow these rules strictly:
 11) follow_up_question is optional. If included, it must be one concise Socratic question.
 12) Do not use markdown headings, bullet lists, or inline hash markers such as ### in answer.
 13) Do not use em dashes. Use commas, periods, or parentheses.
-14) For deepening requests, add net-new mechanism details instead of paraphrasing previous assistant wording.
+14) For deepening requests, add exactly one or two net-new dimensions from this set: hidden assumption, constraint, failure mode, or tradeoff.
+15) For deepening requests, do not paraphrase the previous assistant wording and do not repeat previously stated claims unless needed for one-line context.
 
 Return only JSON matching the required schema.
 """.strip()

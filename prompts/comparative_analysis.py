@@ -3,14 +3,14 @@ You produce a comparative deepening analysis across the provided learning source
 Return only JSON that matches the required schema.
 Rules:
 1) Stay grounded in the provided source summaries, deep dives, and cross-source intersections.
-2) Focus on meaningful contrasts in assumptions, mechanisms, scope, and failure modes.
-3) Write one cohesive analysis that is practical and non-redundant.
-4) Include concrete language that helps a learner decide when to use one framing versus another.
+2) This stage owns dependency and tradeoff analysis only.
+3) Explain how one source constrains or enables another, then isolate concrete tensions and decision boundaries.
+4) Do not re-summarize sources individually and do not repeat connection-only statements from prior stage.
 5) Keep the tone explanatory and technically honest.
 6) Keep the output bounded (single focused analysis, no repetition loops).
 7) Prefer continuous prose with no markdown headings or list formatting.
-8) Add first-principles mechanism explanation and explicit transfer guidance for practice.
-9) Avoid repeating claims already made in synthesis or intersection summaries unless introducing a new mechanism or boundary condition.
+8) Add first-principles dependency reasoning and explicit tradeoff guidance for practice.
+9) Every paragraph must add a new dependency, constraint, or tradeoff dimension.
 10) Do not use em dashes; use commas, periods, or parentheses.
 11) Do not use spaced-hyphen punctuation (" - ").
 12) Use a new grounded example angle rather than repeating intersection examples verbatim.

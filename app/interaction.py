@@ -56,6 +56,9 @@ DEEPENING_QUERY_PATTERNS = [
 REDUNDANCY_SIMILARITY_THRESHOLD = 0.88
 REDUNDANCY_TOKEN_OVERLAP_THRESHOLD = 0.62
 REDUNDANCY_MIN_CHAR_RATIO = 0.45
+DEEPENING_REDUNDANCY_SIMILARITY_THRESHOLD = 0.74
+DEEPENING_REDUNDANCY_TOKEN_OVERLAP_THRESHOLD = 0.50
+DEEPENING_REDUNDANCY_MIN_CHAR_RATIO = 0.25
 
 
 def ensure_interaction_tables() -> None:
@@ -188,7 +191,15 @@ def _sanitize_continuous_text(text_value: str) -> str:
     return "\n\n".join(part for part in paragraphs if part).strip()
 
 
-def _strip_redundant_sentences(current_text: str, reference_text: str) -> str:
+def _strip_redundant_sentences(
+    current_text: str,
+    reference_text: str,
+    *,
+    similarity_threshold: float = REDUNDANCY_SIMILARITY_THRESHOLD,
+    token_overlap_threshold: float = REDUNDANCY_TOKEN_OVERLAP_THRESHOLD,
+    min_char_ratio: float = REDUNDANCY_MIN_CHAR_RATIO,
+    allow_shorter_output: bool = False,
+) -> str:
     current_sentences = _split_sentences(current_text)
     if len(current_sentences) < 2:
         return current_text
@@ -206,10 +217,10 @@ def _strip_redundant_sentences(current_text: str, reference_text: str) -> str:
             if sentence_norm == reference_norm:
                 duplicate = True
                 break
-            if SequenceMatcher(None, sentence_norm, reference_norm).ratio() >= REDUNDANCY_SIMILARITY_THRESHOLD:
+            if SequenceMatcher(None, sentence_norm, reference_norm).ratio() >= similarity_threshold:
                 duplicate = True
                 break
-            if _token_overlap_ratio(sentence_norm, reference_norm) >= REDUNDANCY_TOKEN_OVERLAP_THRESHOLD:
+            if _token_overlap_ratio(sentence_norm, reference_norm) >= token_overlap_threshold:
                 duplicate = True
                 break
         if not duplicate:
@@ -219,7 +230,9 @@ def _strip_redundant_sentences(current_text: str, reference_text: str) -> str:
         return current_text
 
     deduped = " ".join(kept_sentences).strip()
-    if len(deduped) < int(len(current_text) * REDUNDANCY_MIN_CHAR_RATIO):
+    if len(deduped) < int(len(current_text) * min_char_ratio):
+        if allow_shorter_output:
+            return deduped
         return current_text
     return deduped
 
@@ -271,6 +284,23 @@ def _is_deepening_query(query: str) -> bool:
     return any(pattern in lowered for pattern in DEEPENING_QUERY_PATTERNS)
 
 
+def _extract_answer_claims(answer_text: str, *, max_claims: int = 3) -> list[str]:
+    claims: list[str] = []
+    seen: set[str] = set()
+    for sentence in _split_sentences(answer_text):
+        normalized = " ".join(sentence.split()).strip()
+        if len(normalized) < 36:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        claims.append(normalized)
+        if len(claims) >= max_claims:
+            break
+    return claims
+
+
 def _wants_long_form(query: str) -> bool:
     lowered = query.lower().strip()
     if _is_deepening_query(lowered):
@@ -283,9 +313,14 @@ def _expand_followup_query(query: str, recent_turns: list[InteractionTurnRecord]
         return query
 
     last_turn = recent_turns[-1]
+    prior_claims = _extract_answer_claims(last_turn.answer, max_claims=3)
+    claims_block = "\n".join(f"- {claim}" for claim in prior_claims) or "- [no clear prior claims]"
     return (
         f"{query}. Focus on the previous discussion topic. "
-        "Do not restate the previous assistant answer with paraphrasing; add new mechanism-level details, constraints, or edge cases. "
+        "Do not restate the previous assistant answer with paraphrasing. "
+        "Add one or two new dimensions chosen from hidden assumption, constraint, failure mode, or tradeoff. "
+        "Do not repeat the listed prior claims unless needed for one short context sentence. "
+        f"Prior claims to avoid repeating:\n{claims_block}\n"
         f"Previous user question: {last_turn.query}. "
         f"Previous assistant answer (truncated): {_truncate_text(last_turn.answer, 820)}"
     ).strip()
@@ -870,7 +905,16 @@ def handle_user_query(
 
     if _is_deepening_query(normalized_query) and recent_turns and answer:
         previous_answer = _sanitize_continuous_text(recent_turns[-1].answer)
-        answer = _sanitize_continuous_text(_strip_redundant_sentences(answer, previous_answer))
+        answer = _sanitize_continuous_text(
+            _strip_redundant_sentences(
+                answer,
+                previous_answer,
+                similarity_threshold=DEEPENING_REDUNDANCY_SIMILARITY_THRESHOLD,
+                token_overlap_threshold=DEEPENING_REDUNDANCY_TOKEN_OVERLAP_THRESHOLD,
+                min_char_ratio=DEEPENING_REDUNDANCY_MIN_CHAR_RATIO,
+                allow_shorter_output=True,
+            )
+        )
 
     if retrieved_context is not None and not _is_insufficient_answer(answer):
         learning_bridge = _sanitize_continuous_text(_build_learning_bridge(retrieved_context) or "")

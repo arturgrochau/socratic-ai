@@ -4,13 +4,13 @@ Return only JSON that matches the provided schema.
 Rules:
 1) Use only the provided summary, deep-dive text, progression outline, key terms, and grounding chunks.
 2) Assume the summary and deep dive were already read; avoid repeating them.
-3) under_surface_explainer must be extensive and first-principles: explain why each core mechanism behaves as it does.
-4) Explicitly include causal chains, assumptions, constraints, tradeoffs, and failure modes.
-5) Cover progression-aware behavior: foundational stage, integration stage, and edge-case stage.
+3) under_surface_explainer is hidden-assumption focused only: expose latent assumptions, system limits, and second-order effects.
+4) Do not provide a step-by-step mechanism walkthrough, practical how-to, or restated deep-dive constraints.
+5) Cover progression-aware assumptions: foundational assumptions, integration assumptions, and edge-case assumption failures.
 6) diagnostic_checklist should provide practical checks at each stage (foundational, integration, edge-case).
-7) key_term_explanations should deepen mental models by connecting terms to underlying mechanisms.
-8) Prefer depth over brevity while staying grounded and coherent (roughly 1100-2200 words).
-9) Add new information not already explicit in the deep dive by introducing mechanism-level links, practical implications, and edge-case interactions.
+7) key_term_explanations, if present, must avoid dictionary-style restatement and only capture hidden assumptions tied to the term.
+8) Prefer depth over brevity while staying grounded and coherent (roughly 850-1600 words).
+9) Every paragraph must introduce a new assumption, hidden dependency, or system limit not already explicit in prior sections.
 10) Output continuous paragraph prose only for under_surface_explainer: no markdown headings, no bullet lists, no numbered lists.
 """.strip()
 
@@ -40,7 +40,7 @@ UNDER_SURFACE_JSON_SCHEMA = {
                     },
                     "required": ["term", "explanation"],
                 },
-                "minItems": 4,
+                "minItems": 0,
                 "maxItems": 10,
             },
         },

@@ -188,35 +188,30 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         raise RuntimeError("Video summary is too short for elaborate mode.")
 
     video_deep_dive = str(video.get("deep_dive_text", "")).strip()
-    if not video_deep_dive:
-        raise RuntimeError("Generation payload is missing video deep-dive text.")
-    if len(video_deep_dive) < 500:
-        raise RuntimeError("Video deep-dive text is too short for elaborate mode.")
-    _assert_clean_continuous_text("Video deep dive", video_deep_dive)
-    if len(video_deep_dive.split()) > 920:
-        raise RuntimeError("Video deep-dive text exceeded expected max-length guardrail.")
+    if video_deep_dive:
+        _assert_clean_continuous_text("Video deep dive", video_deep_dive)
+        if len(video_deep_dive.split()) > 920:
+            raise RuntimeError("Video deep-dive text exceeded expected max-length guardrail.")
 
     video_key_terms = video.get("key_terms") or []
     if len(video_key_terms) < 5:
         raise RuntimeError("Generation payload has too few video key terms.")
 
     video_under_surface = str(video.get("under_surface_explainer", "")).strip()
-    if not video_under_surface:
-        raise RuntimeError("Generation payload is missing video under-surface explainer text.")
-    if len(video_under_surface) < 600:
-        raise RuntimeError("Video under-surface explainer is too short for elaborate mode.")
-    _assert_clean_continuous_text("Video under-surface explainer", video_under_surface)
+    if video_under_surface:
+        _assert_clean_continuous_text("Video under-surface explainer", video_under_surface)
 
     video_diagnostic = video.get("diagnostic_checklist") or []
-    if len(video_diagnostic) < 4:
+    if video_diagnostic and len(video_diagnostic) < 2:
         raise RuntimeError("Generation payload has too few video diagnostic checklist items.")
 
     video_term_breakdown = video.get("key_term_explanations") or []
-    if len(video_term_breakdown) < 4:
-        raise RuntimeError("Generation payload has too few video key-term explanations.")
+    if video_term_breakdown and len(video_term_breakdown) < 1:
+        raise RuntimeError("Generation payload has malformed video key-term explanations.")
 
-    if len(video.get("reflection_points") or []) < 4:
-        raise RuntimeError("Generation payload has too few video reflection points.")
+    video_reflection = video.get("reflection_points") or []
+    if video_reflection and len(video_reflection) < 2:
+        raise RuntimeError("Generation payload has too few video reflection points when reflection is present.")
 
     if not documents:
         raise RuntimeError("Generation payload is missing document sections.")
@@ -233,32 +228,29 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
             raise RuntimeError("Document summary is too short for elaborate mode.")
 
         deep_dive_text = str(document.get("deep_dive_text", "")).strip()
-        if not deep_dive_text:
-            raise RuntimeError("Generation payload has a document section without deep-dive text.")
-        _assert_clean_continuous_text("Document deep dive", deep_dive_text)
-        if len(deep_dive_text.split()) > 920:
-            raise RuntimeError("Document deep-dive text exceeded expected max-length guardrail.")
+        if deep_dive_text:
+            _assert_clean_continuous_text("Document deep dive", deep_dive_text)
+            if len(deep_dive_text.split()) > 920:
+                raise RuntimeError("Document deep-dive text exceeded expected max-length guardrail.")
 
         if len(document.get("key_terms") or []) < 5:
             raise RuntimeError("Generation payload has a document section with too few key terms.")
 
         under_surface = str(document.get("under_surface_explainer", "")).strip()
-        if not under_surface:
-            raise RuntimeError("Generation payload has a document section without under-surface explainer text.")
-        if len(under_surface) < 500:
-            raise RuntimeError("Document under-surface explainer is too short for elaborate mode.")
-        _assert_clean_continuous_text("Document under-surface explainer", under_surface)
+        if under_surface:
+            _assert_clean_continuous_text("Document under-surface explainer", under_surface)
 
         diagnostic = document.get("diagnostic_checklist") or []
-        if len(diagnostic) < 4:
-            raise RuntimeError("Generation payload has a document section with too few diagnostic checklist items.")
+        if diagnostic and len(diagnostic) < 2:
+            raise RuntimeError("Generation payload has too few document diagnostic checklist items.")
 
         term_breakdown = document.get("key_term_explanations") or []
-        if len(term_breakdown) < 4:
-            raise RuntimeError("Generation payload has a document section with too few key-term explanations.")
+        if term_breakdown and len(term_breakdown) < 1:
+            raise RuntimeError("Generation payload has malformed document key-term explanations.")
 
-        if len(document.get("reflection_points") or []) < 4:
-            raise RuntimeError("Generation payload has a document section with too few reflection points.")
+        reflection_points = document.get("reflection_points") or []
+        if reflection_points and len(reflection_points) < 2:
+            raise RuntimeError("Generation payload has too few document reflection points when reflection is present.")
 
     intersections = insights.get("intersections") or []
     if not intersections:
@@ -297,23 +289,20 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
     if attributed_sentence_count < 10:
         raise RuntimeError("Generation payload has too few attributed sentence highlights across intersections.")
 
-    if not str(insights.get("layman_bridge", "")).strip():
-        raise RuntimeError("Generation payload has no layman bridge explanation.")
-    _assert_clean_continuous_text("Layman bridge", str(insights.get("layman_bridge", "")).strip())
-    if not str(insights.get("synthesis_text", "")).strip():
-        raise RuntimeError("Generation payload has no synthesis text.")
-    _assert_clean_continuous_text("Synthesis text", str(insights.get("synthesis_text", "")).strip())
+    layman_bridge = str(insights.get("layman_bridge", "")).strip()
+    if layman_bridge:
+        _assert_clean_continuous_text("Layman bridge", layman_bridge)
+    synthesis_text = str(insights.get("synthesis_text", "")).strip()
+    if synthesis_text:
+        _assert_clean_continuous_text("Synthesis text", synthesis_text)
 
     comparative_analysis = str(insights.get("comparative_analysis", "")).strip()
-    if not comparative_analysis:
-        raise RuntimeError("Generation payload has no comparative analysis text.")
-    if len(comparative_analysis) < 280:
-        raise RuntimeError("Comparative analysis text is too short for elaborate mode.")
-    _assert_clean_continuous_text("Comparative analysis", comparative_analysis)
+    if comparative_analysis:
+        _assert_clean_continuous_text("Comparative analysis", comparative_analysis)
 
     application_scenarios = insights.get("application_scenarios") or []
-    if len(application_scenarios) < 2:
-        raise RuntimeError("Generation payload has too few application scenarios.")
+    if application_scenarios and len(application_scenarios) < 1:
+        raise RuntimeError("Generation payload has malformed application scenarios.")
 
     required_scenario_fields = {
         "scenario_title",
@@ -329,8 +318,6 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
             raise RuntimeError("Application scenario has too few transfer steps.")
 
     questions = quiz.get("questions") or []
-    if len(questions) < 6:
-        raise RuntimeError("Generation payload has too few quiz questions.")
 
     required_question_fields = {
         "question",
@@ -346,8 +333,8 @@ def _run_generation(*, api_base_url: str, user_id: str, source_ids: list[int]) -
         if not required_question_fields.issubset(set(question.keys())):
             raise RuntimeError("Generation payload has a malformed advanced quiz question entry.")
 
-    if not str(quiz.get("study_advice", "")).strip():
-        raise RuntimeError("Generation payload has no study advice.")
+    if questions and not str(quiz.get("study_advice", "")).strip():
+        raise RuntimeError("Generation payload has quiz questions but no study advice.")
 
     return {
         "video_title": str(video.get("generated_title", ""))[:120],

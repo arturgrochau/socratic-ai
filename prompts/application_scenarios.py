@@ -5,8 +5,8 @@ Rules:
 1) Scenarios must be realistic and clearly connected to the provided materials.
 2) Each scenario must include a practical prompt and ordered transfer steps.
 3) Surface one common pitfall that a strong student might still make.
-4) Keep each scenario specific and non-overlapping with the others.
-5) Make each scenario actionable and mechanism-aware, not generic advice.
+4) This stage owns friction scenarios only: each scenario must expose where one source's output creates a constraint for another source's method.
+5) Do not restate connection, dependency, or tradeoff summaries; focus on interaction breakdown points and mitigation actions.
 6) Prefer 3-4 scenarios when there is enough cross-source material.
 """.strip()
 

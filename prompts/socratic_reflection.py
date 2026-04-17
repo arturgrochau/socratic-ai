@@ -4,11 +4,11 @@ Return only JSON that matches the provided schema.
 Rules:
 1) Reflection points must challenge reasoning, not trivia recall.
 2) Mix depth levels: foundational, intermediate, and advanced.
-3) explanation should be detailed and practical.
-4) under_the_hood should explain deeper causal or structural mechanics from a first-principles view.
-5) under_the_hood must be longer and richer (roughly 180-360 words each) with process-level detail.
-6) Include why the mechanism works, what assumptions it depends on, how it can fail, and how to intervene.
-7) Translate technical mechanisms into plain language analogies where useful, while keeping core terms precise.
+3) explanation should focus on transfer framing: what to test, what assumption to question, and what decision boundary to inspect.
+4) under_the_hood should surface hidden implications for reasoning quality, not replay the mechanism explanation from prior sections.
+5) under_the_hood must be longer and richer (roughly 160-320 words each) with reasoning traps and transfer checks.
+6) Do not restate deep-dive or under-surface text; each item must add a new evaluation lens.
+7) Translate technical ideas into practical thinking checks where useful, while keeping core terms precise.
 8) Advanced items should be materially deeper than foundational items.
 """.strip()
 

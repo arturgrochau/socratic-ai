@@ -9,9 +9,9 @@ Rules:
 5) Wrong options should often be true in a nearby context, but not true for the exact question asked.
 3) Provide exactly 4 options per question.
 4) answer_index must match the correct option.
-5) explanation should explicitly contrast why the correct option fits and why each distractor fails for this specific question.
-6) under_the_hood must be technical, first-principles oriented, and mechanism-focused (causal chain, assumptions, constraints, and tradeoffs).
-6) source_evidence should cite concrete facts/sections from the provided payload.
+5) explanation should only explain why distractors fail in this scope; do not re-teach the full mechanism narrative from prior sections.
+6) under_the_hood must add one new edge condition or tradeoff angle not already stated in prior synthesis text.
+6) source_evidence should cite concrete facts/sections from the provided payload and avoid repeating the same quote pattern across many questions.
 7) Keep question bodies and explanations concise enough to avoid excessively large JSON payloads.
 """.strip()
 

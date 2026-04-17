@@ -731,18 +731,18 @@ def _render_integrated_cross_source_analysis(
     if not any([cleaned_bridge, cleaned_synthesis, cleaned_comparative]):
         return
 
-    st.markdown("### Integrated Cross-Source Analysis")
+    st.markdown("### Cross-Source Interaction Ladder")
 
     if cleaned_synthesis:
-        st.markdown("#### Integration")
+        st.markdown("#### Dependency Path")
         st.markdown(_format_long_prose_markdown(cleaned_synthesis, max_sentences_per_paragraph=4))
 
     if cleaned_comparative and _text_overlap_ratio(cleaned_comparative, cleaned_synthesis) < 0.72:
-        st.markdown("#### Contrast and Trade-Offs")
+        st.markdown("#### Trade-Off Boundaries")
         st.markdown(_format_long_prose_markdown(cleaned_comparative, max_sentences_per_paragraph=4))
 
     if cleaned_bridge and _text_overlap_ratio(cleaned_bridge, cleaned_synthesis) < 0.65:
-        st.markdown("#### Plain-Language Anchor")
+        st.markdown("#### Connection Anchor")
         st.markdown(_format_long_prose_markdown(cleaned_bridge, max_sentences_per_paragraph=3))
 
 
@@ -884,29 +884,6 @@ def _render_source_learning_section(section_payload: dict) -> None:
                 st.markdown("**Diagnostic checklist**")
                 for item in diagnostic_checklist:
                     st.markdown(f"- {item}")
-
-            key_term_explanations = section_payload.get("key_term_explanations", []) or []
-            if key_term_explanations:
-                st.markdown("**Key term breakdown**")
-                for entry in key_term_explanations:
-                    term = ""
-                    explanation = ""
-                    if isinstance(entry, dict):
-                        term = str(entry.get("term") or "").strip()
-                        explanation = str(entry.get("explanation") or "").strip()
-                    elif isinstance(entry, str):
-                        cleaned_entry = _normalize_continuous_text_for_display(entry)
-                        if ":" in cleaned_entry:
-                            maybe_term, maybe_explanation = cleaned_entry.split(":", 1)
-                            term = maybe_term.strip()
-                            explanation = maybe_explanation.strip()
-                        else:
-                            explanation = cleaned_entry
-
-                    if term and explanation:
-                        st.markdown(f"- **{term}**: {explanation}")
-                    elif explanation:
-                        st.markdown(f"- {explanation}")
 
             if st.button(
                 "Elaborate further in chat",
@@ -1359,7 +1336,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                     _render_source_learning_section(section_payload)
 
     if selected_section == "Cross-Source Synthesis & Assessment":
-        st.markdown("### Cross-Source Connections")
+        st.markdown("### Connection Layer")
 
         intersections = insights_payload.get("intersections", []) or []
         if intersections:
@@ -1470,7 +1447,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
 
         application_scenarios = insights_payload.get("application_scenarios", []) or []
         if application_scenarios:
-            st.markdown("### Application Scenarios")
+            st.markdown("### Friction Scenarios")
             for index, scenario in enumerate(application_scenarios, start=1):
                 if not isinstance(scenario, dict):
                     continue

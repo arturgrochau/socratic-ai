@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.generation import (
+    _apply_source_hard_cuts,
     _compute_distributed_row_positions,
     _deduplicate_section_text,
     _enforce_section_novelty,
@@ -14,6 +15,8 @@ from app.generation import (
     _truncate_to_max_words,
     _pairwise_overlap_ratio,
 )
+from app.interaction import _expand_followup_query, _strip_redundant_sentences
+from app.models import InteractionTurnRecord, ReflectionPoint
 from frontend.app import (
     _build_first_principles_evidence_summary,
     _build_quick_elaboration_prompt,
@@ -145,6 +148,41 @@ class DeduplicationTests(unittest.TestCase):
         ratio = _pairwise_claim_overlap_ratio(left, right)
         self.assertAlmostEqual(ratio, 0.5, places=2)
 
+    def test_source_hard_cut_drops_overlap_prone_sections(self) -> None:
+        summary = "Core behavior depends on delayed feedback stability and constrained updates."
+        deep = "Delayed feedback stability and constrained updates are central constraints in this mechanism."
+        under = "Delayed feedback stability and constrained updates are central constraints in this mechanism."
+        reflection_points = [
+            ReflectionPoint(
+                question="What fails first?",
+                explanation="Delayed feedback stability and constrained updates are central constraints in this mechanism.",
+                under_the_hood="Delayed feedback stability and constrained updates are central constraints in this mechanism.",
+                depth_level="foundational",
+            )
+        ]
+
+        (
+            cut_deep,
+            cut_under,
+            cut_reflection,
+            cut_checklist,
+            cut_terms,
+            cut_labels,
+        ) = _apply_source_hard_cuts(
+            summary_text=summary,
+            deep_dive_text=deep,
+            under_surface_explainer=under,
+            reflection_points=reflection_points,
+            diagnostic_checklist=["Check whether delayed feedback is stable."],
+            key_term_explanations=[],
+        )
+
+        self.assertTrue(cut_labels)
+        self.assertTrue((not cut_reflection) or (not cut_under) or (not cut_deep))
+        if not cut_under:
+            self.assertEqual(cut_checklist, [])
+            self.assertEqual(cut_terms, [])
+
 
 class ProgressionOutlineEfficiencyTests(unittest.TestCase):
     def test_short_sources_skip_model_outline_stage(self) -> None:
@@ -275,6 +313,41 @@ class ChatBehaviorTests(unittest.TestCase):
             "Practical deployments are shaped by transfer constraints and assumptions.",
         )
         self.assertGreater(score, 0.4)
+
+    def test_expand_followup_query_includes_prior_claims_and_dimensions(self) -> None:
+        expanded = _expand_followup_query(
+            "Elaborate further",
+            [
+                InteractionTurnRecord(
+                    query="How does this work?",
+                    answer=(
+                        "The system depends on delayed feedback alignment. "
+                        "When alignment breaks, instability emerges under constraint pressure."
+                    ),
+                    follow_up_question=None,
+                )
+            ],
+        )
+        self.assertIn("Prior claims to avoid repeating", expanded)
+        self.assertIn("hidden assumption", expanded)
+
+    def test_strict_redundancy_strip_can_return_shorter_output(self) -> None:
+        current = (
+            "The mechanism depends on delayed feedback stability. "
+            "The mechanism depends on delayed feedback stability. "
+            "A hidden assumption is stable calibration."
+        )
+        reference = "The mechanism depends on delayed feedback stability."
+        stripped = _strip_redundant_sentences(
+            current,
+            reference,
+            similarity_threshold=0.74,
+            token_overlap_threshold=0.5,
+            min_char_ratio=0.9,
+            allow_shorter_output=True,
+        )
+        self.assertIn("hidden assumption", stripped.lower())
+        self.assertNotIn("depends on delayed feedback stability", stripped.lower())
 
 
 class SourceLabelFormattingTests(unittest.TestCase):

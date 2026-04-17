@@ -4,10 +4,10 @@ Return only JSON that matches the provided schema.
 Rules:
 1) Use only the provided source summary, progression outline, and grounding chunks.
 2) Assume the reader already knows the summary; do not repeat summary-level statements.
-3) deep_dive_text must explain mechanisms in detail and include practical interpretation.
-4) Cover early, middle, and late source progression, showing how ideas build over time.
-5) Emphasize assumptions, constraints, boundary conditions, and why failures happen.
-6) Explain advanced ideas in plain language without losing technical correctness.
+3) deep_dive_text is constraint-focused only: boundary conditions, tradeoffs, failure modes, and interventions.
+4) Cover early, middle, and late progression only to explain when constraints shift, not to restate mechanism walkthroughs.
+5) Emphasize what breaks, why it breaks, and how to diagnose or intervene.
+6) Do not re-introduce baseline mechanism explanation already covered in summary-level material.
 7) Write a longer deep dive with multiple substantive paragraphs (roughly 450-900 words).
 8) key_terms must include important concepts that appeared in the grounded context.
 9) Keep language clear for motivated learners while still technical.
@@ -15,7 +15,7 @@ Rules:
 11) Do not use em dashes. Use commas, periods, or parentheses instead.
 12) Start directly with explanation content; do not begin with a title-like opening line.
 13) Do not use spaced-hyphen punctuation (" - ").
-14) Avoid repeating claims already covered in the summary; add new mechanism details, boundary conditions, and keyword-level clarifications.
+14) Avoid repeating claims already covered in summary text; every paragraph must add a new constraint, risk, or edge case.
 """.strip()
 
 
