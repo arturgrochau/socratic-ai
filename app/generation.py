@@ -81,6 +81,27 @@ SECTION_CLAIM_OVERLAP_THRESHOLD = 0.18
 MAX_CLAIMS_PER_SECTION = 24
 MIN_CLAIM_CHARS = 28
 
+VARIABLE_FAMILY_PATTERNS: dict[str, tuple[str, ...]] = {
+    "constraint": (r"\bconstraint(s)?\b", r"\blimit(s|ation)?\b", r"\bboundary\b"),
+    "failure_mode": (r"\bfail(s|ure|ed|ing)?\b", r"\bbreak(s|down)?\b", r"\bcollapse(s|d)?\b"),
+    "instability": (r"\binstabilit(y|ies)\b", r"\bvolatile\b", r"\boscillat(e|ion|ing)\b"),
+    "assumption": (r"\bassum(es|ption|ed)?\b", r"\bpremise(s)?\b", r"\bimplicit\b"),
+    "theoretical_limit": (r"\btheoretical\b", r"\bupper bound\b", r"\blower bound\b"),
+    "tradeoff": (r"\btrade[- ]?off(s)?\b", r"\bat the expense of\b", r"\bcost of\b"),
+    "latency": (r"\blatenc(y|ies)\b", r"\bdelay(s|ed)?\b"),
+    "generalization": (r"\bgeneraliz(e|ation|es|ed)\b", r"\bout[- ]of[- ]distribution\b"),
+    "interpretability": (r"\binterpretab(le|ility)\b", r"\bexplainab(le|ility)\b"),
+    "stability": (r"\bstabilit(y|ies)\b", r"\brobust(ness)?\b", r"\bdrift\b"),
+}
+
+INTERACTION_TYPE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "connection": (r"\bconnect(s|ion|ed)?\b", r"\blink(s|ed|age)?\b", r"\boverlap(s|ped)?\b", r"\bbridge\b"),
+    "transfer": (r"\btransfer(s|red|ring)?\b", r"\bapply(ing|ied)?\b", r"\badapt(s|ed|ation)?\b", r"\bport(s|ed)?\b"),
+    "dependency": (r"\bdepend(s|ency|ent)?\b", r"\brequire(s|ment|d)?\b", r"\benable(s|d|r)?\b", r"\bprerequisite(s)?\b"),
+    "constraint": (r"\bconstraint(s)?\b", r"\blimit(s|ation)?\b", r"\bbottleneck(s)?\b", r"\bfragile\b"),
+    "tradeoff": (r"\btrade[- ]?off(s)?\b", r"\bat the expense of\b", r"\bdegrade(s|d|ation)?\b"),
+}
+
 TEXT_EXPANSION_JSON_SCHEMA = {
     "name": "expanded_text",
     "strict": True,
@@ -904,6 +925,190 @@ def _extract_claims(text_value: str, *, limit: int = MAX_CLAIMS_PER_SECTION) -> 
     return claims
 
 
+def _extract_variable_families(text_value: str) -> set[str]:
+    normalized = _normalize_continuous_prose(text_value).lower()
+    if not normalized:
+        return set()
+
+    families: set[str] = set()
+    for family, patterns in VARIABLE_FAMILY_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, normalized):
+                families.add(family)
+                break
+    return families
+
+
+def _section_has_required_variables(
+    *,
+    section_text: str,
+    prior_texts: list[str],
+    required_families: list[str],
+) -> bool:
+    if not _normalize_continuous_prose(section_text):
+        return False
+
+    section_families = _extract_variable_families(section_text)
+    prior_families: set[str] = set()
+    for value in prior_texts:
+        prior_families.update(_extract_variable_families(value))
+
+    new_families = section_families - prior_families
+    if not new_families:
+        return False
+    if not required_families:
+        return True
+    return bool(new_families.intersection(set(required_families)))
+
+
+def _format_intent_guidance(intent_entry: dict[str, Any]) -> str:
+    role = str(intent_entry.get("role") or "").strip()
+    required_variables = [str(item).strip() for item in intent_entry.get("required_variables", []) if str(item).strip()]
+    forbidden_claims = [
+        _truncate_for_prompt(str(item), limit=180)
+        for item in intent_entry.get("forbidden_claims", [])
+        if str(item).strip()
+    ]
+
+    lines = [
+        f"Role contract: {role or 'not specified'}",
+        "Required variable families: " + (", ".join(required_variables) if required_variables else "[none]"),
+        "Forbidden prior claims:\n" + ("\n".join(f"- {item}" for item in forbidden_claims[:8]) if forbidden_claims else "- [none]"),
+    ]
+    return "\n".join(lines)
+
+
+def _build_source_intent_map(
+    *,
+    summary_text: str,
+    progression_outline: str,
+) -> dict[str, dict[str, Any]]:
+    baseline_claims = _extract_claims(f"{summary_text}\n\n{progression_outline}", limit=12)
+
+    return {
+        "deep_dive": {
+            "role": "Constraints, boundary conditions, failure modes, and instability behavior only.",
+            "required_variables": ["constraint", "failure_mode", "instability", "tradeoff"],
+            "forbidden_claims": baseline_claims,
+        },
+        "under_surface": {
+            "role": "Hidden assumptions, latent premises, and theoretical limits only.",
+            "required_variables": ["assumption", "theoretical_limit", "stability", "generalization"],
+            "forbidden_claims": baseline_claims,
+        },
+        "reflection": {
+            "role": "Transfer diagnostics, decision boundaries, and counterexample-oriented reasoning only.",
+            "required_variables": ["tradeoff", "failure_mode", "assumption", "constraint"],
+            "forbidden_claims": baseline_claims,
+        },
+    }
+
+
+def _normalize_evidence_key(text_value: str) -> str:
+    normalized = _normalize_continuous_prose(text_value).lower()
+    return " ".join(re.findall(r"[a-z0-9]+", normalized))
+
+
+def _build_cross_intent_map(
+    *,
+    video_section: SourceLearningSection,
+    document_sections: list[SourceLearningSection],
+) -> dict[str, dict[str, Any]]:
+    source_claims = _extract_claims(
+        "\n\n".join(
+            [video_section.summary_text, video_section.deep_dive_text]
+            + [section.summary_text for section in document_sections]
+            + [section.deep_dive_text for section in document_sections]
+        ),
+        limit=24,
+    )
+    return {
+        "connection": {
+            "role": "Define cross-source relationships once with grounded evidence.",
+            "required_types": ["connection"],
+            "forbidden_claims": [],
+        },
+        "dependency": {
+            "role": "Explain enabling and requiring relations without re-summarizing sources.",
+            "required_types": ["dependency", "transfer"],
+            "forbidden_claims": source_claims,
+        },
+        "tradeoff": {
+            "role": "Isolate conflicts, degradations, and decision boundaries.",
+            "required_types": ["tradeoff", "constraint"],
+            "forbidden_claims": source_claims,
+        },
+        "friction": {
+            "role": "Show breakdown points in applied transfer and mitigation steps.",
+            "required_types": ["transfer", "constraint", "tradeoff"],
+            "forbidden_claims": source_claims,
+        },
+        "quiz": {
+            "role": "Assess misconceptions and edge conditions without re-teaching prior sections.",
+            "required_types": ["tradeoff", "constraint", "dependency"],
+            "forbidden_claims": source_claims,
+        },
+    }
+
+
+def _classify_interaction_types(text_value: str) -> set[str]:
+    normalized = _normalize_continuous_prose(text_value).lower()
+    if not normalized:
+        return set()
+
+    found_types: set[str] = set()
+    for type_name, patterns in INTERACTION_TYPE_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, normalized):
+                found_types.add(type_name)
+                break
+    return found_types
+
+
+def _source_restatement_ratio(text_value: str, source_texts: list[str]) -> float:
+    normalized = _normalize_continuous_prose(text_value)
+    if not normalized:
+        return 0.0
+    ratios = [
+        _token_overlap_ratio(normalized, source_text)
+        for source_text in source_texts
+        if _normalize_continuous_prose(source_text)
+    ]
+    return max(ratios) if ratios else 0.0
+
+
+def _assert_interaction_stage_progression(
+    *,
+    stage_name: str,
+    stage_text: str,
+    used_types: set[str],
+    required_new_types: set[str],
+    source_texts: list[str],
+    max_source_restatement_ratio: float,
+) -> set[str]:
+    normalized = _normalize_continuous_prose(stage_text)
+    if not normalized:
+        return set()
+
+    stage_types = _classify_interaction_types(normalized)
+    if not stage_types:
+        raise ValueError(f"{stage_name} failed interaction typing: no interaction markers detected")
+
+    new_types = stage_types - used_types
+    if required_new_types and not new_types.intersection(required_new_types):
+        raise ValueError(
+            f"{stage_name} failed interaction typing: no new required interaction type in {sorted(stage_types)}"
+        )
+
+    restatement = _source_restatement_ratio(normalized, source_texts)
+    if restatement > max_source_restatement_ratio:
+        raise ValueError(
+            f"{stage_name} restates source material too strongly: {restatement:.3f} > {max_source_restatement_ratio:.3f}"
+        )
+
+    return stage_types
+
+
 def _record_claim_ledger_entries(
     *,
     user_id: str,
@@ -1399,6 +1604,7 @@ def _generate_source_deep_dive(
     source_type: str,
     grounding_chunks: list[str],
     progression_outline: str,
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> tuple[str, list[str]]:
@@ -1412,6 +1618,7 @@ def _generate_source_deep_dive(
             f"Source type: {source_type}\n\n"
             f"Source summary:\n{summary_text}\n\n"
             f"Progression outline:\n{progression_outline}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}\n\n"
             "Grounding chunks:\n"
             f"{chunk_text}"
         ),
@@ -1441,6 +1648,7 @@ def _generate_reflection_points(
     source_type: str,
     progression_outline: str,
     grounding_chunks: list[str],
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> list[ReflectionPoint]:
@@ -1455,6 +1663,7 @@ def _generate_reflection_points(
             f"Summary:\n{summary_text}\n\n"
             f"Deep dive:\n{deep_dive_text}\n\n"
             f"Progression outline:\n{progression_outline}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}\n\n"
             "Representative grounding chunks:\n"
             f"{chunk_text}\n\n"
             "Generate Socratic reflection points."
@@ -1493,6 +1702,7 @@ def _generate_under_surface_pack(
     source_type: str,
     grounding_chunks: list[str],
     progression_outline: str,
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> tuple[str, list[str], list[KeyTermExplanation]]:
@@ -1508,6 +1718,7 @@ def _generate_under_surface_pack(
             f"Deep dive:\n{deep_dive_text}\n\n"
             f"Progression outline:\n{progression_outline}\n\n"
             f"Key terms: {', '.join(key_terms[:10])}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}\n\n"
             f"Grounding chunks:\n{chunk_text}"
         ),
         response_schema=UNDER_SURFACE_JSON_SCHEMA,
@@ -1792,11 +2003,17 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
             ),
         )
     generated_title = _generate_source_title(summary_text, source_type, user_id, run_id)
+    source_intent_map = _build_source_intent_map(
+        summary_text=summary_text,
+        progression_outline=progression_outline,
+    )
+
     deep_dive_text, key_terms = _generate_source_deep_dive(
         summary_text,
         source_type,
         grounding_chunks,
         progression_outline,
+        _format_intent_guidance(source_intent_map["deep_dive"]),
         user_id,
         run_id,
     )
@@ -1837,12 +2054,28 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
                 details=f"fallback_to_first_pass={_trim_error_detail(str(exc))}",
             )
 
+    if deep_dive_text and not _section_has_required_variables(
+        section_text=deep_dive_text,
+        prior_texts=[summary_text, progression_outline],
+        required_families=source_intent_map["deep_dive"]["required_variables"],
+    ):
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_variable_gate_deep:{source_type}",
+            attempt_number=1,
+            status="failed",
+            details="No new required variable family introduced; omitting deep dive section.",
+        )
+        deep_dive_text = ""
+
     reflection_points = _generate_reflection_points(
         summary_text,
         deep_dive_text,
         source_type,
         progression_outline,
         reflection_chunks,
+        _format_intent_guidance(source_intent_map["reflection"]),
         user_id,
         run_id,
     )
@@ -1870,6 +2103,7 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         source_type=source_type,
         grounding_chunks=under_surface_chunks,
         progression_outline=progression_outline,
+        intent_guidance=_format_intent_guidance(source_intent_map["under_surface"]),
         user_id=user_id,
         run_id=run_id,
     )
@@ -1911,6 +2145,23 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
 
     under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
 
+    if under_surface_explainer and not _section_has_required_variables(
+        section_text=under_surface_explainer,
+        prior_texts=[summary_text, deep_dive_text, reflection_text_pre],
+        required_families=source_intent_map["under_surface"]["required_variables"],
+    ):
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_variable_gate_under:{source_type}",
+            attempt_number=1,
+            status="failed",
+            details="No new required variable family introduced; omitting under-surface section.",
+        )
+        under_surface_explainer = ""
+        diagnostic_checklist = []
+        key_term_explanations = []
+
     # Remove key-term restatement plane to avoid dictionary-like overlap with deep dive and under-surface content.
     key_term_explanations = []
 
@@ -1929,6 +2180,29 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         )
         for point in reflection_points
     ]
+
+    required_reflection_vars = source_intent_map["reflection"]["required_variables"]
+    filtered_reflection_points: list[ReflectionPoint] = []
+    for point in reflection_points:
+        point_text = " ".join(part for part in [point.explanation, point.under_the_hood] if part)
+        if _section_has_required_variables(
+            section_text=point_text,
+            prior_texts=[summary_text, deep_dive_text, under_surface_explainer],
+            required_families=required_reflection_vars,
+        ):
+            filtered_reflection_points.append(point)
+    if filtered_reflection_points:
+        reflection_points = filtered_reflection_points
+    else:
+        log_generation_stage_event(
+            run_id=run_id,
+            user_id=user_id,
+            stage_name=f"source_variable_gate_reflection:{source_type}",
+            attempt_number=1,
+            status="failed",
+            details="No reflection points introduced new required variable families; omitting reflection section.",
+        )
+        reflection_points = []
 
     refined_checklist: list[str] = []
     for checklist_item in diagnostic_checklist:
@@ -2113,6 +2387,7 @@ def _generate_combined_insights(
     video_section: SourceLearningSection,
     document_sections: list[SourceLearningSection],
     relationship_insights: list[str],
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> CombinedInsightSection:
@@ -2147,7 +2422,8 @@ def _generate_combined_insights(
         system_prompt=COMBINED_INSIGHTS_SYSTEM_PROMPT,
         user_prompt=(
             "Generate cross-source attributed insights from this payload:\n\n"
-            f"{json.dumps(source_payload, ensure_ascii=True)}"
+            f"{json.dumps(source_payload, ensure_ascii=True)}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
         ),
         response_schema=COMBINED_INSIGHTS_JSON_SCHEMA,
         required_keys=["intersections", "layman_bridge", "synthesis_text"],
@@ -2401,6 +2677,7 @@ def _generate_combined_quiz(
     comparative_analysis_text: str,
     application_scenarios: list[ApplicationScenario],
     relationship_insights: list[str],
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> CombinedQuizSection:
@@ -2433,7 +2710,8 @@ def _generate_combined_quiz(
         system_prompt=COMBINED_QUIZ_SYSTEM_PROMPT,
         user_prompt=(
             "Generate overlap-focused advanced quiz questions from this payload:\n\n"
-            f"{json.dumps(quiz_payload, ensure_ascii=True)}"
+            f"{json.dumps(quiz_payload, ensure_ascii=True)}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
         ),
         response_schema=COMBINED_QUIZ_JSON_SCHEMA,
         required_keys=["questions", "study_advice"],
@@ -2465,6 +2743,12 @@ def _generate_combined_quiz(
 
     refined_questions: list[QuizQuestion] = []
     prior_quiz_texts: list[str] = []
+    consumed_evidence_keys: set[str] = {
+        _normalize_evidence_key(sentence.text)
+        for intersection in insights_section.intersections
+        for sentence in intersection.attributed_sentences
+        if _normalize_evidence_key(sentence.text)
+    }
     for question in questions:
         explanation = _enforce_section_novelty(
             _normalize_continuous_prose(question.explanation),
@@ -2481,8 +2765,10 @@ def _generate_combined_quiz(
                 _normalize_continuous_prose(evidence),
                 [*prior_cross_texts, *prior_quiz_texts, *refined_evidence],
             )
-            if normalized_evidence:
+            evidence_key = _normalize_evidence_key(normalized_evidence)
+            if normalized_evidence and evidence_key and evidence_key not in consumed_evidence_keys:
                 refined_evidence.append(normalized_evidence)
+                consumed_evidence_keys.add(evidence_key)
 
         question_text_block = " ".join(
             part for part in [question.question, explanation, under_the_hood, " ".join(refined_evidence)] if part
@@ -2527,6 +2813,7 @@ def _generate_comparative_analysis(
     document_sections: list[SourceLearningSection],
     insights_section: CombinedInsightSection,
     relationship_insights: list[str],
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> str:
@@ -2544,7 +2831,8 @@ def _generate_comparative_analysis(
         system_prompt=COMPARATIVE_ANALYSIS_SYSTEM_PROMPT,
         user_prompt=(
             "Generate one comparative deepening analysis from this payload:\n\n"
-            f"{json.dumps(payload, ensure_ascii=True)}"
+            f"{json.dumps(payload, ensure_ascii=True)}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
         ),
         response_schema=COMPARATIVE_ANALYSIS_JSON_SCHEMA,
         required_keys=["comparative_analysis"],
@@ -2643,6 +2931,7 @@ def _generate_application_scenarios(
     insights_section: CombinedInsightSection,
     comparative_analysis_text: str,
     relationship_insights: list[str],
+    intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> list[ApplicationScenario]:
@@ -2661,7 +2950,8 @@ def _generate_application_scenarios(
         system_prompt=APPLICATION_SCENARIOS_SYSTEM_PROMPT,
         user_prompt=(
             "Generate grounded application scenarios from this payload:\n\n"
-            f"{json.dumps(payload, ensure_ascii=True)}"
+            f"{json.dumps(payload, ensure_ascii=True)}\n\n"
+            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
         ),
         response_schema=APPLICATION_SCENARIOS_JSON_SCHEMA,
         required_keys=["application_scenarios"],
@@ -3233,6 +3523,10 @@ def generate_tailored_learning(
         )
 
         relationship_insights = _load_relationship_insights(source_ids, user_id)
+        cross_intent_map = _build_cross_intent_map(
+            video_section=video_section,
+            document_sections=document_sections,
+        )
 
         cache_was_accepted = False
         if cached_combined is not None:
@@ -3242,11 +3536,61 @@ def generate_tailored_learning(
                     insights=cached_insights,
                     quiz=cached_quiz,
                 )
+                cached_cross_texts = _build_cross_section_text_map(cached_insights, cached_quiz)
+                source_texts = [
+                    video_section.summary_text,
+                    video_section.deep_dive_text,
+                    *[section.summary_text for section in document_sections],
+                    *[section.deep_dive_text for section in document_sections],
+                ]
+
+                used_interaction_types: set[str] = set()
+                cached_connection_text = " ".join(
+                    part
+                    for part in [
+                        cached_cross_texts.get("connection", ""),
+                        cached_cross_texts.get("bridge", ""),
+                    ]
+                    if part
+                ).strip()
+                cached_connection_types = _classify_interaction_types(cached_connection_text)
+                if "connection" not in cached_connection_types:
+                    raise ValueError("cached cross-source section missing connection interaction markers")
+                used_interaction_types.add("connection")
+
+                cached_dependency_types = _assert_interaction_stage_progression(
+                    stage_name="cross-source:dependency:cached",
+                    stage_text=cached_cross_texts.get("dependency", ""),
+                    used_types=used_interaction_types,
+                    required_new_types=set(cross_intent_map["dependency"]["required_types"]),
+                    source_texts=source_texts,
+                    max_source_restatement_ratio=0.45,
+                )
+                used_interaction_types.update(cached_dependency_types)
+
+                cached_tradeoff_types = _assert_interaction_stage_progression(
+                    stage_name="cross-source:tradeoff:cached",
+                    stage_text=cached_cross_texts.get("tradeoff", ""),
+                    used_types=used_interaction_types,
+                    required_new_types=set(cross_intent_map["tradeoff"]["required_types"]),
+                    source_texts=source_texts,
+                    max_source_restatement_ratio=0.42,
+                )
+                used_interaction_types.update(cached_tradeoff_types)
+
+                cached_friction_text = cached_cross_texts.get("friction", "")
+                if _normalize_continuous_prose(cached_friction_text):
+                    cached_friction_types = _classify_interaction_types(cached_friction_text)
+                    if not cached_friction_types.intersection(set(cross_intent_map["friction"]["required_types"])):
+                        raise ValueError("cached cross-source friction stage missing required interaction markers")
+                    if _source_restatement_ratio(cached_friction_text, source_texts) > 0.38:
+                        raise ValueError("cached cross-source friction stage restates source content too strongly")
+
                 _assert_pairwise_uniqueness(
                     run_id=run_id,
                     user_id=user_id,
                     section_group="cross-source",
-                    section_texts=_build_cross_section_text_map(cached_insights, cached_quiz),
+                    section_texts=cached_cross_texts,
                     max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
                     enable_claim_gate=True,
                 )
@@ -3282,6 +3626,7 @@ def generate_tailored_learning(
                         video_section=video_section,
                         document_sections=document_sections,
                         relationship_insights=relationship_insights,
+                        intent_guidance=_format_intent_guidance(cross_intent_map["connection"]),
                         user_id=user_id,
                         run_id=run_id,
                     )
@@ -3290,6 +3635,7 @@ def generate_tailored_learning(
                         document_sections=document_sections,
                         insights_section=insights_section,
                         relationship_insights=relationship_insights,
+                        intent_guidance=_format_intent_guidance(cross_intent_map["tradeoff"]),
                         user_id=user_id,
                         run_id=run_id,
                     )
@@ -3299,6 +3645,7 @@ def generate_tailored_learning(
                         insights_section=insights_section,
                         comparative_analysis_text=comparative_analysis,
                         relationship_insights=relationship_insights,
+                        intent_guidance=_format_intent_guidance(cross_intent_map["friction"]),
                         user_id=user_id,
                         run_id=run_id,
                     )
@@ -3309,6 +3656,7 @@ def generate_tailored_learning(
                         comparative_analysis_text=comparative_analysis,
                         application_scenarios=application_scenarios,
                         relationship_insights=relationship_insights,
+                        intent_guidance=_format_intent_guidance(cross_intent_map["quiz"]),
                         user_id=user_id,
                         run_id=run_id,
                     )
@@ -3322,11 +3670,64 @@ def generate_tailored_learning(
                         insights=candidate_insights,
                         quiz=quiz_section,
                     )
+                    candidate_cross_texts = _build_cross_section_text_map(candidate_insights, quiz_section)
+
+                    source_texts = [
+                        video_section.summary_text,
+                        video_section.deep_dive_text,
+                        *[section.summary_text for section in document_sections],
+                        *[section.deep_dive_text for section in document_sections],
+                    ]
+                    used_interaction_types: set[str] = set()
+
+                    connection_text = " ".join(
+                        part
+                        for part in [
+                            candidate_cross_texts.get("connection", ""),
+                            candidate_cross_texts.get("bridge", ""),
+                        ]
+                        if part
+                    ).strip()
+                    connection_types = _classify_interaction_types(connection_text)
+                    if "connection" not in connection_types:
+                        raise ValueError("cross-source interaction typing failed: connection stage missing connection markers")
+                    used_interaction_types.add("connection")
+
+                    dependency_types = _assert_interaction_stage_progression(
+                        stage_name="cross-source:dependency",
+                        stage_text=candidate_cross_texts.get("dependency", ""),
+                        used_types=used_interaction_types,
+                        required_new_types=set(cross_intent_map["dependency"]["required_types"]),
+                        source_texts=source_texts,
+                        max_source_restatement_ratio=0.45,
+                    )
+                    used_interaction_types.update(dependency_types)
+
+                    tradeoff_types = _assert_interaction_stage_progression(
+                        stage_name="cross-source:tradeoff",
+                        stage_text=candidate_cross_texts.get("tradeoff", ""),
+                        used_types=used_interaction_types,
+                        required_new_types=set(cross_intent_map["tradeoff"]["required_types"]),
+                        source_texts=source_texts,
+                        max_source_restatement_ratio=0.42,
+                    )
+                    used_interaction_types.update(tradeoff_types)
+
+                    friction_text = candidate_cross_texts.get("friction", "")
+                    if _normalize_continuous_prose(friction_text):
+                        friction_types = _classify_interaction_types(friction_text)
+                        if not friction_types.intersection(set(cross_intent_map["friction"]["required_types"])):
+                            raise ValueError(
+                                "cross-source interaction typing failed: friction stage missing required interaction markers"
+                            )
+                        if _source_restatement_ratio(friction_text, source_texts) > 0.38:
+                            raise ValueError("cross-source friction stage restates source content too strongly")
+
                     _assert_pairwise_uniqueness(
                         run_id=run_id,
                         user_id=user_id,
                         section_group="cross-source",
-                        section_texts=_build_cross_section_text_map(candidate_insights, quiz_section),
+                        section_texts=candidate_cross_texts,
                         max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
                         enable_claim_gate=True,
                     )

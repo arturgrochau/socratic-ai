@@ -3,14 +3,20 @@ from __future__ import annotations
 import unittest
 
 from app.generation import (
+    _assert_interaction_stage_progression,
     _apply_source_hard_cuts,
+    _build_source_intent_map,
+    _classify_interaction_types,
     _compute_distributed_row_positions,
     _deduplicate_section_text,
     _enforce_section_novelty,
     _extract_claims,
+    _extract_variable_families,
     _normalize_continuous_prose,
     _pairwise_claim_overlap_ratio,
     _section_redundancy_ratio,
+    _section_has_required_variables,
+    _source_restatement_ratio,
     _should_use_model_progression_outline,
     _truncate_to_max_words,
     _pairwise_overlap_ratio,
@@ -198,6 +204,62 @@ class ProgressionOutlineEfficiencyTests(unittest.TestCase):
             grounding_chunks=[str(index) for index in range(7)],
         )
         self.assertTrue(should_use_model)
+
+
+class ControllerGuardTests(unittest.TestCase):
+    def test_build_source_intent_map_has_expected_roles(self) -> None:
+        intent_map = _build_source_intent_map(
+            summary_text="The mechanism stabilizes when feedback delay is bounded.",
+            progression_outline="Early phase sets assumptions, late phase stresses constraints.",
+        )
+        self.assertIn("deep_dive", intent_map)
+        self.assertIn("under_surface", intent_map)
+        self.assertIn("reflection", intent_map)
+        self.assertIn("required_variables", intent_map["deep_dive"])
+
+    def test_extract_variable_families_detects_constraints_and_assumptions(self) -> None:
+        families = _extract_variable_families(
+            "A hidden assumption appears under latency limits, and failure occurs when drift grows."
+        )
+        self.assertIn("assumption", families)
+        self.assertIn("constraint", families)
+        self.assertIn("failure_mode", families)
+
+    def test_section_has_required_variables_requires_new_signal(self) -> None:
+        has_new = _section_has_required_variables(
+            section_text="The system fails under instability when boundary constraints tighten.",
+            prior_texts=["The summary explains baseline mechanism behavior."],
+            required_families=["constraint", "failure_mode"],
+        )
+        self.assertTrue(has_new)
+
+    def test_classify_interaction_types_detects_dependency_and_tradeoff(self) -> None:
+        types = _classify_interaction_types(
+            "This setup depends on calibrated inputs and introduces a trade-off between latency and stability."
+        )
+        self.assertIn("dependency", types)
+        self.assertIn("tradeoff", types)
+
+    def test_source_restatement_ratio_is_higher_for_rephrased_source_text(self) -> None:
+        ratio = _source_restatement_ratio(
+            "The model depends on calibrated inputs and stable delay windows.",
+            [
+                "Calibrated inputs and stable delay windows are required by the model.",
+                "A separate document discusses downstream monitoring.",
+            ],
+        )
+        self.assertGreater(ratio, 0.2)
+
+    def test_interaction_stage_progression_requires_new_types(self) -> None:
+        stage_types = _assert_interaction_stage_progression(
+            stage_name="cross-source:dependency",
+            stage_text="This method depends on the upstream signal and requires stable calibration.",
+            used_types={"connection"},
+            required_new_types={"dependency", "transfer"},
+            source_texts=["Source summary describes baseline mechanisms."],
+            max_source_restatement_ratio=0.9,
+        )
+        self.assertIn("dependency", stage_types)
 
 
 class CrossSourceVisibilityTests(unittest.TestCase):

@@ -263,17 +263,11 @@ def _cross_section_text_map(insights: dict[str, Any], quiz: dict[str, Any]) -> d
     ).strip()
 
     return {
-        "intersections": intersections,
+        "connection": intersections,
         "bridge": str(insights.get("layman_bridge", "") or "").strip(),
-        "integrated_analysis": " ".join(
-            part
-            for part in [
-                str(insights.get("synthesis_text", "") or "").strip(),
-                str(insights.get("comparative_analysis", "") or "").strip(),
-            ]
-            if part
-        ).strip(),
-        "scenarios": scenarios,
+        "dependency": str(insights.get("synthesis_text", "") or "").strip(),
+        "tradeoff": str(insights.get("comparative_analysis", "") or "").strip(),
+        "friction": scenarios,
         "quiz": quiz_text,
     }
 
