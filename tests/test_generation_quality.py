@@ -22,6 +22,8 @@ from app.generation import (
     _section_redundancy_ratio,
     _section_has_required_variables,
     _source_restatement_ratio,
+    _tighten_progressive_cross_stage_texts,
+    _tighten_stage_text,
     _should_use_model_progression_outline,
     _truncate_to_max_words,
     _pairwise_overlap_ratio,
@@ -36,6 +38,8 @@ from app.models import (
     ReflectionPoint,
 )
 from frontend.app import (
+    _build_generation_export_json,
+    _build_generation_export_markdown,
     _build_first_principles_evidence_summary,
     _build_quick_elaboration_prompt,
     _build_quick_quiz_prompt,
@@ -371,6 +375,101 @@ class ControllerGuardTests(unittest.TestCase):
 
         self.assertTrue(mapping_claims)
 
+    def test_progressive_cross_stage_allows_mapping_intersection_language(self) -> None:
+        stage_texts = {
+            "mapping": (
+                "A shared intersection appears across sources: both describe a common reliability mechanism "
+                "that overlaps in how boundary assumptions drive outcomes."
+            ),
+            "constraint": "A constraint emerges when load increases, and failure risk rises under tighter windows.",
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Decide which intervention to prioritize based on implication risk and timing.",
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
+    def test_progressive_cross_stage_allows_mapping_with_light_decision_language(self) -> None:
+        stage_texts = {
+            "mapping": (
+                "The sources connect through a shared intersection in reliability assumptions. "
+                "This mapping shows which overlap matters most when both mechanisms align."
+            ),
+            "constraint": "A constraint emerges when load increases, and failure risk rises under tighter windows.",
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Decide which intervention to prioritize based on implication risk and timing.",
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
+    def test_progressive_cross_stage_allows_mapping_with_both_across_signal(self) -> None:
+        stage_texts = {
+            "mapping": (
+                "Both sources describe the same reliability mechanism across contexts, "
+                "between upstream calibration and downstream stability behavior."
+            ),
+            "constraint": "A constraint emerges when load increases, and failure risk rises under tighter windows.",
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Decide which intervention to prioritize based on implication risk and timing.",
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
+    def test_progressive_cross_stage_allows_mapping_without_explicit_mapping_tokens(self) -> None:
+        stage_texts = {
+            "mapping": (
+                "Reliability behavior appears in the video and the notes with matching assumptions "
+                "about calibration drift under load."
+            ),
+            "constraint": "A constraint emerges when load increases, and failure risk rises under tighter windows.",
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Decide which intervention to prioritize based on implication risk and timing.",
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
+    def test_progressive_cross_stage_allows_constraint_without_explicit_constraint_tokens(self) -> None:
+        stage_texts = {
+            "mapping": "The sources connect through calibration assumptions and shared reliability framing.",
+            "constraint": (
+                "Both sources share the same reliability pattern across contexts, and this overlap "
+                "becomes fragile as load and noise increase."
+            ),
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Decide which intervention to prioritize based on implication risk and timing.",
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
     def test_progressive_cross_stage_rejects_decision_stage_without_decision_signal(self) -> None:
         stage_texts = {
             "mapping": "The sources connect through calibration assumptions and shared reliability framing.",
@@ -385,6 +484,69 @@ class ControllerGuardTests(unittest.TestCase):
                 source_texts=["Baseline source summary content."],
                 mapping_lock_claims=None,
             )
+
+    def test_progressive_cross_stage_allows_mixed_constraint_decision_language(self) -> None:
+        stage_texts = {
+            "mapping": "The sources connect through calibration assumptions and shared reliability framing.",
+            "constraint": (
+                "A key constraint appears under load when failure risk compounds at boundary conditions. "
+                "You should prioritize the bottleneck check first when this breakdown starts to spread."
+            ),
+            "transfer": "Adapt mitigation steps to transfer controls between scenarios when friction appears.",
+            "decision": "Decide which intervention to prioritize based on implication risk and timing.",
+        }
+
+        mapping_claims = _assert_progressive_cross_structure(
+            stage_texts=stage_texts,
+            source_texts=["Baseline source summary content."],
+            mapping_lock_claims=None,
+        )
+
+        self.assertTrue(mapping_claims)
+
+    def test_tighten_stage_text_removes_mapping_reanchor_in_constraint_stage(self) -> None:
+        tightened, _ = _tighten_stage_text(
+            stage_name="constraint",
+            text_value=(
+                "The sources connect through a shared mechanism across both materials. "
+                "A key constraint appears when noise rises and failure risk increases."
+            ),
+            prior_stage_texts=["The sources connect through a shared mechanism across both materials."],
+        )
+
+        self.assertIn("constraint", tightened.lower())
+        self.assertNotIn("shared mechanism across both materials", tightened.lower())
+
+    def test_progressive_tightening_caps_mapping_and_constraint_paragraphs(self) -> None:
+        tightened = _tighten_progressive_cross_stage_texts(
+            stage_texts={
+                "mapping": (
+                    "Both sources connect through shared calibration assumptions. "
+                    "Both sources connect through shared calibration assumptions again. "
+                    "Across both sources, overlapping control loops align outcomes. "
+                    "Between both materials, the same mapping pattern appears under drift."
+                ),
+                "constraint": (
+                    "A constraint emerges when load increases and boundary limits tighten. "
+                    "Failure appears when load increases and boundary limits tighten. "
+                    "A tradeoff appears because stabilizing one path degrades another under pressure. "
+                    "Constraint risk compounds when assumptions no longer hold."
+                ),
+                "transfer": (
+                    "Apply the mitigation sequence to adapt controls in deployment. "
+                    "Then adapt monitoring to transfer the control law safely."
+                ),
+                "decision": (
+                    "Decide which control to prioritize first under uncertainty. "
+                    "Choose the tradeoff with lower failure impact for this context."
+                ),
+            }
+        )
+
+        mapping_paragraphs = [part for part in tightened["mapping"].split("\n\n") if part.strip()]
+        constraint_paragraphs = [part for part in tightened["constraint"].split("\n\n") if part.strip()]
+        self.assertLessEqual(len(mapping_paragraphs), 2)
+        self.assertLessEqual(len(constraint_paragraphs), 2)
 
 
 class CrossSourceVisibilityTests(unittest.TestCase):
@@ -535,6 +697,106 @@ class ChatBehaviorTests(unittest.TestCase):
         )
         self.assertIn("hidden assumption", stripped.lower())
         self.assertNotIn("depends on delayed feedback stability", stripped.lower())
+
+
+class ExportBuilderTests(unittest.TestCase):
+    def test_generation_export_markdown_includes_sources_and_cross_sections(self) -> None:
+        generation_result = {
+            "source_ids": [1, 2],
+            "video": {
+                "source_id": 1,
+                "source_type": "video",
+                "source_name": "Video Source Name",
+                "generated_title": "Video Topic",
+                "summary_text": "Video summary.",
+                "deep_dive_text": "Video deep dive.",
+                "key_terms": ["alpha", "beta"],
+                "under_surface_explainer": "Video mechanism.",
+                "diagnostic_checklist": ["Check signal drift"],
+                "reflection_points": [
+                    {
+                        "question": "Why does this work?",
+                        "explanation": "Because constraints align.",
+                        "under_the_hood": "Underlying mechanism.",
+                    }
+                ],
+            },
+            "documents": [
+                {
+                    "source_id": 2,
+                    "source_type": "document",
+                    "source_name": "Doc Source Name",
+                    "generated_title": "Doc Topic",
+                    "summary_text": "Doc summary.",
+                    "deep_dive_text": "Doc deep dive.",
+                    "key_terms": ["gamma"],
+                    "under_surface_explainer": "Doc mechanism.",
+                    "reflection_points": [],
+                }
+            ],
+            "insights": {
+                "intersections": [
+                    {
+                        "intersection_title": "Shared mechanism",
+                        "why_it_matters": "It improves transfer.",
+                        "integrated_explanation": "The overlap is causal.",
+                        "attributed_sentences": [
+                            {"text": "Evidence text.", "source_id": 1}
+                        ],
+                    }
+                ],
+                "layman_bridge": "Bridge text.",
+                "synthesis_text": "Synthesis text.",
+                "comparative_analysis": "Comparative text.",
+                "application_scenarios": [
+                    {
+                        "scenario_title": "Scenario A",
+                        "scenario_prompt": "Use in production",
+                        "transfer_steps": ["Step one", "Step two"],
+                        "common_pitfall": "Overfit assumptions",
+                    }
+                ],
+            },
+            "quiz": {
+                "questions": [
+                    {
+                        "question": "What should you do?",
+                        "options": ["A", "B", "C", "D"],
+                        "answer_index": 1,
+                        "explanation": "Because B is right.",
+                        "under_the_hood": "Mechanism detail.",
+                    }
+                ],
+                "study_advice": "Review mistakes.",
+            },
+        }
+
+        markdown_export = _build_generation_export_markdown(generation_result, user_id="demo-user")
+
+        self.assertIn("# Socratic Study Snapshot", markdown_export)
+        self.assertIn("# Source Learning", markdown_export)
+        self.assertIn("## Video: Video Topic", markdown_export)
+        self.assertIn("## Document: Doc Topic", markdown_export)
+        self.assertIn("# Cross-Source Synthesis and Assessment", markdown_export)
+        self.assertIn("## 1) Mapping", markdown_export)
+        self.assertIn("## 2) Constraint or Breakdown", markdown_export)
+        self.assertIn("## 3) Transfer and Adaptation", markdown_export)
+        self.assertIn("## 4) Decision and Implication", markdown_export)
+
+    def test_generation_export_json_wraps_generation_payload(self) -> None:
+        generation_result = {
+            "source_ids": [3],
+            "video": {"generated_title": "Only source"},
+            "documents": [],
+            "insights": {},
+            "quiz": {},
+        }
+
+        json_export = _build_generation_export_json(generation_result, user_id="demo-user")
+
+        self.assertIn('"user_id": "demo-user"', json_export)
+        self.assertIn('"generation_result"', json_export)
+        self.assertIn('"source_ids": [', json_export)
 
 
 class SourceLabelFormattingTests(unittest.TestCase):

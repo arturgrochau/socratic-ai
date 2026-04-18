@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import mimetypes
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -27,7 +30,13 @@ from app.models import (
     UploadRequestMeta,
     VideoIngestionRecord,
 )
-from config import db_engine, openai_client
+from config import (
+    INGESTION_VIDEO_STEP_TIMEOUT_SECONDS,
+    WHISPER_TRANSCRIPTION_MAX_RETRIES,
+    WHISPER_TRANSCRIPTION_TIMEOUT_SECONDS,
+    db_engine,
+    openai_client,
+)
 
 
 UPLOAD_ROOT = Path("uploads")
@@ -48,6 +57,9 @@ RAW_CHUNK_OVERLAP_CHARS = 320
 TRANSCRIPT_TEXT_PLACEHOLDER = "[chunked transcript stored in source_text_chunks]"
 WHISPER_MAX_REQUEST_BYTES = 24 * 1024 * 1024
 WHISPER_CHUNK_SECONDS = 540
+
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_ingestion_tables() -> None:
@@ -451,16 +463,37 @@ def _transcribe_whisper_file(
     user_id: str,
     segment_offset_seconds: float,
 ) -> TranscriptPayload:
-    try:
-        with audio_path.open("rb") as audio_file:
-            transcription = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
+    last_error: Exception | None = None
+    transcription: object | None = None
+    for attempt in range(1, WHISPER_TRANSCRIPTION_MAX_RETRIES + 1):
+        try:
+            with audio_path.open("rb") as audio_file:
+                transcription = openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                    timeout=WHISPER_TRANSCRIPTION_TIMEOUT_SECONDS,
+                )
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Whisper attempt %s/%s failed for %s: %s",
+                attempt,
+                WHISPER_TRANSCRIPTION_MAX_RETRIES,
+                audio_path.name,
+                exc,
             )
-    except Exception as exc:
-        raise RuntimeError(f"Whisper transcription failed: {exc}") from exc
+            if attempt >= WHISPER_TRANSCRIPTION_MAX_RETRIES:
+                raise RuntimeError(
+                    "Whisper transcription failed after "
+                    f"{WHISPER_TRANSCRIPTION_MAX_RETRIES} attempt(s): {exc}"
+                ) from exc
+            time.sleep(min(2.0, 0.4 * attempt))
+
+    if transcription is None:
+        raise RuntimeError(f"Whisper transcription failed: {last_error}") from last_error
 
     log_api_usage(
         response=transcription,
@@ -930,8 +963,36 @@ async def ingest_upload_bundle(
     transcript: TranscriptPayload | None = None
     if video_path is not None:
         audio_path = audio_dir / f"{video_path.stem}.wav"
-        extract_audio_from_video(video_path, audio_path)
-        transcript = transcribe_audio_with_whisper(audio_path, user_id)
+        try:
+            start_time = time.perf_counter()
+            await asyncio.wait_for(
+                asyncio.to_thread(extract_audio_from_video, video_path, audio_path),
+                timeout=INGESTION_VIDEO_STEP_TIMEOUT_SECONDS,
+            )
+            extraction_seconds = time.perf_counter() - start_time
+            logger.info(
+                "Video audio extraction completed in %.2fs for %s",
+                extraction_seconds,
+                video_path.name,
+            )
+
+            start_time = time.perf_counter()
+            transcript = await asyncio.wait_for(
+                asyncio.to_thread(transcribe_audio_with_whisper, audio_path, user_id),
+                timeout=INGESTION_VIDEO_STEP_TIMEOUT_SECONDS,
+            )
+            transcription_seconds = time.perf_counter() - start_time
+            logger.info(
+                "Whisper transcription completed in %.2fs for %s",
+                transcription_seconds,
+                audio_path.name,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Video ingestion exceeded timeout budget during extraction/transcription. "
+                f"Increase INGESTION_VIDEO_STEP_TIMEOUT_SECONDS (current={INGESTION_VIDEO_STEP_TIMEOUT_SECONDS}) "
+                "or use documents-only mode for faster validation."
+            ) from exc
 
     # 4) PDF or note parsing
     parsed_documents: list[tuple[UploadFile, list[DocumentPageText]]] = []
