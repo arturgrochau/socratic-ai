@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -650,6 +652,258 @@ def _should_show_cross_source_section(
     )
 
 
+def _append_export_markdown_section(lines: list[str], heading: str, text_value: str) -> None:
+    cleaned_text = _normalize_continuous_text_for_display(text_value)
+    if not cleaned_text:
+        return
+    lines.append(f"### {heading}")
+    lines.append(cleaned_text)
+    lines.append("")
+
+
+def _build_source_export_markdown(section_payload: dict, *, fallback_title: str) -> list[str]:
+    source_type = str(section_payload.get("source_type") or "source").strip().lower()
+    source_prefix = "Video" if source_type == "video" else "Document" if source_type == "document" else "Source"
+    generated_title = str(section_payload.get("generated_title") or fallback_title).strip() or fallback_title
+    source_name = str(section_payload.get("source_name") or "").strip()
+    source_id = int(section_payload.get("source_id", 0) or 0)
+
+    lines: list[str] = [f"## {source_prefix}: {generated_title}"]
+    lines.append(f"- Source ID: {source_id if source_id > 0 else 'n/a'}")
+    if source_name and source_name.lower() != generated_title.lower():
+        lines.append(f"- Original name: {source_name}")
+
+    key_terms = [str(term).strip() for term in (section_payload.get("key_terms") or []) if str(term).strip()]
+    if key_terms:
+        lines.append(f"- Key terms: {', '.join(key_terms)}")
+    lines.append("")
+
+    _append_export_markdown_section(lines, "Summary", str(section_payload.get("summary_text") or ""))
+    _append_export_markdown_section(lines, "Deep Dive", str(section_payload.get("deep_dive_text") or ""))
+    _append_export_markdown_section(
+        lines,
+        "Why This Works Under the Surface",
+        str(section_payload.get("under_surface_explainer") or ""),
+    )
+
+    diagnostic_checklist = section_payload.get("diagnostic_checklist") or []
+    if diagnostic_checklist:
+        lines.append("### Diagnostic Checklist")
+        for item in diagnostic_checklist:
+            cleaned_item = _normalize_continuous_text_for_display(str(item))
+            if cleaned_item:
+                lines.append(f"- {cleaned_item}")
+        lines.append("")
+
+    reflection_points = section_payload.get("reflection_points") or []
+    if reflection_points:
+        lines.append("### Socratic Reflection Points")
+        for index, point in enumerate(reflection_points, start=1):
+            if isinstance(point, dict):
+                question = _normalize_continuous_text_for_display(str(point.get("question") or ""))
+                explanation = _normalize_continuous_text_for_display(str(point.get("explanation") or ""))
+                under_the_hood = _normalize_continuous_text_for_display(str(point.get("under_the_hood") or ""))
+                if question:
+                    lines.append(f"{index}. {question}")
+                if explanation:
+                    lines.append(f"   - Why: {explanation}")
+                if under_the_hood:
+                    lines.append(f"   - Under the hood: {under_the_hood}")
+            else:
+                cleaned_point = _normalize_continuous_text_for_display(str(point))
+                if cleaned_point:
+                    lines.append(f"{index}. {cleaned_point}")
+        lines.append("")
+
+    return lines
+
+
+def _build_generation_export_markdown(generation_result: dict, *, user_id: str) -> str:
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines: list[str] = [
+        "# Socratic Study Snapshot",
+        "",
+        f"- Exported at: {exported_at}",
+        f"- User: {str(user_id or '').strip() or 'anonymous'}",
+        f"- Source IDs: {', '.join(str(value) for value in (generation_result.get('source_ids') or [])) or 'none'}",
+        "",
+    ]
+
+    video_payload = generation_result.get("video") or None
+    document_payloads = generation_result.get("documents", []) or []
+
+    if video_payload or document_payloads:
+        lines.append("# Source Learning")
+        lines.append("")
+        if video_payload:
+            lines.extend(_build_source_export_markdown(video_payload, fallback_title="Video"))
+        for index, document_payload in enumerate(document_payloads, start=1):
+            lines.extend(
+                _build_source_export_markdown(
+                    document_payload,
+                    fallback_title=f"Document {index}",
+                )
+            )
+
+    insights_payload = generation_result.get("insights") or {}
+    quiz_payload = generation_result.get("quiz") or {}
+    intersections = insights_payload.get("intersections", []) or []
+
+    if insights_payload or quiz_payload:
+        lines.append("# Cross-Source Synthesis and Assessment")
+        lines.append("")
+
+    if intersections:
+        lines.append("## 1) Mapping")
+        lines.append("")
+        for index, intersection in enumerate(intersections, start=1):
+            if not isinstance(intersection, dict):
+                continue
+            title = str(intersection.get("intersection_title") or f"Intersection {index}").strip()
+            lines.append(f"### {index}. {title}")
+
+            why_it_matters = _normalize_continuous_text_for_display(
+                str(intersection.get("why_it_matters") or "")
+            )
+            integrated_explanation = _normalize_continuous_text_for_display(
+                str(intersection.get("integrated_explanation") or "")
+            )
+            if why_it_matters:
+                lines.append(f"- Why it matters: {why_it_matters}")
+            if integrated_explanation:
+                lines.append(f"- Integrated explanation: {integrated_explanation}")
+
+            attributed_sentences = intersection.get("attributed_sentences", []) or []
+            if attributed_sentences:
+                lines.append("- Grounding evidence:")
+                for sentence in attributed_sentences:
+                    if not isinstance(sentence, dict):
+                        continue
+                    quote = _normalize_continuous_text_for_display(str(sentence.get("text") or ""))
+                    source_id = int(sentence.get("source_id", 0) or 0)
+                    if quote:
+                        lines.append(f"  - Source {source_id if source_id > 0 else '?'}: {quote}")
+            lines.append("")
+
+    lines.append("## 2) Constraint or Breakdown")
+    lines.append("")
+    _append_export_markdown_section(lines, "Layman Bridge", str(insights_payload.get("layman_bridge") or ""))
+    _append_export_markdown_section(lines, "Synthesis", str(insights_payload.get("synthesis_text") or ""))
+    _append_export_markdown_section(
+        lines,
+        "Comparative Analysis",
+        str(insights_payload.get("comparative_analysis") or ""),
+    )
+
+    application_scenarios = insights_payload.get("application_scenarios", []) or []
+    if application_scenarios:
+        lines.append("## 3) Transfer and Adaptation")
+        lines.append("")
+        for index, scenario in enumerate(application_scenarios, start=1):
+            if not isinstance(scenario, dict):
+                continue
+            title = str(scenario.get("scenario_title") or f"Scenario {index}").strip()
+            lines.append(f"### {index}. {title}")
+            prompt_text = _normalize_continuous_text_for_display(str(scenario.get("scenario_prompt") or ""))
+            if prompt_text:
+                lines.append(f"- Prompt: {prompt_text}")
+            transfer_steps = scenario.get("transfer_steps") or []
+            if transfer_steps:
+                lines.append("- Transfer steps:")
+                for step_index, step_text in enumerate(transfer_steps, start=1):
+                    cleaned_step = _normalize_continuous_text_for_display(str(step_text))
+                    if cleaned_step:
+                        lines.append(f"  {step_index}. {cleaned_step}")
+            pitfall_text = _normalize_continuous_text_for_display(str(scenario.get("common_pitfall") or ""))
+            if pitfall_text:
+                lines.append(f"- Common pitfall: {pitfall_text}")
+            lines.append("")
+
+    questions = quiz_payload.get("questions", []) or []
+    if questions:
+        lines.append("## 4) Decision and Implication")
+        lines.append("")
+        for index, question_payload in enumerate(questions, start=1):
+            if not isinstance(question_payload, dict):
+                continue
+            question = _normalize_continuous_text_for_display(str(question_payload.get("question") or ""))
+            if question:
+                lines.append(f"### Q{index}. {question}")
+            options = question_payload.get("options", []) or []
+            for option_index, option in enumerate(options, start=1):
+                cleaned_option = _normalize_continuous_text_for_display(str(option))
+                if cleaned_option:
+                    lines.append(f"{option_index}. {cleaned_option}")
+
+            answer_index = int(question_payload.get("answer_index", 0) or 0)
+            if options and 0 <= answer_index < len(options):
+                lines.append(f"- Correct answer: {str(options[answer_index]).strip()}")
+
+            explanation = _normalize_continuous_text_for_display(str(question_payload.get("explanation") or ""))
+            if explanation:
+                lines.append(f"- Why this is correct: {explanation}")
+            under_the_hood = _normalize_continuous_text_for_display(
+                str(question_payload.get("under_the_hood") or "")
+            )
+            if under_the_hood:
+                lines.append(f"- Under the hood: {under_the_hood}")
+            lines.append("")
+
+    study_advice = _normalize_continuous_text_for_display(str(quiz_payload.get("study_advice") or ""))
+    if study_advice:
+        lines.append("## Study Advice")
+        lines.append(study_advice)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_generation_export_json(generation_result: dict, *, user_id: str) -> str:
+    export_payload = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "user_id": str(user_id or "").strip() or None,
+        "generation_result": generation_result,
+    }
+    return json.dumps(export_payload, ensure_ascii=True, indent=2)
+
+
+def _render_generation_export_actions(generation_result: dict) -> None:
+    markdown_export = _build_generation_export_markdown(
+        generation_result,
+        user_id=str(st.session_state.get("user_id") or ""),
+    )
+    json_export = _build_generation_export_json(
+        generation_result,
+        user_id=str(st.session_state.get("user_id") or ""),
+    )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    user_token = _slugify_token(str(st.session_state.get("user_id") or ""), fallback="user")
+    file_prefix = f"socratic_snapshot_{timestamp}_{user_token}"
+
+    with st.container(border=True):
+        st.markdown("### Save this generation locally")
+        st.caption("Download a readable study snapshot or the full raw payload.")
+        col_markdown, col_json = st.columns(2)
+        with col_markdown:
+            st.download_button(
+                "Download study snapshot (.md)",
+                data=markdown_export,
+                file_name=f"{file_prefix}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        with col_json:
+            st.download_button(
+                "Download raw payload (.json)",
+                data=json_export,
+                file_name=f"{file_prefix}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        st.caption("Tip: open the markdown file and print it to PDF if you want a PDF copy.")
+
+
 def _render_key_terms(key_terms: list[str]) -> None:
     if not key_terms:
         return
@@ -1279,6 +1533,8 @@ def _render_generation_tabs(has_user_id: bool) -> None:
         st.info("Generate tailored content to populate tabs.")
         return
 
+    _render_generation_export_actions(generation_result)
+
     video_payload = generation_result.get("video") or None
     document_payloads = generation_result.get("documents", []) or []
     insights_payload = generation_result.get("insights", {})
@@ -1501,7 +1757,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                         st.markdown("**Why this works under the surface**")
                         st.markdown(under_the_hood)
                     if source_evidence:
-                        st.markdown("**Source evidence**")
+                        st.markdown("**Supporting references**")
                         for evidence in source_evidence:
                             st.markdown(f"- {evidence}")
 

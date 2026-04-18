@@ -20,6 +20,9 @@ Rules:
 16) This is the only stage allowed to perform explicit source mapping, do not perform later-stage reasoning tasks.
 17) Do not restate previously introduced concepts unless they are being challenged, extended, or operationalized.
 18) If this output could be swapped with any later stage without meaning change, it is invalid.
+19) Use explicit mapping language in each intersection (for example: connect, overlap, shared, between, both, across).
+20) Keep mapping prose compressed: one core idea per paragraph and at most 2 short paragraphs per integrated_explanation.
+21) Remove sentences that introduce tradeoff prescriptions, transfer playbooks, or decision recommendations.
 """.strip()
 
 

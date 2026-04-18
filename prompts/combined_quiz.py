@@ -16,6 +16,8 @@ Rules:
 8) Assume mapping, constraint, and transfer stages are already known, do not reteach them.
 9) Remove any explanation sentence that does not add new decision, implication, or edge-condition value.
 10) If question explanations could be swapped with earlier narrative sections without meaning change, output is invalid.
+11) Keep decision reasoning compressed: one core implication per paragraph and avoid multi-paragraph restatements.
+12) Avoid repeated analogy framing across questions unless the later use adds a genuinely new tradeoff implication.
 """.strip()
 
 

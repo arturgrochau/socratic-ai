@@ -11,6 +11,8 @@ Rules:
 7) Assume mapping and constraint analysis are already known, do not reintroduce them.
 8) Remove any scenario sentence that does not add transfer adaptation or mitigation value.
 9) If a scenario could be swapped with another stage without changing meaning, it is invalid.
+10) Keep each scenario compact: 1 short prompt paragraph plus 3-4 action-first steps.
+11) Avoid repeated analogy framing across scenarios unless the later analogy extends with a new operational constraint.
 """.strip()
 
 

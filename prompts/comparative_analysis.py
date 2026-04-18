@@ -17,6 +17,8 @@ Rules:
 13) Do not perform source mapping in this stage, assume mapping is already established.
 14) Remove any sentence that could be deleted without losing a new constraint or breakdown insight.
 15) If this analysis could be swapped with mapping, transfer, or decision sections, it is invalid.
+16) Keep output to 1-2 compact paragraphs, each with one core constraint or tradeoff chain.
+17) Remove any sentence that only re-anchors shared background already established in mapping.
 """.strip()
 
 
