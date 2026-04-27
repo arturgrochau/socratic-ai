@@ -185,16 +185,23 @@ class GenerateTailoredLearningRequest(BaseModel):
     document_source_ids: list[int] = Field(default_factory=list)
 
 
+class ClaimLedgerEntry(BaseModel):
+    claim: str
+    grounding_quote: str
+    claim_type: Literal["mechanism", "constraint", "failure", "tradeoff", "assumption", "implication"]
+
+
 class ReflectionPoint(BaseModel):
     question: str
     explanation: str
-    under_the_hood: str
+    reasoning_traps: str
     depth_level: Literal["foundational", "intermediate", "advanced"]
 
 
 class KeyTermExplanation(BaseModel):
     term: str
-    explanation: str
+    layman: str
+    technical: str
 
 
 class SourceLearningSection(BaseModel):
@@ -206,9 +213,11 @@ class SourceLearningSection(BaseModel):
     deep_dive_text: str
     key_terms: list[str]
     under_surface_explainer: str = ""
+    first_principles_synthesis: str = ""
     diagnostic_checklist: list[str] = Field(default_factory=list)
     key_term_explanations: list[KeyTermExplanation] = Field(default_factory=list)
     reflection_points: list[ReflectionPoint]
+    low_mechanism_density: bool = False
     model_name: str
     schema_version: int = 6
 
@@ -229,6 +238,20 @@ class InsightIntersection(BaseModel):
     inference_label: Literal["inferred_extension"] | None = None
 
 
+class CrossSourceTension(BaseModel):
+    title: str
+    source_a_claim: str
+    source_b_claim: str
+    resolution_or_tradeoff: str
+
+
+class TransferBridge(BaseModel):
+    from_source_id: int
+    to_source_id: int
+    transfer_mechanism: str
+    adaptation_needed: str
+
+
 class ApplicationScenario(BaseModel):
     scenario_title: str
     scenario_prompt: str
@@ -237,14 +260,14 @@ class ApplicationScenario(BaseModel):
 
 
 class CombinedInsightSection(BaseModel):
-    intersections: list[InsightIntersection]
-    parallels: list[AttributedSentence] = Field(default_factory=list)
-    layman_bridge: str
     synthesis_text: str
+    intersections: list[InsightIntersection] = Field(default_factory=list)
+    parallels: list[AttributedSentence] = Field(default_factory=list)
+    layman_bridge: str = ""
     comparative_analysis: str = ""
     application_scenarios: list[ApplicationScenario] = Field(default_factory=list)
     model_name: str
-    schema_version: int = 4
+    schema_version: int = 5
 
 
 class QuizQuestion(BaseModel):
@@ -252,15 +275,12 @@ class QuizQuestion(BaseModel):
     options: list[str]
     answer_index: int = Field(ge=0, le=3)
     explanation: str
-    under_the_hood: str
-    difficulty_level: Literal["foundational", "intermediate", "advanced"]
-    question_type: Literal["cross_source", "synthesis", "application"]
-    source_evidence: list[str]
+    source_evidence: list[str] = Field(default_factory=list)
 
 
 class CombinedQuizSection(BaseModel):
     questions: list[QuizQuestion]
-    study_advice: str
+    study_advice: str = ""
     model_name: str
     schema_version: int = 2
 

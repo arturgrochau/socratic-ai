@@ -10,6 +10,22 @@ The product goal is structured, engaged learning rather than passive summarizati
 
 The app is intentionally retrieval-first and stage-based instead of one-shot chat. Ingestion stores transcript and document chunks, processing builds source concepts and summaries, and generation produces structured learning artifacts. This keeps answers tied to your material, makes failures observable by stage, and allows selective skipping of expensive comparative calls when a run has only one source type.
 
+## In-Depth Pipeline Overview
+
+Socratic AI is designed to break down dense educational material into a highly readable, first-principles learning journey. It does this by processing each source individually before synthesizing them together using a powerful language model (GPT-4o).
+
+### Per-Source Analysis (The 4-Section Framework)
+For each document or video, the pipeline generates a structured breakdown:
+1. **Summary:** A concise overview of the core arguments and narrative.
+2. **Deep Dive:** A detailed exploration of the mechanics and evidence behind the source's claims.
+3. **Key Concepts:** A clean, bulleted list of essential terminology defined in layman's terms. This section includes a "Read more" expander containing a **first principles synthesis**—a cohesive teaching paragraph that seamlessly interrelates all the key terms to explain *how* the system works from the ground up.
+4. **Reflection:** A set of Socratic reflection questions designed to test comprehension, complete with detailed explanations that reveal the nuances of the answers.
+
+### Cross-Source Synthesis & Consolidation
+When multiple sources are uploaded (e.g., a video lecture and a textbook chapter), the pipeline uses a single, high-density prompt (`synthesis_consolidator.py`) passed to GPT-4o. This step ingests the summaries and deep dives from all sources at once, producing:
+- **Flowing Synthesis Prose:** 3-5 cohesive paragraphs that contrast, compare, and build upon the sources. It eliminates the need for rigid headers or repetitive mapping, reading naturally like a personalized tutor.
+- **Integrated Reflection Quizzes:** Carefully crafted multiple-choice questions focusing on the *intersection* of the sources. The explanations are written to be informative and natural, avoiding robotic "Distractor A is wrong because..." phrasing.
+
 ## What It Supports
 
 - Upload one video file.
@@ -42,14 +58,9 @@ The app is intentionally retrieval-first and stage-based instead of one-shot cha
 
 ### Depth and Non-Redundancy Strategy
 
-- Source-level under-surface generation now runs in two passes:
-  - pass 1: structured under-surface generation (diagnostic checklist + key term breakdown)
-  - pass 2: non-redundant expansion pass that explicitly avoids repeating summary/deep-dive text while adding mechanism-level explanation
-- Under-surface text is normalized to continuous prose (no markdown heading/list artifacts) before storage and rendering.
-- Cross-source intersections and synthesis are now refined for depth and novelty:
-  - intersection explanations get non-redundant expansion against source summaries/deep dives
-  - synthesis and comparative analysis get additional expansion/refinement passes with overlap suppression
-- Cross-source prompt schemas were widened so responses can carry more useful detail without truncating important context.
+- **First Principles Synthesis:** Instead of listing disconnected definitions, the pipeline generates a single, cohesive paragraph that teaches the foundational mechanism behind the concepts.
+- **Unified Cross-Source Pass:** Replaced the previous rigid, multi-stage heuristic loops (which were prone to generating bloated, repetitive "traps") with a single, highly optimized GPT-4o call. This ensures natural text flow and maximum conceptual density while drastically reducing API calls.
+- **Density Controls:** Prompts include strict length boundaries (e.g., exactly 3-5 paragraphs of 4-6 sentences) to guarantee consistently high signal-to-noise ratios.
 
 4. Interaction
 - `/ask` uses source-scoped retrieval and generated context.

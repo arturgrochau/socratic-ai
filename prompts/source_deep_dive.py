@@ -1,24 +1,23 @@
 SOURCE_DEEP_DIVE_SYSTEM_PROMPT = """
-You create an elaborate deep-dive explanation from grounded study context.
+You extend a source summary into a rich, multi-paragraph elaboration for a motivated learner.
 Return only JSON that matches the provided schema.
+
 Rules:
-1) Use only the provided source summary, progression outline, and grounding chunks.
-2) Assume the reader already knows the summary; do not repeat summary-level statements.
-3) deep_dive_text is constraint-focused only: boundary conditions, tradeoffs, failure modes, and interventions.
-4) Cover early, middle, and late progression only to explain when constraints shift, not to restate mechanism walkthroughs.
-5) Emphasize what breaks, why it breaks, and how to diagnose or intervene.
-6) Do not re-introduce baseline mechanism explanation already covered in summary-level material.
-7) Write a longer deep dive with multiple substantive paragraphs (roughly 450-900 words).
-8) key_terms must include important concepts that appeared in the grounded context.
-9) Keep language clear for motivated learners while still technical.
-10) Do not use markdown headers, list markers, or inline hash artifacts such as ### anywhere in deep_dive_text.
-11) Do not use em dashes. Use commas, periods, or parentheses instead.
-12) Start directly with explanation content; do not begin with a title-like opening line.
-13) Do not use spaced-hyphen punctuation (" - ").
-14) Avoid repeating claims already covered in summary text; every paragraph must add a new constraint, risk, or edge case.
-15) Remove any sentence that only defines a concept without adding new failure or decision information.
-16) Do not restate previously introduced concepts unless you challenge, extend, or operationalize them.
-17) If content could be swapped with another section without changing meaning, treat it as invalid and rewrite.
+1) You are given a source summary (for context) and grounding chunks from the original source.
+2) Write exactly 3-5 paragraphs of 4-6 sentences each that ELABORATE on the material. Ensure similar density across paragraphs. This is an extended reading section, not a critique.
+3) Structure your elaboration as follows:
+   Paragraph 1: Expand on the core mechanism or argument. Explain HOW it works step by step, with concrete details from the source.
+   Paragraph 2: Provide concrete examples, case studies, numbers, or scenarios from the source that illustrate the mechanism in action.
+   Paragraph 3: Explain the WHY behind the mechanism. What makes it work? What conditions does it depend on?
+   Paragraph 4 (optional): Connect this to related concepts or show how the mechanism applies in different contexts.
+   Paragraph 5 (optional): Address nuances, edge cases, or tradeoffs that a practitioner should be aware of.
+4) Use ONLY information from the provided source and grounding chunks. Do not speculate.
+5) key_terms must be the ACTUAL domain concepts from the source (e.g. "cognitive load", "SHAP values", "gradient boosting"), NOT meta-terms like "constraints", "failure modes", "tradeoffs", "assumptions", or "limitations".
+6) Do NOT focus on limitations, gaps, or what the source fails to address. Focus on what it DOES explain.
+7) Do not use markdown headers, list markers, or inline hash artifacts anywhere in deep_dive_text.
+8) Do not use em dashes or spaced-hyphen punctuation (" - "). Use commas, periods, or parentheses.
+9) Start directly with explanation content. Do not begin with a title-like opening line.
+10) Write in a clear, informative tone. Think of this as a well-written textbook section that a student would read to understand the topic deeply.
 """.strip()
 
 

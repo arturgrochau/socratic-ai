@@ -1,28 +1,17 @@
 COMBINED_INSIGHTS_SYSTEM_PROMPT = """
-You synthesize insights across a video and documents.
+You extract cross-source relationships from consolidated source sections.
 Return only JSON that matches the provided schema.
 Rules:
-1) Use only provided summaries, grounding chunks, and relationship notes.
-2) This stage is connection-only: establish how sources relate, where concepts align, and what shared mechanism exists.
-3) Do not perform full dependency analysis, tradeoff analysis, or scenario application in this stage.
-4) attributed_sentences must be short sentence-level snippets with valid source attribution.
-5) inferred_extension is allowed only for high-impact conceptual extension and must be clearly labeled with inference_label='inferred_extension'.
-6) Make the layman_bridge practical and easy to apply.
-7) synthesis_text should explain connections and relationship structure only, without repeating source-by-source summaries.
+1) Use only the provided consolidated source sections.
+2) Identify intersections: where do sources share, reinforce, or challenge each other?
+3) Identify tensions: where do sources disagree or create constraints for each other?
+4) Identify transfer bridges: how can insights from one source be applied to the other?
+5) attributed_sentences must be short sentence-level snippets with valid source attribution.
+6) Keep outputs bounded and focused: concise titles, compact attributed sentences, no unnecessary repetition.
+7) Do not re-summarize individual sources; focus on RELATIONSHIPS between them.
 8) emphasis_terms should include important keywords for each sentence.
-9) Keep outputs bounded and focused: concise titles, compact attributed sentences, and no unnecessary repetition.
-10) Avoid markdown headings and list formatting inside layman_bridge and synthesis_text.
-11) For each integrated_explanation, include mechanism-level linkage and one practical implication of that linkage.
-12) Minimize redundancy across intersections, layman_bridge, and synthesis_text; each section must add new relational information.
-13) Do not use em dashes; use commas, periods, or parentheses.
-14) Do not use spaced-hyphen punctuation (" - ").
-15) Prefer fresh grounded examples in each section rather than reusing the same example family.
-16) This is the only stage allowed to perform explicit source mapping, do not perform later-stage reasoning tasks.
-17) Do not restate previously introduced concepts unless they are being challenged, extended, or operationalized.
-18) If this output could be swapped with any later stage without meaning change, it is invalid.
-19) Use explicit mapping language in each intersection (for example: connect, overlap, shared, between, both, across).
-20) Keep mapping prose compressed: one core idea per paragraph and at most 2 short paragraphs per integrated_explanation.
-21) Remove sentences that introduce tradeoff prescriptions, transfer playbooks, or decision recommendations.
+9) Do not use em dashes; use commas, periods, or parentheses.
+10) Do not use spaced-hyphen punctuation (" - ").
 """.strip()
 
 
@@ -35,8 +24,8 @@ COMBINED_INSIGHTS_JSON_SCHEMA = {
         "properties": {
             "intersections": {
                 "type": "array",
-                "minItems": 3,
-                "maxItems": 7,
+                "minItems": 2,
+                "maxItems": 5,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -46,8 +35,8 @@ COMBINED_INSIGHTS_JSON_SCHEMA = {
                         "integrated_explanation": {"type": "string", "maxLength": 3600},
                         "attributed_sentences": {
                             "type": "array",
-                            "minItems": 3,
-                            "maxItems": 10,
+                            "minItems": 2,
+                            "maxItems": 8,
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
@@ -94,9 +83,39 @@ COMBINED_INSIGHTS_JSON_SCHEMA = {
                     ],
                 },
             },
-            "layman_bridge": {"type": "string", "maxLength": 1800},
-            "synthesis_text": {"type": "string", "maxLength": 8400},
+            "tensions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "title": {"type": "string", "maxLength": 140},
+                        "source_a_claim": {"type": "string", "maxLength": 400},
+                        "source_b_claim": {"type": "string", "maxLength": 400},
+                        "resolution_or_tradeoff": {"type": "string", "maxLength": 600},
+                    },
+                    "required": ["title", "source_a_claim", "source_b_claim", "resolution_or_tradeoff"],
+                },
+            },
+            "transfer_bridges": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "from_source_id": {"type": "integer"},
+                        "to_source_id": {"type": "integer"},
+                        "transfer_mechanism": {"type": "string", "maxLength": 500},
+                        "adaptation_needed": {"type": "string", "maxLength": 400},
+                    },
+                    "required": ["from_source_id", "to_source_id", "transfer_mechanism", "adaptation_needed"],
+                },
+            },
         },
-        "required": ["intersections", "layman_bridge", "synthesis_text"],
+        "required": ["intersections", "tensions", "transfer_bridges"],
     },
 }

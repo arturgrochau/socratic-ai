@@ -679,16 +679,16 @@ def _build_source_export_markdown(section_payload: dict, *, fallback_title: str)
     lines.append("")
 
     _append_export_markdown_section(lines, "Summary", str(section_payload.get("summary_text") or ""))
-    _append_export_markdown_section(lines, "Deep Dive", str(section_payload.get("deep_dive_text") or ""))
+    _append_export_markdown_section(lines, "Boundary Conditions & Failure Modes", str(section_payload.get("deep_dive_text") or ""))
     _append_export_markdown_section(
         lines,
-        "Why This Works Under the Surface",
+        "Hidden Assumptions & System Limits",
         str(section_payload.get("under_surface_explainer") or ""),
     )
 
     diagnostic_checklist = section_payload.get("diagnostic_checklist") or []
     if diagnostic_checklist:
-        lines.append("### Diagnostic Checklist")
+        lines.append("### Practitioner Checks")
         for item in diagnostic_checklist:
             cleaned_item = _normalize_continuous_text_for_display(str(item))
             if cleaned_item:
@@ -702,13 +702,13 @@ def _build_source_export_markdown(section_payload: dict, *, fallback_title: str)
             if isinstance(point, dict):
                 question = _normalize_continuous_text_for_display(str(point.get("question") or ""))
                 explanation = _normalize_continuous_text_for_display(str(point.get("explanation") or ""))
-                under_the_hood = _normalize_continuous_text_for_display(str(point.get("under_the_hood") or ""))
+                reasoning_traps = _normalize_continuous_text_for_display(str(point.get("reasoning_traps") or point.get("under_the_hood") or ""))
                 if question:
                     lines.append(f"{index}. {question}")
                 if explanation:
                     lines.append(f"   - Why: {explanation}")
-                if under_the_hood:
-                    lines.append(f"   - Under the hood: {under_the_hood}")
+                if reasoning_traps:
+                    lines.append(f"   - Reasoning traps: {reasoning_traps}")
             else:
                 cleaned_point = _normalize_continuous_text_for_display(str(point))
                 if cleaned_point:
@@ -842,11 +842,11 @@ def _build_generation_export_markdown(generation_result: dict, *, user_id: str) 
             explanation = _normalize_continuous_text_for_display(str(question_payload.get("explanation") or ""))
             if explanation:
                 lines.append(f"- Why this is correct: {explanation}")
-            under_the_hood = _normalize_continuous_text_for_display(
-                str(question_payload.get("under_the_hood") or "")
+            reasoning_traps = _normalize_continuous_text_for_display(
+                str(question_payload.get("reasoning_traps") or question_payload.get("under_the_hood") or "")
             )
-            if under_the_hood:
-                lines.append(f"- Under the hood: {under_the_hood}")
+            if reasoning_traps:
+                lines.append(f"- Reasoning traps: {reasoning_traps}")
             lines.append("")
 
     study_advice = _normalize_continuous_text_for_display(str(quiz_payload.get("study_advice") or ""))
@@ -972,35 +972,6 @@ def _text_overlap_ratio(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / float(min(len(left_tokens), len(right_tokens)))
 
 
-def _render_integrated_cross_source_analysis(
-    *,
-    layman_bridge: str,
-    synthesis_text: str,
-    comparative_analysis: str,
-    emphasis_terms: list[str],
-) -> None:
-    cleaned_bridge = _normalize_continuous_text_for_display(layman_bridge)
-    cleaned_synthesis = _normalize_continuous_text_for_display(synthesis_text)
-    cleaned_comparative = _normalize_continuous_text_for_display(comparative_analysis)
-
-    if not any([cleaned_bridge, cleaned_synthesis, cleaned_comparative]):
-        return
-
-    constraint_parts = [part for part in [cleaned_synthesis, cleaned_comparative] if part]
-    if cleaned_bridge and not constraint_parts:
-        constraint_parts.append(cleaned_bridge)
-
-    if constraint_parts:
-        st.markdown("### 2) Constraint or Breakdown")
-        merged_constraint_text = " ".join(constraint_parts).strip()
-        st.markdown(
-            _bold_keywords_in_text(
-                _format_long_prose_markdown(merged_constraint_text, max_sentences_per_paragraph=4),
-                emphasis_terms,
-            )
-        )
-
-
 def _render_reflection_points(
     reflection_points: list[dict] | list[str],
     *,
@@ -1019,35 +990,16 @@ def _render_reflection_points(
 
         question = str(point.get("question", "")).strip()
         explanation = str(point.get("explanation", "")).strip()
-        under_the_hood = str(point.get("under_the_hood", "")).strip()
+        reasoning_traps = str(point.get("reasoning_traps") or point.get("under_the_hood") or "").strip()
         depth_level = str(point.get("depth_level", "")).strip()
 
-        st.markdown(f"**{index}. {question}**")
-        if depth_level:
-            st.caption(f"Depth: {depth_level}")
+        st.markdown(f"**Q{index}. {question}**")
         if explanation:
             st.markdown(_format_long_prose_markdown(explanation))
-        if under_the_hood:
-            with st.expander(f"Why this works under the surface (point {index})"):
-                cleaned_under_the_hood = _normalize_continuous_text_for_display(under_the_hood)
-                st.markdown(_format_long_prose_markdown(cleaned_under_the_hood, max_sentences_per_paragraph=4))
-                if st.button(
-                    "Elaborate further in chat",
-                    key=f"elaborate_reflection_{source_key}_{index}",
-                    use_container_width=False,
-                ):
-                    _queue_chat_navigation(
-                        _build_elaboration_chat_prompt(
-                            context_label=f"{source_label} | reflection point {index}",
-                            under_surface_text=under_the_hood,
-                            key_terms=key_terms,
-                            point_question=question,
-                            point_explanation=explanation,
-                            depth_level=depth_level,
-                        ),
-                        auto_submit=True,
-                    )
-                    st.rerun()
+        if reasoning_traps:
+            with st.expander("Read more"):
+                cleaned_reasoning_traps = _normalize_continuous_text_for_display(reasoning_traps)
+                st.markdown(_format_long_prose_markdown(cleaned_reasoning_traps, max_sentences_per_paragraph=4))
 
 
 def _render_source_learning_section(section_payload: dict) -> None:
@@ -1077,6 +1029,11 @@ def _render_source_learning_section(section_payload: dict) -> None:
                 continue
 
             candidate_norm = _normalize(candidate)
+            # Strip markdown heading markers.
+            candidate = re.sub(r"^#{1,6}\s*", "", candidate).strip()
+            if not candidate:
+                continue
+
             if not cleaned_lines:
                 if title_norm and candidate_norm == title_norm:
                     continue
@@ -1084,11 +1041,15 @@ def _render_source_learning_section(section_payload: dict) -> None:
                     candidate_norm == "summary"
                     or candidate_norm.startswith("summary of")
                     or candidate_norm in {"video summary", "document summary"}
+                    or candidate_norm.startswith("core thesis")
+                    or candidate_norm.startswith("key mechanisms")
+                    or candidate_norm.startswith("practical implications")
                 ):
                     continue
                 if section_kind == "deep_dive" and (
                     candidate_norm == "deep dive"
                     or candidate_norm.startswith("deep dive")
+                    or candidate_norm.startswith("boundary conditions")
                 ):
                     continue
 
@@ -1100,6 +1061,10 @@ def _render_source_learning_section(section_payload: dict) -> None:
 
         return cleaned_text
 
+    key_terms = section_payload.get("key_terms", []) or []
+    normalized_terms = [str(term) for term in key_terms]
+
+    # === SECTION 1: Summary ===
     st.subheader(source_label)
     if source_name and _normalize(source_name) != _normalize(generated_title):
         st.caption(source_name)
@@ -1108,66 +1073,108 @@ def _render_source_learning_section(section_payload: dict) -> None:
         generated_title,
         "summary",
     )
-    _render_structured_summary(summary_text)
+    if summary_text:
+        summary_text = _normalize_continuous_text_for_display(summary_text)
+        st.markdown(
+            _bold_keywords_in_text(
+                _format_long_prose_markdown(summary_text, max_sentences_per_paragraph=4),
+                normalized_terms,
+            )
+        )
 
-    key_terms = section_payload.get("key_terms", []) or []
-    normalized_terms = [str(term) for term in key_terms]
-    _render_key_terms(normalized_terms)
-
+    # === SECTION 2: Deep Dive (merged boundary analysis + hidden assumptions) ===
     deep_dive_text = _clean_block(
         str(section_payload.get("deep_dive_text", "")),
         generated_title,
         "deep_dive",
     )
+    under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
+    diagnostic_checklist = section_payload.get("diagnostic_checklist", []) or []
+
+    # Merge deep dive + under surface into one flowing section.
+    deep_dive_parts: list[str] = []
     if deep_dive_text:
-        deep_dive_text = _normalize_continuous_text_for_display(deep_dive_text)
+        deep_dive_parts.append(_normalize_continuous_text_for_display(deep_dive_text))
+    if under_surface_text:
+        deep_dive_parts.append(_normalize_continuous_text_for_display(under_surface_text))
+
+    if deep_dive_parts:
         st.markdown("### Deep Dive")
+        merged_deep = "\n\n".join(deep_dive_parts)
         st.markdown(
             _bold_keywords_in_text(
-                _format_long_prose_markdown(deep_dive_text),
+                _format_long_prose_markdown(merged_deep, max_sentences_per_paragraph=4),
                 normalized_terms,
             )
         )
 
-    under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
-    if under_surface_text:
-        with st.expander("Why this works under the surface"):
-            normalized_under_surface = _normalize_continuous_text_for_display(under_surface_text)
-            formatted_under_surface = _format_long_prose_markdown(
-                normalized_under_surface,
-                max_sentences_per_paragraph=4,
-            )
-            st.markdown(_bold_keywords_in_text(formatted_under_surface, normalized_terms))
-
-            diagnostic_checklist = section_payload.get("diagnostic_checklist", []) or []
-            if diagnostic_checklist:
-                st.markdown("**Diagnostic checklist**")
+        if diagnostic_checklist:
+            with st.expander("Read more"):
                 for item in diagnostic_checklist:
-                    st.markdown(f"- {item}")
+                    cleaned_item = _normalize_continuous_text_for_display(str(item))
+                    if cleaned_item:
+                        st.markdown(f"- {cleaned_item}")
 
-            if st.button(
-                "Elaborate further in chat",
-                key=f"elaborate_under_surface_{source_key}",
-                use_container_width=False,
-            ):
-                _queue_chat_navigation(
-                    _build_elaboration_chat_prompt(
-                        context_label=source_label,
-                        under_surface_text=normalized_under_surface,
-                        key_terms=normalized_terms,
-                    ),
-                    auto_submit=True,
-                )
-                st.rerun()
+    # === SECTION 3: Key Concepts (layman + collapsible first principles) ===
+    key_term_explanations = section_payload.get("key_term_explanations", []) or []
+    first_principles_synthesis = str(section_payload.get("first_principles_synthesis", "")).strip()
 
+    if normalized_terms:
+        st.markdown("### Key Concepts")
+
+        with st.container(border=True):
+            if key_term_explanations:
+                # Render each term as a bullet point with layman explanation.
+                for term_entry in key_term_explanations:
+                    if not isinstance(term_entry, dict):
+                        continue
+                    term_name = str(term_entry.get("term", "")).strip()
+                    term_layman = str(term_entry.get("layman", "")).strip()
+                    if not term_name:
+                        continue
+
+                    if term_layman:
+                        st.markdown(f"• **{term_name}** &mdash; {term_layman}")
+                    else:
+                        st.markdown(f"• **{term_name}**")
+
+                if first_principles_synthesis:
+                    with st.expander("Read more"):
+                        st.markdown(first_principles_synthesis)
+                else:
+                    # Fallback for old schema
+                    technical_parts = []
+                    for term_entry in key_term_explanations:
+                        if isinstance(term_entry, dict):
+                            tech = str(term_entry.get("technical", "")).strip()
+                            if tech:
+                                technical_parts.append(tech)
+                            else:
+                                term_explanation = str(term_entry.get("explanation", "")).strip()
+                                if term_explanation:
+                                    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', term_explanation) if s.strip()]
+                                    if len(sentences) > 2:
+                                        technical_parts.append(" ".join(sentences[2:]))
+                    if technical_parts:
+                        with st.expander("Read more"):
+                            st.markdown(" ".join(technical_parts))
+            else:
+                # Fallback: show key terms as badges when no detailed explanations exist.
+                formatted = " ".join(f"• **{term.strip()}**" for term in normalized_terms if term.strip())
+                if formatted:
+                    st.markdown(formatted)
+                    st.caption("Detailed definitions will be generated in the next run.")
+
+    # === SECTION 4: Socratic Reflection ===
     reflection_points = section_payload.get("reflection_points", []) or []
-    st.markdown("### Socratic Reflection Points")
-    _render_reflection_points(
-        reflection_points,
-        source_label=source_label,
-        source_key=source_key,
-        key_terms=normalized_terms,
-    )
+    if reflection_points:
+        st.markdown("### Reflection")
+        _render_reflection_points(
+            reflection_points,
+            source_label=source_label,
+            source_key=source_key,
+            key_terms=normalized_terms,
+        )
 
 
 def _render_ask_result() -> None:
@@ -1292,7 +1299,7 @@ def _render_grouped_evidence(
     if not evidence_items:
         return
 
-    with st.expander("Show grounded mechanism evidence", expanded=False):
+    with st.expander("Show grounded excerpts", expanded=False):
         keyword_terms: list[str] = []
         seen_terms: set[str] = set()
         for _, _, terms in evidence_items:
@@ -1309,7 +1316,7 @@ def _render_grouped_evidence(
 
         if keyword_terms:
             joined_keywords = ", ".join(f"**{term}**" for term in keyword_terms)
-            st.markdown(f"First-principles keywords: {joined_keywords}")
+            st.markdown(f"Shared keywords: {joined_keywords}")
 
         summary = _build_first_principles_evidence_summary(evidence_items)
         if summary:
@@ -1590,181 +1597,43 @@ def _render_generation_tabs(has_user_id: bool) -> None:
                     _render_source_learning_section(section_payload)
 
     if selected_section == "Cross-Source Synthesis & Assessment":
-        st.markdown("### 1) Mapping")
+        st.markdown("### Cross-Source Synthesis")
 
-        intersections = insights_payload.get("intersections", []) or []
-        all_cross_attributed_sentences: list[dict] = []
-        if intersections:
-            for index, intersection in enumerate(intersections, start=1):
-                if not isinstance(intersection, dict):
-                    continue
-
-                title = str(intersection.get("intersection_title", f"Intersection {index}")).strip()
-                why_it_matters = str(intersection.get("why_it_matters", "")).strip()
-                integrated_explanation = str(intersection.get("integrated_explanation", "")).strip()
-
-                with st.container(border=True):
-                    st.markdown(f"#### {title or f'Intersection {index}'}")
-
-                    attributed_sentences = [
-                        item
-                        for item in (intersection.get("attributed_sentences", []) or [])
-                        if isinstance(item, dict)
-                        and int(item.get("source_id", 0) or 0) in source_label_map
-                    ]
-                    all_cross_attributed_sentences.extend(attributed_sentences)
-                    emphasis_terms = _collect_emphasis_terms(attributed_sentences)
-
-                    if why_it_matters:
-                        st.markdown(
-                            f"**Why it matters:** {_bold_keywords_in_text(why_it_matters, emphasis_terms)}"
-                        )
-                    if integrated_explanation:
-                        cleaned_integrated = _normalize_continuous_text_for_display(integrated_explanation)
-                        st.markdown(
-                            _bold_keywords_in_text(
-                                _format_long_prose_markdown(cleaned_integrated, max_sentences_per_paragraph=4),
-                                emphasis_terms,
-                            )
-                        )
-
-                    if emphasis_terms:
-                        concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
-                        st.caption(f"Key concepts: {concept_list}")
-
-                    _render_grouped_evidence(
-                        attributed_sentences,
-                        source_label_map=source_label_map,
-                    )
-
-                    ask_about_intersection = st.button(
-                        "Elaborate further",
-                        key=f"ask_intersection_{index}",
-                        use_container_width=False,
-                    )
-                    if ask_about_intersection:
-                        _queue_chat_navigation(_build_intersection_chat_prefill(
-                            title=title or f"Intersection {index}",
-                            why_it_matters=why_it_matters,
-                            emphasis_terms=emphasis_terms,
-                            attributed_sentences=attributed_sentences,
-                        ), auto_submit=True)
-                        st.rerun()
-
-                    inferred_extension = str(intersection.get("inferred_extension") or "").strip()
-                    inference_label = str(intersection.get("inference_label") or "").strip()
-                    if inferred_extension and inference_label == "inferred_extension":
-                        with st.expander("Inferred extension (conceptual deepening)"):
-                            st.markdown(inferred_extension)
-        else:
-            parallels = insights_payload.get("parallels", []) or []
-            if parallels:
-                with st.container(border=True):
-                    st.markdown("#### Core Cross-Source Intersection")
-                    normalized_parallels = [
-                        item
-                        for item in parallels
-                        if isinstance(item, dict)
-                        and int(item.get("source_id", 0) or 0) in source_label_map
-                    ]
-                    all_cross_attributed_sentences.extend(normalized_parallels)
-                    emphasis_terms = _collect_emphasis_terms(normalized_parallels)
-                    if emphasis_terms:
-                        concept_list = ", ".join(f"**{term}**" for term in emphasis_terms)
-                        st.caption(f"Key concepts: {concept_list}")
-                    _render_grouped_evidence(
-                        normalized_parallels,
-                        source_label_map=source_label_map,
-                    )
-
-                    ask_about_core = st.button(
-                        "Elaborate further",
-                        key="ask_core_intersection",
-                        use_container_width=False,
-                    )
-                    if ask_about_core:
-                        _queue_chat_navigation(_build_intersection_chat_prefill(
-                            title="Core Cross-Source Intersection",
-                            why_it_matters="Help me understand the strongest overlap across my sources.",
-                            emphasis_terms=emphasis_terms,
-                            attributed_sentences=normalized_parallels,
-                        ), auto_submit=True)
-                        st.rerun()
-            else:
-                st.write("No intersections available.")
-
-        cross_emphasis_terms = _collect_emphasis_terms(all_cross_attributed_sentences)
-
-        layman_bridge = str(insights_payload.get("layman_bridge", "")).strip()
         synthesis_text = str(insights_payload.get("synthesis_text", "")).strip()
-        comparative_analysis = str(insights_payload.get("comparative_analysis") or "").strip()
-        _render_integrated_cross_source_analysis(
-            layman_bridge=layman_bridge,
-            synthesis_text=synthesis_text,
-            comparative_analysis=comparative_analysis,
-            emphasis_terms=cross_emphasis_terms,
-        )
+        if synthesis_text:
+            cleaned_synthesis = _normalize_continuous_text_for_display(synthesis_text)
+            st.markdown(_format_long_prose_markdown(cleaned_synthesis, max_sentences_per_paragraph=4))
 
-        application_scenarios = insights_payload.get("application_scenarios", []) or []
-        if application_scenarios:
-            st.markdown("### 3) Transfer and Adaptation")
-            for index, scenario in enumerate(application_scenarios, start=1):
-                if not isinstance(scenario, dict):
-                    continue
-                scenario_title = str(scenario.get("scenario_title") or f"Scenario {index}").strip()
-                scenario_prompt = str(scenario.get("scenario_prompt") or "").strip()
-                transfer_steps = scenario.get("transfer_steps") or []
-                common_pitfall = str(scenario.get("common_pitfall") or "").strip()
-
-                with st.container(border=True):
-                    st.markdown(f"#### {scenario_title}")
-                    if scenario_prompt:
-                        st.markdown(f"**Prompt:** {scenario_prompt}")
-                    if transfer_steps:
-                        st.markdown("**Transfer steps**")
-                        for step_index, step_text in enumerate(transfer_steps, start=1):
-                            st.markdown(f"{step_index}. {step_text}")
-                    if common_pitfall:
-                        st.warning(f"Common pitfall: {common_pitfall}")
-
-        st.markdown("### 4) Decision and Implication")
+        st.markdown("### Quiz")
         questions = quiz_payload.get("questions", []) or []
         if not questions:
             st.write("No quiz questions available.")
         else:
-            for index, question_payload in enumerate(questions, start=1):
-                difficulty_level = str(question_payload.get("difficulty_level", "")).strip()
-                question_type = str(question_payload.get("question_type", "")).strip()
-                st.markdown(f"**Q{index}. {question_payload.get('question', '')}**")
-                if difficulty_level or question_type:
-                    st.caption(f"Level: {difficulty_level or 'n/a'} | Type: {question_type or 'n/a'}")
+            with st.container(border=True):
+                for index, question_payload in enumerate(questions, start=1):
+                    st.markdown(f"**Q{index}. {question_payload.get('question', '')}**")
+                    options = question_payload.get("options", []) or []
+                    labels = ["A)", "B)", "C)", "D)"]
+                    for option_index, option_text in enumerate(options):
+                        label = labels[option_index] if option_index < len(labels) else f"{option_index+1}."
+                        st.write(f"{label} {option_text}")
 
-                options = question_payload.get("options", []) or []
-                for option_index, option_text in enumerate(options, start=1):
-                    st.write(f"{option_index}. {option_text}")
-
-                answer_index = int(question_payload.get("answer_index", 0))
-                explanation = str(question_payload.get("explanation", "")).strip()
-                under_the_hood = str(question_payload.get("under_the_hood", "")).strip()
-                source_evidence = question_payload.get("source_evidence", []) or []
-                with st.expander(f"Show answer for Q{index}"):
-                    if options and 0 <= answer_index < len(options):
-                        st.write(f"Correct answer: {options[answer_index]}")
-                    if explanation:
-                        st.markdown("**Why this is correct**")
-                        st.markdown(explanation)
-                    if under_the_hood:
-                        st.markdown("**Why this works under the surface**")
-                        st.markdown(under_the_hood)
-                    if source_evidence:
-                        st.markdown("**Supporting references**")
-                        for evidence in source_evidence:
-                            st.markdown(f"- {evidence}")
-
-        study_advice = str(quiz_payload.get("study_advice", "")).strip()
-        if study_advice:
-            st.markdown("### Study Advice")
-            st.markdown(study_advice)
+                    answer_index = int(question_payload.get("answer_index", 0))
+                    explanation = str(question_payload.get("explanation", "")).strip()
+                    under_the_hood = str(question_payload.get("reasoning_traps") or question_payload.get("under_the_hood") or "").strip()
+                    
+                    with st.expander("Show answer"):
+                        if options and 0 <= answer_index < len(options):
+                            st.write(f"**Correct answer:** {options[answer_index]}")
+                        
+                        full_explanation_parts = []
+                        if explanation:
+                            full_explanation_parts.append(explanation)
+                        if under_the_hood:
+                            full_explanation_parts.append(under_the_hood)
+                        
+                        if full_explanation_parts:
+                            st.markdown(" ".join(full_explanation_parts))
 
     if selected_section == "Socratic Chatbox":
         _render_ask_tab(has_user_id)

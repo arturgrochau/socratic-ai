@@ -16,39 +16,51 @@ from app.linking import link_source_pair
 from app.models import (
     ApplicationScenario,
     AttributedSentence,
+    ClaimLedgerEntry,
     CombinedInsightSection,
     CombinedQuizSection,
+    CrossSourceTension,
     GenerateTailoredLearningResponse,
     InsightIntersection,
     KeyTermExplanation,
     QuizQuestion,
     ReflectionPoint,
     SourceLearningSection,
+    TransferBridge,
 )
 from app.processing import get_source_metadata, load_existing_source_summary, process_source
 from config import (
     CACHE_PROCESSED_SOURCES,
+    CONSOLIDATION_MODEL,
     ENABLE_STRICT_GENERATION_GATES,
     ENABLE_GENERATION_CRITIC_FALLBACK,
     GENERATION_CRITIC_MODEL,
     GENERATION_MODEL,
+    MAX_CHUNK_DIFF_WINDOWS,
     MAX_CROSS_CRITIC_CALLS_PER_RUN,
     MAX_SOURCE_CRITIC_CALLS_PER_RUN,
     db_engine,
     openai_client,
 )
-from prompts.combined_insights import (
-    COMBINED_INSIGHTS_JSON_SCHEMA,
-    COMBINED_INSIGHTS_SYSTEM_PROMPT,
+from prompts.synthesis_consolidator import (
+    SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
+    SYNTHESIS_CONSOLIDATOR_SYSTEM_PROMPT,
 )
-from prompts.combined_quiz import COMBINED_QUIZ_JSON_SCHEMA, COMBINED_QUIZ_SYSTEM_PROMPT
-from prompts.comparative_analysis import (
-    COMPARATIVE_ANALYSIS_JSON_SCHEMA,
-    COMPARATIVE_ANALYSIS_SYSTEM_PROMPT,
+from prompts.chunk_diff import (
+    CHUNK_DIFF_JSON_SCHEMA,
+    CHUNK_DIFF_SYSTEM_PROMPT,
 )
-from prompts.application_scenarios import (
-    APPLICATION_SCENARIOS_JSON_SCHEMA,
-    APPLICATION_SCENARIOS_SYSTEM_PROMPT,
+from prompts.source_consolidator import (
+    SOURCE_CONSOLIDATOR_JSON_SCHEMA,
+    SOURCE_CONSOLIDATOR_SYSTEM_PROMPT,
+)
+from prompts.synthesis_consolidator import (
+    SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
+    SYNTHESIS_CONSOLIDATOR_SYSTEM_PROMPT,
+)
+from prompts.noncomparative_quiz import (
+    NONCOMPARATIVE_QUIZ_JSON_SCHEMA,
+    NONCOMPARATIVE_QUIZ_SYSTEM_PROMPT,
 )
 from prompts.socratic_reflection import (
     SOCRATIC_REFLECTION_JSON_SCHEMA,
@@ -362,6 +374,7 @@ def _run_structured_generation_step(
     system_prompt: str,
     response_schema: dict[str, Any],
     required_keys: list[str] | None = None,
+    model_name: str = GENERATION_MODEL,
 ) -> dict[str, Any]:
     last_error_detail = "Retry budget exhausted."
 
@@ -377,7 +390,7 @@ def _run_structured_generation_step(
 
         try:
             completion = openai_client.chat.completions.create(
-                model=GENERATION_MODEL,
+                model=model_name,
                 temperature=0,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -389,7 +402,7 @@ def _run_structured_generation_step(
                 response=completion,
                 user_id=user_id,
                 call_stage="generation",
-                model_name=GENERATION_MODEL,
+                model_name=model_name,
             )
 
             content = completion.choices[0].message.content
@@ -557,6 +570,10 @@ def ensure_generation_tables() -> None:
         if "key_term_explanations_json" not in source_columns:
             connection.execute(
                 text("ALTER TABLE source_learning_sections ADD COLUMN key_term_explanations_json TEXT DEFAULT '[]'")
+            )
+        if "first_principles_synthesis" not in source_columns:
+            connection.execute(
+                text("ALTER TABLE source_learning_sections ADD COLUMN first_principles_synthesis TEXT DEFAULT ''")
             )
 
         connection.execute(
@@ -2292,7 +2309,7 @@ def _find_worst_overlap_pair(
 
 def _reflection_points_to_text(reflection_points: list[ReflectionPoint]) -> str:
     return " ".join(
-        " ".join(part for part in [point.question, point.explanation, point.under_the_hood] if part)
+        " ".join(part for part in [point.question, point.explanation, point.reasoning_traps] if part)
         for point in reflection_points
     ).strip()
 
@@ -2302,10 +2319,11 @@ def _apply_source_hard_cuts(
     summary_text: str,
     deep_dive_text: str,
     under_surface_explainer: str,
+    first_principles_synthesis: str,
     reflection_points: list[ReflectionPoint],
     diagnostic_checklist: list[str],
     key_term_explanations: list[KeyTermExplanation],
-) -> tuple[str, str, list[ReflectionPoint], list[str], list[KeyTermExplanation], list[str]]:
+) -> tuple[str, str, str, list[ReflectionPoint], list[str], list[KeyTermExplanation], list[str]]:
     cut_priority = {
         "reflection": 0,
         "under_surface": 1,
@@ -2359,6 +2377,7 @@ def _apply_source_hard_cuts(
     return (
         current_deep_dive,
         current_under_surface,
+        first_principles_synthesis,
         current_reflection_points,
         current_diagnostic_checklist,
         current_key_term_explanations,
@@ -2490,16 +2509,130 @@ def _generate_source_title(summary_text: str, source_type: str, user_id: str, ru
     return title
 
 
+def _build_chunk_windows(
+    grounding_chunks: list[str],
+    *,
+    window_size: int = 4,
+    max_windows: int | None = None,
+) -> list[str]:
+    """Split grounding chunks into overlapping windows for claim extraction."""
+    if not grounding_chunks:
+        return []
+
+    effective_max = max_windows or MAX_CHUNK_DIFF_WINDOWS
+    windows: list[str] = []
+    for start in range(0, len(grounding_chunks), max(window_size - 1, 1)):
+        window = grounding_chunks[start : start + window_size]
+        if window:
+            windows.append("\n\n".join(window))
+        if len(windows) >= effective_max:
+            break
+
+    return windows
+
+
+def _extract_chunk_diff_claims(
+    *,
+    summary_text: str,
+    grounding_chunks: list[str],
+    source_type: str,
+    user_id: str,
+    run_id: str,
+) -> list[ClaimLedgerEntry]:
+    """Stage 3: Extract novel claims from chunk windows that are NOT in the summary."""
+    windows = _build_chunk_windows(grounding_chunks)
+    if not windows:
+        return []
+
+    all_claims: list[ClaimLedgerEntry] = []
+    seen_claims: set[str] = set()
+
+    for window_index, window_text in enumerate(windows):
+        try:
+            payload = _run_structured_generation_step(
+                run_id=run_id,
+                stage_name=f"chunk_diff:{source_type}:window_{window_index}",
+                user_id=user_id,
+                system_prompt=CHUNK_DIFF_SYSTEM_PROMPT,
+                user_prompt=(
+                    f"Source summary:\n{summary_text}\n\n"
+                    f"Chunk window {window_index + 1} of {len(windows)}:\n{window_text}"
+                ),
+                response_schema=CHUNK_DIFF_JSON_SCHEMA,
+                required_keys=["claims"],
+            )
+            for raw_claim in payload.get("claims", []):
+                try:
+                    entry = ClaimLedgerEntry.model_validate(raw_claim)
+                    claim_normalized = entry.claim.lower().strip()
+                    if claim_normalized in seen_claims:
+                        continue
+                    # Check token overlap with existing claims for dedup
+                    is_duplicate = False
+                    for existing in all_claims:
+                        if _token_overlap_ratio(entry.claim, existing.claim) > 0.50:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        seen_claims.add(claim_normalized)
+                        all_claims.append(entry)
+                except Exception:
+                    continue
+        except Exception as exc:
+            log_generation_stage_event(
+                run_id=run_id,
+                user_id=user_id,
+                stage_name=f"chunk_diff:{source_type}:window_{window_index}",
+                attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
+                status="skipped",
+                details=f"window_error={_trim_error_detail(str(exc))}",
+            )
+
+    log_generation_stage_event(
+        run_id=run_id,
+        user_id=user_id,
+        stage_name=f"chunk_diff_complete:{source_type}",
+        attempt_number=1,
+        status="succeeded",
+        details=f"total_claims={len(all_claims)};windows_processed={len(windows)}",
+    )
+    return all_claims
+
+
+def _filter_used_claims(
+    full_claims: list[ClaimLedgerEntry],
+    used_text: str,
+) -> list[ClaimLedgerEntry]:
+    """Remove claims whose content appears in used_text (token overlap > 0.5)."""
+    return [
+        claim for claim in full_claims
+        if _token_overlap_ratio(claim.claim, used_text) < 0.50
+    ]
+
+
+def _format_claim_ledger(claims: list[ClaimLedgerEntry]) -> str:
+    """Format claim ledger entries into a prompt-ready text block."""
+    if not claims:
+        return "[No novel claims extracted — analyze omissions and gaps instead]"
+    lines = []
+    for index, claim in enumerate(claims, start=1):
+        lines.append(
+            f"{index}. [{claim.claim_type}] {claim.claim} "
+            f"(grounding: \"{claim.grounding_quote}\")"
+        )
+    return "\n".join(lines)
+
+
 def _generate_source_deep_dive(
     summary_text: str,
     source_type: str,
-    grounding_chunks: list[str],
+    claim_ledger: list[ClaimLedgerEntry],
     progression_outline: str,
     intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> tuple[str, list[str]]:
-    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
+    claim_text = _format_claim_ledger(claim_ledger)
     payload = _run_structured_generation_step(
         run_id=run_id,
         stage_name=f"source_deep_dive:{source_type}",
@@ -2507,11 +2640,11 @@ def _generate_source_deep_dive(
         system_prompt=SOURCE_DEEP_DIVE_SYSTEM_PROMPT,
         user_prompt=(
             f"Source type: {source_type}\n\n"
-            f"Source summary:\n{summary_text}\n\n"
+            f"Source summary (context only, do not repeat):\n{summary_text}\n\n"
             f"Progression outline:\n{progression_outline}\n\n"
             f"Controller intent guidance:\n{intent_guidance or '[none]'}\n\n"
-            "Grounding chunks:\n"
-            f"{chunk_text}"
+            "CLAIM LEDGER (novel facts NOT in the summary — use these as primary material):\n"
+            f"{claim_text}"
         ),
         response_schema=SOURCE_DEEP_DIVE_JSON_SCHEMA,
         required_keys=["deep_dive_text", "key_terms"],
@@ -2538,12 +2671,12 @@ def _generate_reflection_points(
     deep_dive_text: str,
     source_type: str,
     progression_outline: str,
-    grounding_chunks: list[str],
+    claim_ledger: list[ClaimLedgerEntry],
     intent_guidance: str,
     user_id: str,
     run_id: str,
 ) -> list[ReflectionPoint]:
-    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
+    claim_text = _format_claim_ledger(claim_ledger)
     payload = _run_structured_generation_step(
         run_id=run_id,
         stage_name=f"source_reflection:{source_type}",
@@ -2552,12 +2685,11 @@ def _generate_reflection_points(
         user_prompt=(
             f"Source type: {source_type}\n\n"
             f"Summary:\n{summary_text}\n\n"
-            f"Deep dive:\n{deep_dive_text}\n\n"
+            f"Boundary conditions & failure modes:\n{deep_dive_text}\n\n"
             f"Progression outline:\n{progression_outline}\n\n"
             f"Controller intent guidance:\n{intent_guidance or '[none]'}\n\n"
-            "Representative grounding chunks:\n"
-            f"{chunk_text}\n\n"
-            "Generate Socratic reflection points."
+            f"Claim ledger (novel facts):\n{claim_text}\n\n"
+            "Generate Socratic reflection points with reasoning traps."
         ),
         response_schema=SOCRATIC_REFLECTION_JSON_SCHEMA,
         required_keys=["reflection_points"],
@@ -2566,6 +2698,9 @@ def _generate_reflection_points(
     points: list[ReflectionPoint] = []
     for raw_point in raw_points:
         try:
+            # Handle both old (under_the_hood) and new (reasoning_traps) field names
+            if isinstance(raw_point, dict) and "under_the_hood" in raw_point and "reasoning_traps" not in raw_point:
+                raw_point["reasoning_traps"] = raw_point.pop("under_the_hood")
             points.append(ReflectionPoint.model_validate(raw_point))
         except Exception:
             point_text = str(raw_point).strip()
@@ -2574,7 +2709,7 @@ def _generate_reflection_points(
                     ReflectionPoint(
                         question=point_text,
                         explanation="Reflect on how this idea works in concrete situations.",
-                        under_the_hood="Trace the mechanism that makes this idea true.",
+                        reasoning_traps="Trace the mechanism that makes this idea true and identify where it could mislead.",
                         depth_level="foundational",
                     )
                 )
@@ -2596,7 +2731,7 @@ def _generate_under_surface_pack(
     intent_guidance: str,
     user_id: str,
     run_id: str,
-) -> tuple[str, list[str], list[KeyTermExplanation]]:
+) -> tuple[str, str, list[str], list[KeyTermExplanation]]:
     chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
     payload = _run_structured_generation_step(
         run_id=run_id,
@@ -2613,9 +2748,10 @@ def _generate_under_surface_pack(
             f"Grounding chunks:\n{chunk_text}"
         ),
         response_schema=UNDER_SURFACE_JSON_SCHEMA,
-        required_keys=["under_surface_explainer", "diagnostic_checklist", "key_term_explanations"],
+        required_keys=["under_surface_explainer", "first_principles_synthesis", "diagnostic_checklist", "key_term_explanations"],
     )
     under_surface_explainer = str(payload.get("under_surface_explainer") or "").strip()
+    first_principles_synthesis = str(payload.get("first_principles_synthesis") or "").strip()
     diagnostic_checklist = [
         str(item).strip()
         for item in payload.get("diagnostic_checklist", [])
@@ -2624,16 +2760,25 @@ def _generate_under_surface_pack(
     key_term_explanations: list[KeyTermExplanation] = []
     for entry in payload.get("key_term_explanations", []):
         try:
+            if isinstance(entry, dict) and "explanation" in entry and "layman" not in entry:
+                entry["layman"] = entry.pop("explanation")
+                entry["technical"] = ""
             key_term_explanations.append(KeyTermExplanation.model_validate(entry))
         except Exception:
             continue
 
     if not under_surface_explainer:
         raise ValueError("Model returned empty under-surface explainer text.")
-    if len(diagnostic_checklist) < 4:
+    if len(diagnostic_checklist) < 3:
         raise ValueError("Model returned too few diagnostic checklist points.")
 
-    return under_surface_explainer, diagnostic_checklist, key_term_explanations
+    # Fallback: if first_principles_synthesis is empty, concatenate technical fields.
+    if not first_principles_synthesis and key_term_explanations:
+        first_principles_synthesis = " ".join(
+            entry.technical.strip() for entry in key_term_explanations if entry.technical.strip()
+        )
+
+    return under_surface_explainer, first_principles_synthesis, diagnostic_checklist, key_term_explanations
 
 
 def _store_source_learning_section(section: SourceLearningSection, user_id: str) -> None:
@@ -2652,6 +2797,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     deep_dive_text,
                     key_terms_json,
                     under_surface_text,
+                    first_principles_synthesis,
                     diagnostic_checklist_json,
                     key_term_explanations_json,
                     schema_version,
@@ -2667,6 +2813,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     :deep_dive_text,
                     :key_terms_json,
                     :under_surface_text,
+                    :first_principles_synthesis,
                     :diagnostic_checklist_json,
                     :key_term_explanations_json,
                     :schema_version,
@@ -2681,6 +2828,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     deep_dive_text = excluded.deep_dive_text,
                     key_terms_json = excluded.key_terms_json,
                     under_surface_text = excluded.under_surface_text,
+                    first_principles_synthesis = excluded.first_principles_synthesis,
                     diagnostic_checklist_json = excluded.diagnostic_checklist_json,
                     key_term_explanations_json = excluded.key_term_explanations_json,
                     schema_version = excluded.schema_version,
@@ -2702,6 +2850,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                 "deep_dive_text": section.deep_dive_text,
                 "key_terms_json": json.dumps(section.key_terms, ensure_ascii=True),
                 "under_surface_text": section.under_surface_explainer,
+                "first_principles_synthesis": section.first_principles_synthesis,
                 "diagnostic_checklist_json": json.dumps(section.diagnostic_checklist, ensure_ascii=True),
                 "key_term_explanations_json": json.dumps(
                     [entry.model_dump() for entry in section.key_term_explanations],
@@ -2728,6 +2877,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
                     deep_dive_text,
                     key_terms_json,
                     under_surface_text,
+                    first_principles_synthesis,
                     diagnostic_checklist_json,
                     key_term_explanations_json,
                     model_name,
@@ -2756,7 +2906,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
                     ReflectionPoint(
                         question=value,
                         explanation="Reflect on what this means in context.",
-                        under_the_hood="Identify the underlying mechanism behind this idea.",
+                        reasoning_traps="Identify the underlying mechanism behind this idea.",
                         depth_level="foundational",
                     )
                 )
@@ -2776,6 +2926,9 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
     key_term_explanations: list[KeyTermExplanation] = []
     for entry in key_term_explanations_raw:
         try:
+            if isinstance(entry, dict) and "explanation" in entry and "layman" not in entry:
+                entry["layman"] = entry.pop("explanation")
+                entry["technical"] = ""
             key_term_explanations.append(KeyTermExplanation.model_validate(entry))
         except Exception:
             continue
@@ -2794,6 +2947,7 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
         deep_dive_text=str(row["deep_dive_text"] or "").strip(),
         key_terms=key_terms,
         under_surface_explainer=under_surface_explainer,
+        first_principles_synthesis=str(row.get("first_principles_synthesis") or "").strip(),
         diagnostic_checklist=diagnostic_checklist,
         key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
@@ -2833,6 +2987,9 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
 
     if not summary_text:
         raise ValueError(f"Source {source_id} summary is unavailable.")
+
+    # Strip markdown headers that may exist in cached summaries from the old prompt format.
+    summary_text = _normalize_continuous_prose(summary_text)
 
     grounding_rows = _load_grounding_chunk_rows(source_id, user_id)
     grounding_chunks, deep_dive_chunk_indexes = _select_distributed_grounding_chunks(
@@ -2899,10 +3056,20 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         progression_outline=progression_outline,
     )
 
+    # Stage 3: Extract novel claims from chunk windows
+    claim_ledger = _extract_chunk_diff_claims(
+        summary_text=summary_text,
+        grounding_chunks=grounding_chunks,
+        source_type=source_type,
+        user_id=user_id,
+        run_id=run_id,
+    )
+
+    # Stage 4: Boundary conditions & failure modes (uses claim ledger)
     deep_dive_text, key_terms = _generate_source_deep_dive(
         summary_text,
         source_type,
-        grounding_chunks,
+        claim_ledger,
         progression_outline,
         _format_intent_guidance(source_intent_map["deep_dive"]),
         user_id,
@@ -2913,77 +3080,31 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         max_words=MAX_DEEP_DIVE_WORDS,
     )
 
-    if _section_redundancy_ratio(deep_dive_text, [summary_text, progression_outline]) > SECTION_REDUNDANCY_RATIO_THRESHOLD:
-        try:
-            refined_deep_dive = _expand_nonredundant_text(
-                run_id=run_id,
-                stage_name=f"source_deep_dive_refine:{source_type}",
-                user_id=user_id,
-                context_label=f"{source_type} deep dive novelty refinement",
-                base_text=deep_dive_text,
-                avoid_texts=[summary_text, progression_outline],
-                grounding_chunks=grounding_chunks,
-                key_terms=key_terms,
-                extra_context=(
-                    "Add new mechanism-level detail not already present in summary/progression text. "
-                    "Include boundary conditions and one fresh practical implication that was not previously stated."
-                ),
-            )
-            refined_deep_dive = _truncate_to_max_words(
-                _enforce_section_novelty(refined_deep_dive, [summary_text, progression_outline]),
-                max_words=MAX_DEEP_DIVE_WORDS,
-            )
-            if refined_deep_dive:
-                deep_dive_text = refined_deep_dive
-        except Exception as exc:
-            log_generation_stage_event(
-                run_id=run_id,
-                user_id=user_id,
-                stage_name=f"source_deep_dive_refine:{source_type}",
-                attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
-                status="skipped",
-                details=f"fallback_to_first_pass={_trim_error_detail(str(exc))}",
-            )
-
-    filtered_deep_dive_text = _filter_deep_dive_sentences(
-        deep_dive_text,
-        [summary_text, progression_outline],
-    )
-    if filtered_deep_dive_text != deep_dive_text:
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_sentence_filter_deep:{source_type}",
-            attempt_number=1,
-            status="succeeded",
-            details=(
-                f"before_sentences={len(_split_into_sentences(deep_dive_text))};"
-                f"after_sentences={len(_split_into_sentences(filtered_deep_dive_text))}"
-            ),
-        )
-    deep_dive_text = filtered_deep_dive_text
-
+    # Soft flag instead of hard gate kill
+    low_mechanism_density = False
     if deep_dive_text and not _section_has_required_variables(
         section_text=deep_dive_text,
         prior_texts=[summary_text, progression_outline],
         required_families=source_intent_map["deep_dive"]["required_variables"],
     ):
+        low_mechanism_density = True
         log_generation_stage_event(
             run_id=run_id,
             user_id=user_id,
             stage_name=f"source_variable_gate_deep:{source_type}",
             attempt_number=1,
-            status="failed",
-            details="No new required variable family introduced; omitting deep dive section.",
+            status="soft_flag",
+            details="No new required variable family introduced; flagged as low_mechanism_density but kept.",
         )
-        deep_dive_text = ""
 
+    # Stage 6: Reflection points (uses claim ledger, not raw chunks)
+    remaining_claims_for_reflection = _filter_used_claims(claim_ledger, deep_dive_text)
     reflection_points = _generate_reflection_points(
         summary_text,
         deep_dive_text,
         source_type,
         progression_outline,
-        reflection_chunks,
+        remaining_claims_for_reflection,
         _format_intent_guidance(source_intent_map["reflection"]),
         user_id,
         run_id,
@@ -2995,8 +3116,8 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
                     point.explanation,
                     [summary_text, deep_dive_text],
                 ),
-                "under_the_hood": _enforce_section_novelty(
-                    point.under_the_hood,
+                "reasoning_traps": _enforce_section_novelty(
+                    point.reasoning_traps,
                     [summary_text, deep_dive_text, point.explanation],
                 ),
             }
@@ -3005,7 +3126,9 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
     ]
     reflection_text_pre = _reflection_points_to_text(reflection_points)
 
-    under_surface_explainer, diagnostic_checklist, key_term_explanations = _generate_under_surface_pack(
+    # Stage 5: Hidden assumptions (uses remaining claims not used in deep dive)
+    remaining_claims_for_under = _filter_used_claims(claim_ledger, deep_dive_text)
+    under_surface_explainer, first_principles_synthesis, diagnostic_checklist, key_term_explanations = _generate_under_surface_pack(
         summary_text=summary_text,
         deep_dive_text=deep_dive_text,
         key_terms=key_terms,
@@ -3022,75 +3145,21 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
     )
     under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
 
-    try:
-        expanded_under_surface = _expand_nonredundant_text(
-            run_id=run_id,
-            stage_name=f"source_under_surface_expand:{source_type}",
-            user_id=user_id,
-            context_label=f"{source_type} under-surface explainer",
-            base_text=under_surface_explainer,
-            avoid_texts=[summary_text, deep_dive_text, reflection_text_pre],
-            grounding_chunks=under_surface_chunks,
-            key_terms=key_terms,
-            extra_context=(
-                f"Progression outline:\n{_truncate_for_prompt(progression_outline, limit=1200)}"
-            ),
-        )
-        expanded_under_surface = _deduplicate_section_text(
-            _normalize_continuous_prose(expanded_under_surface),
-            [summary_text, deep_dive_text, reflection_text_pre, under_surface_explainer],
-        )
-        if expanded_under_surface:
-            under_surface_explainer = expanded_under_surface
-    except Exception as exc:
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_under_surface_expand:{source_type}",
-            attempt_number=GENERATION_MAX_STAGE_ATTEMPTS,
-            status="skipped",
-            details=f"fallback_to_first_pass={_trim_error_detail(str(exc))}",
-        )
-
-    under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
-
-    filtered_under_surface = _filter_under_surface_sentences(
-        under_surface_explainer,
-        [summary_text, deep_dive_text, reflection_text_pre],
-    )
-    if filtered_under_surface != under_surface_explainer:
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_sentence_filter_under:{source_type}",
-            attempt_number=1,
-            status="succeeded",
-            details=(
-                f"before_sentences={len(_split_into_sentences(under_surface_explainer))};"
-                f"after_sentences={len(_split_into_sentences(filtered_under_surface))}"
-            ),
-        )
-    under_surface_explainer = filtered_under_surface
-
+    # Soft flag instead of hard gate kill for under-surface
     if under_surface_explainer and not _section_has_required_variables(
         section_text=under_surface_explainer,
         prior_texts=[summary_text, deep_dive_text, reflection_text_pre],
         required_families=source_intent_map["under_surface"]["required_variables"],
     ):
+        low_mechanism_density = True
         log_generation_stage_event(
             run_id=run_id,
             user_id=user_id,
             stage_name=f"source_variable_gate_under:{source_type}",
             attempt_number=1,
-            status="failed",
-            details="No new required variable family introduced; omitting under-surface section.",
+            status="soft_flag",
+            details="No new required variable family introduced; flagged but content kept.",
         )
-        under_surface_explainer = ""
-        diagnostic_checklist = []
-        key_term_explanations = []
-
-    # Remove key-term restatement plane to avoid dictionary-like overlap with deep dive and under-surface content.
-    key_term_explanations = []
 
     reflection_points = [
         point.model_copy(
@@ -3099,8 +3168,8 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
                     point.explanation,
                     [summary_text, deep_dive_text, under_surface_explainer],
                 ),
-                "under_the_hood": _enforce_section_novelty(
-                    point.under_the_hood,
+                "reasoning_traps": _enforce_section_novelty(
+                    point.reasoning_traps,
                     [summary_text, deep_dive_text, under_surface_explainer, point.explanation],
                 ),
             }
@@ -3111,7 +3180,7 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
     required_reflection_vars = source_intent_map["reflection"]["required_variables"]
     filtered_reflection_points: list[ReflectionPoint] = []
     for point in reflection_points:
-        point_text = " ".join(part for part in [point.explanation, point.under_the_hood] if part)
+        point_text = " ".join(part for part in [point.explanation, point.reasoning_traps] if part)
         if _section_has_required_variables(
             section_text=point_text,
             prior_texts=[summary_text, deep_dive_text, under_surface_explainer],
@@ -3220,6 +3289,7 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
             (
                 deep_dive_text,
                 under_surface_explainer,
+                first_principles_synthesis,
                 reflection_points,
                 diagnostic_checklist,
                 key_term_explanations,
@@ -3267,9 +3337,11 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         deep_dive_text=deep_dive_text,
         key_terms=key_terms,
         under_surface_explainer=under_surface_explainer,
+        first_principles_synthesis=first_principles_synthesis,
         diagnostic_checklist=diagnostic_checklist,
         key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
+        low_mechanism_density=low_mechanism_density,
         model_name=GENERATION_MODEL,
         schema_version=GENERATION_SCHEMA_VERSION,
     )
@@ -3310,819 +3382,85 @@ def _normalize_attributed_sentence(
     )
 
 
-def _generate_combined_insights(
+def _generate_synthesis_consolidation(
     video_section: SourceLearningSection,
     document_sections: list[SourceLearningSection],
-    relationship_insights: list[str],
-    intent_guidance: str,
     user_id: str,
     run_id: str,
-) -> CombinedInsightSection:
+) -> tuple[CombinedInsightSection, CombinedQuizSection]:
     source_catalog = [
         {
             "source_id": video_section.source_id,
             "source_type": "video",
             "title": video_section.generated_title,
-            "source_name": video_section.source_name,
+            "summary": video_section.summary_text,
+            "deep_dive": video_section.deep_dive_text,
         }
     ] + [
         {
             "source_id": section.source_id,
             "source_type": "document",
             "title": section.generated_title,
-            "source_name": section.source_name,
+            "summary": section.summary_text,
+            "deep_dive": section.deep_dive_text,
         }
         for section in document_sections
     ]
 
-    source_payload = {
-        "source_catalog": source_catalog,
-        "video": video_section.model_dump(),
-        "documents": [section.model_dump() for section in document_sections],
-        "relationship_insights": relationship_insights,
-    }
-
     payload = _run_structured_generation_step(
         run_id=run_id,
-        stage_name="combined_insights",
+        stage_name="synthesis_consolidation",
         user_id=user_id,
-        system_prompt=COMBINED_INSIGHTS_SYSTEM_PROMPT,
+        system_prompt=SYNTHESIS_CONSOLIDATOR_SYSTEM_PROMPT,
         user_prompt=(
-            "Generate cross-source attributed insights from this payload:\n\n"
-            f"{json.dumps(source_payload, ensure_ascii=True)}\n\n"
-            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
+            f"Here are the summaries and deep dives for {len(source_catalog)} sources:\n\n"
+            + "\n\n".join(
+                f"Source: {s['title']}\n"
+                f"Type: {s['source_type']}\n"
+                f"Summary:\n{s['summary']}\n\n"
+                f"Deep Dive:\n{s['deep_dive']}"
+                for s in source_catalog
+            )
         ),
-        response_schema=COMBINED_INSIGHTS_JSON_SCHEMA,
-        required_keys=["intersections", "layman_bridge", "synthesis_text"],
+        response_schema=SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
+        required_keys=["synthesis_text", "questions"],
+        model_name=CONSOLIDATION_MODEL,
     )
-    known_sources = {
-        video_section.source_id: "video",
-        **{section.source_id: "document" for section in document_sections},
-    }
 
-    raw_intersections = payload.get("intersections", [])
-    intersections: list[InsightIntersection] = []
-    parallels: list[AttributedSentence] = []
+    synthesis_text = payload.get("synthesis_text", "").strip()
+    raw_questions = payload.get("questions", [])
 
-    for raw_intersection in raw_intersections:
-        if not isinstance(raw_intersection, dict):
+    questions = []
+    for q in raw_questions:
+        if not isinstance(q, dict):
             continue
-
-        raw_sentences = raw_intersection.get("attributed_sentences", [])
-        attributed_sentences: list[AttributedSentence] = []
-        for raw_sentence in raw_sentences:
-            if not isinstance(raw_sentence, dict):
-                continue
-            normalized_sentence = _normalize_attributed_sentence(
-                raw_sentence,
-                known_sources,
-                video_section.source_id,
-            )
-            if normalized_sentence is not None:
-                attributed_sentences.append(normalized_sentence)
-
-        if len(attributed_sentences) < 2:
-            continue
-
-        intersection_title = str(raw_intersection.get("intersection_title", "")).strip()
-        why_it_matters = str(raw_intersection.get("why_it_matters", "")).strip()
-        integrated_explanation = _normalize_continuous_prose(
-            str(raw_intersection.get("integrated_explanation", "")).strip()
-        )
-        if not intersection_title or not why_it_matters or not integrated_explanation:
-            continue
-
-        inferred_extension = raw_intersection.get("inferred_extension")
-        inferred_extension_text = (
-            str(inferred_extension).strip()
-            if inferred_extension is not None
-            else None
-        )
-        if inferred_extension_text == "":
-            inferred_extension_text = None
-
-        inference_label = raw_intersection.get("inference_label")
-        inference_label_value = (
-            "inferred_extension"
-            if inferred_extension_text and str(inference_label).strip() == "inferred_extension"
-            else None
-        )
-
-        intersections.append(
-            InsightIntersection(
-                intersection_title=intersection_title,
-                why_it_matters=why_it_matters,
-                integrated_explanation=integrated_explanation,
-                attributed_sentences=attributed_sentences,
-                inferred_extension=inferred_extension_text,
-                inference_label=inference_label_value,
+        questions.append(
+            QuizQuestion(
+                question=str(q.get("question", "")).strip(),
+                options=[str(opt).strip() for opt in q.get("options", [])[:4]],
+                answer_index=int(q.get("answer_index", 0)),
+                explanation=str(q.get("explanation", "")).strip(),
+                source_evidence=[],
             )
         )
-        parallels.extend(attributed_sentences)
 
-    if not intersections:
-        # Backward compatibility: handle legacy payload shape.
-        raw_parallels = payload.get("parallels", [])
-        legacy_sentences: list[AttributedSentence] = []
-        for raw_item in raw_parallels:
-            if not isinstance(raw_item, dict):
-                continue
-            normalized_sentence = _normalize_attributed_sentence(
-                raw_item,
-                known_sources,
-                video_section.source_id,
-            )
-            if normalized_sentence is not None:
-                legacy_sentences.append(normalized_sentence)
-
-        if len(legacy_sentences) >= 3:
-            intersections.append(
-                InsightIntersection(
-                    intersection_title="Core Cross-Source Intersection",
-                    why_it_matters="This overlap captures the strongest shared mechanism across your sources.",
-                    integrated_explanation="These attributed points connect what the video and documents reinforce, extend, or challenge.",
-                    attributed_sentences=legacy_sentences,
-                )
-            )
-            parallels.extend(legacy_sentences)
-
-    layman_bridge = _normalize_continuous_prose(str(payload.get("layman_bridge", "")).strip())
-    synthesis_text = _normalize_continuous_prose(str(payload.get("synthesis_text", "")).strip())
-    if len(intersections) < 1:
-        raise ValueError("Model returned too few integrated cross-source intersections.")
-    if not layman_bridge:
-        raise ValueError("Model returned an empty layman bridge.")
-    if not synthesis_text:
-        raise ValueError("Model returned an empty synthesis text.")
-
-    source_background = [
-        video_section.summary_text,
-        video_section.deep_dive_text,
-        video_section.under_surface_explainer,
-    ] + [
-        value
-        for section in document_sections
-        for value in [section.summary_text, section.deep_dive_text, section.under_surface_explainer]
-    ]
-    shared_grounding_chunks = [
-        (
-            f"{section.source_type.title()} [{section.generated_title}]\n"
-            f"Summary: {_truncate_for_prompt(section.summary_text, limit=320)}\n"
-            f"Deep dive: {_truncate_for_prompt(section.deep_dive_text, limit=380)}\n"
-            f"Under surface: {_truncate_for_prompt(section.under_surface_explainer, limit=380)}"
-        )
-        for section in [video_section, *document_sections]
-    ]
-
-    refined_intersections: list[InsightIntersection] = []
-    prior_intersection_explanations: list[str] = []
-    for index, intersection in enumerate(intersections, start=1):
-        try:
-            expanded_intersection = _expand_nonredundant_text(
-                run_id=run_id,
-                stage_name=f"combined_intersection_expand:{index}",
-                user_id=user_id,
-                context_label=f"cross-source intersection: {intersection.intersection_title}",
-                base_text=intersection.integrated_explanation,
-                avoid_texts=[
-                    intersection.why_it_matters,
-                    layman_bridge,
-                    *prior_intersection_explanations,
-                    *source_background,
-                ],
-                grounding_chunks=shared_grounding_chunks,
-                key_terms=[
-                    term
-                    for sentence in intersection.attributed_sentences
-                    for term in sentence.emphasis_terms
-                ],
-            )
-            expanded_intersection = _deduplicate_section_text(
-                _normalize_continuous_prose(expanded_intersection),
-                [intersection.why_it_matters, *prior_intersection_explanations, *source_background],
-            )
-            if expanded_intersection:
-                refined_intersections.append(
-                    intersection.model_copy(update={"integrated_explanation": expanded_intersection})
-                )
-                prior_intersection_explanations.append(expanded_intersection)
-                continue
-        except Exception:
-            pass
-
-        fallback_intersection = _normalize_continuous_prose(
-            _deduplicate_section_text(
-                intersection.integrated_explanation,
-                [intersection.why_it_matters, *prior_intersection_explanations, *source_background],
-            )
-        )
-        refined_intersections.append(
-            intersection.model_copy(update={"integrated_explanation": fallback_intersection})
-        )
-        prior_intersection_explanations.append(fallback_intersection)
-
-    intersections = refined_intersections
-    tightened_intersections: list[InsightIntersection] = []
-    prior_mapping_texts: list[str] = []
-    for intersection in intersections:
-        tightened_why, _ = _tighten_stage_text(
-            stage_name="mapping",
-            text_value=intersection.why_it_matters,
-            prior_stage_texts=[*prior_mapping_texts, *source_background],
-        )
-        tightened_integrated, _ = _tighten_stage_text(
-            stage_name="mapping",
-            text_value=intersection.integrated_explanation,
-            prior_stage_texts=[*prior_mapping_texts, tightened_why, *source_background],
-        )
-
-        normalized_why = tightened_why or _normalize_continuous_prose(intersection.why_it_matters)
-        normalized_integrated = tightened_integrated or _normalize_continuous_prose(intersection.integrated_explanation)
-        if not normalized_why and not normalized_integrated:
-            continue
-
-        tightened_intersections.append(
-            intersection.model_copy(
-                update={
-                    "why_it_matters": normalized_why,
-                    "integrated_explanation": normalized_integrated,
-                }
-            )
-        )
-        prior_mapping_texts.extend([normalized_why, normalized_integrated])
-
-    if tightened_intersections:
-        intersections = tightened_intersections
-
-    intersection_evidence_texts = [
-        sentence.text
-        for entry in intersections
-        for sentence in entry.attributed_sentences
-        if sentence.text.strip()
-    ]
-
-    layman_bridge = _enforce_section_novelty(
-        layman_bridge,
-        [
-            *[entry.why_it_matters for entry in intersections],
-            *[entry.integrated_explanation for entry in intersections],
-            *intersection_evidence_texts,
-            *source_background,
-        ],
-    )
-    tightened_bridge, _ = _tighten_stage_text(
-        stage_name="mapping",
-        text_value=layman_bridge,
-        prior_stage_texts=[
-            *[entry.why_it_matters for entry in intersections],
-            *[entry.integrated_explanation for entry in intersections],
-            *intersection_evidence_texts,
-            *source_background,
-        ],
-    )
-    if tightened_bridge:
-        layman_bridge = tightened_bridge
-
-    try:
-        expanded_synthesis = _expand_nonredundant_text(
-            run_id=run_id,
-            stage_name="combined_synthesis_expand",
-            user_id=user_id,
-            context_label="cross-source synthesis",
-            base_text=synthesis_text,
-            avoid_texts=[
-                layman_bridge,
-                *[entry.why_it_matters for entry in intersections],
-                *source_background,
-            ],
-            grounding_chunks=shared_grounding_chunks,
-            key_terms=[
-                term
-                for entry in intersections
-                for sentence in entry.attributed_sentences
-                for term in sentence.emphasis_terms
-            ],
-            extra_context=(
-                "Relationship insights:\n"
-                + "\n".join(_truncate_for_prompt(item, limit=260) for item in relationship_insights[:8])
-            ),
-        )
-        expanded_synthesis = _normalize_continuous_prose(
-            _deduplicate_section_text(
-                expanded_synthesis,
-                [layman_bridge, *[entry.integrated_explanation for entry in intersections], *source_background],
-            )
-        )
-        if expanded_synthesis:
-            synthesis_text = expanded_synthesis
-    except Exception:
-        synthesis_text = _normalize_continuous_prose(synthesis_text)
-
-    synthesis_text = _enforce_section_novelty(
-        synthesis_text,
-        [
-            layman_bridge,
-            *[entry.why_it_matters for entry in intersections],
-            *[entry.integrated_explanation for entry in intersections],
-            *intersection_evidence_texts,
-            *source_background,
-        ],
-    )
-    tightened_synthesis, _ = _tighten_stage_text(
-        stage_name="constraint",
-        text_value=synthesis_text,
-        prior_stage_texts=[
-            layman_bridge,
-            *[entry.why_it_matters for entry in intersections],
-            *[entry.integrated_explanation for entry in intersections],
-            *intersection_evidence_texts,
-            *source_background,
-        ],
-    )
-    if tightened_synthesis:
-        synthesis_text = tightened_synthesis
-
-    layman_bridge = _normalize_continuous_prose(layman_bridge)
-
-    return CombinedInsightSection(
-        intersections=intersections,
-        parallels=parallels,
-        layman_bridge=layman_bridge,
+    insights = CombinedInsightSection(
         synthesis_text=synthesis_text,
-        model_name=GENERATION_MODEL,
-        schema_version=GENERATION_SCHEMA_VERSION,
+        intersections=[],
+        parallels=[],
+        layman_bridge="",
+        comparative_analysis="",
+        application_scenarios=[],
+        model_name=CONSOLIDATION_MODEL,
     )
 
-
-def _generate_combined_quiz(
-    video_section: SourceLearningSection,
-    document_sections: list[SourceLearningSection],
-    insights_section: CombinedInsightSection,
-    comparative_analysis_text: str,
-    application_scenarios: list[ApplicationScenario],
-    relationship_insights: list[str],
-    intent_guidance: str,
-    user_id: str,
-    run_id: str,
-) -> CombinedQuizSection:
-    source_catalog = [
-        {
-            "source_id": video_section.source_id,
-            "source_type": "video",
-            "title": video_section.generated_title,
-        }
-    ] + [
-        {
-            "source_id": section.source_id,
-            "source_type": "document",
-            "title": section.generated_title,
-        }
-        for section in document_sections
-    ]
-
-    quiz_payload = {
-        "source_catalog": source_catalog,
-        "insights": insights_section.model_dump(),
-        "comparative_analysis": comparative_analysis_text,
-        "application_scenarios": [entry.model_dump() for entry in application_scenarios],
-        "relationship_insights": relationship_insights,
-        "difficulty_mix": {
-            "foundational": "2-3 questions",
-            "intermediate": "2-4 questions",
-            "advanced": "1-3 questions",
-        },
-        "style": "hard, high-discrimination trick questions with clear correctness",
-        "distractor_policy": (
-            "Use topic-adjacent plausible distractors, avoid giveaway absolutes such as solely/always/never/entirely/only "
-            "unless directly grounded, and prefer distractors that can be true in nearby contexts but not for the asked scope"
-        ),
-        "under_the_hood_depth": (
-            "Provide technical, first-principles reasoning with mechanism, assumptions, constraints, and tradeoffs"
-        ),
-    }
-
-    payload = _run_structured_generation_step(
-        run_id=run_id,
-        stage_name="combined_quiz",
-        user_id=user_id,
-        system_prompt=COMBINED_QUIZ_SYSTEM_PROMPT,
-        user_prompt=(
-            "Generate overlap-focused advanced quiz questions from this payload:\n\n"
-            f"{json.dumps(quiz_payload, ensure_ascii=True)}\n\n"
-            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
-        ),
-        response_schema=COMBINED_QUIZ_JSON_SCHEMA,
-        required_keys=["questions", "study_advice"],
-    )
-    questions = [QuizQuestion.model_validate(item) for item in payload.get("questions", [])]
-    if len(questions) < 6:
-        raise ValueError("Model returned too few quiz questions.")
-
-    prior_cross_texts = [
-        insights_section.layman_bridge,
-        insights_section.synthesis_text,
-        comparative_analysis_text,
-        *[
-            " ".join(
-                part
-                for part in [
-                    scenario.scenario_title,
-                    scenario.scenario_prompt,
-                    " ".join(scenario.transfer_steps),
-                    scenario.common_pitfall,
-                ]
-                if part
-            )
-            for scenario in application_scenarios
-        ],
-        *[entry.why_it_matters for entry in insights_section.intersections],
-        *[entry.integrated_explanation for entry in insights_section.intersections],
-    ]
-
-    refined_questions: list[QuizQuestion] = []
-    prior_quiz_texts: list[str] = []
-    consumed_evidence_keys: set[str] = {
-        _normalize_evidence_key(sentence.text)
-        for intersection in insights_section.intersections
-        for sentence in intersection.attributed_sentences
-        if _normalize_evidence_key(sentence.text)
-    }
-    for question in questions:
-        explanation = _enforce_section_novelty(
-            _normalize_continuous_prose(question.explanation),
-            [*prior_cross_texts, *prior_quiz_texts],
-        )
-        tightened_explanation, _ = _tighten_stage_text(
-            stage_name="decision",
-            text_value=explanation,
-            prior_stage_texts=[*prior_cross_texts, *prior_quiz_texts],
-        )
-        if tightened_explanation:
-            explanation = tightened_explanation
-
-        under_the_hood = _enforce_section_novelty(
-            _normalize_continuous_prose(question.under_the_hood),
-            [*prior_cross_texts, *prior_quiz_texts, explanation],
-        )
-        tightened_under_the_hood, _ = _tighten_stage_text(
-            stage_name="decision",
-            text_value=under_the_hood,
-            prior_stage_texts=[*prior_cross_texts, *prior_quiz_texts, explanation],
-        )
-        if tightened_under_the_hood:
-            under_the_hood = tightened_under_the_hood
-
-        refined_evidence: list[str] = []
-        for evidence in question.source_evidence:
-            normalized_evidence = _enforce_section_novelty(
-                _normalize_continuous_prose(evidence),
-                [*prior_cross_texts, *prior_quiz_texts, *refined_evidence],
-            )
-            evidence_key = _normalize_evidence_key(normalized_evidence)
-            if normalized_evidence and evidence_key and evidence_key not in consumed_evidence_keys:
-                refined_evidence.append(normalized_evidence)
-                consumed_evidence_keys.add(evidence_key)
-
-        question_text_block = " ".join(
-            part for part in [question.question, explanation, under_the_hood, " ".join(refined_evidence)] if part
-        ).strip()
-        if not question_text_block:
-            continue
-
-        if _section_redundancy_ratio(question_text_block, [*prior_cross_texts, *prior_quiz_texts]) > SECTION_REDUNDANCY_RATIO_THRESHOLD:
-            continue
-
-        refined_questions.append(
-            question.model_copy(
-                update={
-                    "explanation": explanation,
-                    "under_the_hood": under_the_hood,
-                    "source_evidence": refined_evidence[:5],
-                }
-            )
-        )
-        prior_quiz_texts.append(question_text_block)
-
-    if len(refined_questions) < 4:
-        raise ValueError("Model returned too few non-redundant quiz questions.")
-
-    study_advice = str(payload.get("study_advice", "")).strip()
-    if not study_advice:
-        raise ValueError("Model returned empty study advice.")
-    study_advice = _enforce_section_novelty(study_advice, [*prior_cross_texts, *prior_quiz_texts])
-    tightened_study_advice, _ = _tighten_stage_text(
-        stage_name="decision",
-        text_value=study_advice,
-        prior_stage_texts=[*prior_cross_texts, *prior_quiz_texts],
-    )
-    if tightened_study_advice:
-        study_advice = tightened_study_advice
-    if not study_advice:
-        study_advice = "Review where each distractor failed, then test one edge condition before moving on."
-
-    return CombinedQuizSection(
-        questions=refined_questions,
-        study_advice=study_advice,
-        model_name=GENERATION_MODEL,
-        schema_version=GENERATION_SCHEMA_VERSION,
+    quiz = CombinedQuizSection(
+        questions=questions,
+        study_advice="",
+        model_name=CONSOLIDATION_MODEL,
     )
 
-
-def _generate_comparative_analysis(
-    video_section: SourceLearningSection,
-    document_sections: list[SourceLearningSection],
-    insights_section: CombinedInsightSection,
-    relationship_insights: list[str],
-    intent_guidance: str,
-    user_id: str,
-    run_id: str,
-) -> str:
-    source_catalog = [
-        {
-            "source_id": video_section.source_id,
-            "source_type": "video",
-            "title": video_section.generated_title,
-        }
-    ] + [
-        {
-            "source_id": section.source_id,
-            "source_type": "document",
-            "title": section.generated_title,
-        }
-        for section in document_sections
-    ]
-
-    mapping_digest = [
-        {
-            "title": entry.intersection_title,
-            "why_it_matters": _truncate_for_prompt(entry.why_it_matters, limit=340),
-            "integrated_explanation": _truncate_for_prompt(entry.integrated_explanation, limit=420),
-        }
-        for entry in insights_section.intersections
-    ]
-
-    payload = {
-        "source_catalog": source_catalog,
-        "mapping_digest": mapping_digest,
-        "layman_bridge": insights_section.layman_bridge,
-        "synthesis_text": insights_section.synthesis_text,
-        "relationship_insights": relationship_insights,
-    }
-
-    result = _run_structured_generation_step(
-        run_id=run_id,
-        stage_name="comparative_analysis",
-        user_id=user_id,
-        system_prompt=COMPARATIVE_ANALYSIS_SYSTEM_PROMPT,
-        user_prompt=(
-            "Generate one comparative deepening analysis from this payload:\n\n"
-            f"{json.dumps(payload, ensure_ascii=True)}\n\n"
-            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
-        ),
-        response_schema=COMPARATIVE_ANALYSIS_JSON_SCHEMA,
-        required_keys=["comparative_analysis"],
-    )
-    comparative_analysis = _normalize_continuous_prose(str(result.get("comparative_analysis", "")).strip())
-    if not comparative_analysis:
-        raise ValueError("Model returned empty comparative analysis text.")
-
-    source_background = [
-        video_section.summary_text,
-        video_section.deep_dive_text,
-        insights_section.synthesis_text,
-    ] + [
-        value
-        for section in document_sections
-        for value in [section.summary_text, section.deep_dive_text]
-    ]
-    grounding_chunks = [
-        (
-            f"{section.source_type.title()} [{section.generated_title}]\n"
-            f"Summary: {_truncate_for_prompt(section.summary_text, limit=320)}\n"
-            f"Deep dive: {_truncate_for_prompt(section.deep_dive_text, limit=360)}"
-        )
-        for section in [video_section, *document_sections]
-    ]
-
-    try:
-        expanded_analysis = _expand_nonredundant_text(
-            run_id=run_id,
-            stage_name="comparative_analysis_expand",
-            user_id=user_id,
-            context_label="cross-source comparative deepening",
-            base_text=comparative_analysis,
-            avoid_texts=[
-                insights_section.layman_bridge,
-                insights_section.synthesis_text,
-                *[entry.why_it_matters for entry in insights_section.intersections],
-                *[entry.integrated_explanation for entry in insights_section.intersections],
-                *source_background,
-            ],
-            grounding_chunks=grounding_chunks,
-            key_terms=[
-                term
-                for entry in insights_section.intersections
-                for sentence in entry.attributed_sentences
-                for term in sentence.emphasis_terms
-            ],
-            extra_context=(
-                "Relationship insights:\n"
-                + "\n".join(_truncate_for_prompt(item, limit=260) for item in relationship_insights[:8])
-            ),
-        )
-        expanded_analysis = _normalize_continuous_prose(
-            _deduplicate_section_text(
-                expanded_analysis,
-                [insights_section.synthesis_text, insights_section.layman_bridge, *source_background],
-            )
-        )
-        if expanded_analysis:
-            comparative_analysis = expanded_analysis
-    except Exception:
-        comparative_analysis = _normalize_continuous_prose(comparative_analysis)
-
-    comparative_analysis = _normalize_continuous_prose(
-        _deduplicate_section_text(
-            comparative_analysis,
-            [
-                insights_section.synthesis_text,
-                insights_section.layman_bridge,
-                *[entry.integrated_explanation for entry in insights_section.intersections],
-            ],
-        )
-    )
-
-    comparative_analysis = _enforce_section_novelty(
-        comparative_analysis,
-        [
-            insights_section.synthesis_text,
-            insights_section.layman_bridge,
-            *[entry.why_it_matters for entry in insights_section.intersections],
-            *[entry.integrated_explanation for entry in insights_section.intersections],
-            *[
-                sentence.text
-                for entry in insights_section.intersections
-                for sentence in entry.attributed_sentences
-            ],
-        ],
-    )
-
-    tightened_comparative, _ = _tighten_stage_text(
-        stage_name="constraint",
-        text_value=comparative_analysis,
-        prior_stage_texts=[
-            insights_section.layman_bridge,
-            insights_section.synthesis_text,
-            *[entry.why_it_matters for entry in insights_section.intersections],
-            *[entry.integrated_explanation for entry in insights_section.intersections],
-        ],
-    )
-    if tightened_comparative:
-        comparative_analysis = tightened_comparative
-
-    return comparative_analysis
-
-
-def _generate_application_scenarios(
-    video_section: SourceLearningSection,
-    document_sections: list[SourceLearningSection],
-    insights_section: CombinedInsightSection,
-    comparative_analysis_text: str,
-    relationship_insights: list[str],
-    intent_guidance: str,
-    user_id: str,
-    run_id: str,
-) -> list[ApplicationScenario]:
-    source_catalog = [
-        {
-            "source_id": video_section.source_id,
-            "source_type": "video",
-            "title": video_section.generated_title,
-        }
-    ] + [
-        {
-            "source_id": section.source_id,
-            "source_type": "document",
-            "title": section.generated_title,
-        }
-        for section in document_sections
-    ]
-
-    mapping_digest = [
-        {
-            "title": entry.intersection_title,
-            "why_it_matters": _truncate_for_prompt(entry.why_it_matters, limit=300),
-        }
-        for entry in insights_section.intersections
-    ]
-
-    payload = {
-        "source_catalog": source_catalog,
-        "mapping_digest": mapping_digest,
-        "layman_bridge": insights_section.layman_bridge,
-        "synthesis_text": insights_section.synthesis_text,
-        "comparative_analysis": comparative_analysis_text,
-        "relationship_insights": relationship_insights,
-    }
-
-    result = _run_structured_generation_step(
-        run_id=run_id,
-        stage_name="application_scenarios",
-        user_id=user_id,
-        system_prompt=APPLICATION_SCENARIOS_SYSTEM_PROMPT,
-        user_prompt=(
-            "Generate grounded application scenarios from this payload:\n\n"
-            f"{json.dumps(payload, ensure_ascii=True)}\n\n"
-            f"Controller intent guidance:\n{intent_guidance or '[none]'}"
-        ),
-        response_schema=APPLICATION_SCENARIOS_JSON_SCHEMA,
-        required_keys=["application_scenarios"],
-    )
-    scenarios: list[ApplicationScenario] = []
-    prior_cross_texts = [
-        insights_section.layman_bridge,
-        insights_section.synthesis_text,
-        comparative_analysis_text,
-        *[entry.why_it_matters for entry in insights_section.intersections],
-        *[entry.integrated_explanation for entry in insights_section.intersections],
-    ]
-    prior_scenario_texts: list[str] = []
-
-    for item in result.get("application_scenarios", []):
-        try:
-            scenario = ApplicationScenario.model_validate(item)
-        except Exception:
-            continue
-
-        normalized_steps: list[str] = []
-        for step in scenario.transfer_steps:
-            normalized_step = _enforce_section_novelty(
-                _normalize_continuous_prose(step),
-                [*prior_cross_texts, *prior_scenario_texts, *normalized_steps],
-            )
-            if normalized_step:
-                normalized_steps.append(normalized_step)
-
-        normalized_prompt = _enforce_section_novelty(
-            _normalize_continuous_prose(scenario.scenario_prompt),
-            [*prior_cross_texts, *prior_scenario_texts],
-        )
-        tightened_prompt, _ = _tighten_stage_text(
-            stage_name="transfer",
-            text_value=normalized_prompt,
-            prior_stage_texts=[*prior_cross_texts, *prior_scenario_texts],
-        )
-        if tightened_prompt:
-            normalized_prompt = tightened_prompt
-
-        tightened_steps: list[str] = []
-        for step_text in normalized_steps:
-            tightened_step, _ = _tighten_stage_text(
-                stage_name="transfer",
-                text_value=step_text,
-                prior_stage_texts=[*prior_cross_texts, *prior_scenario_texts, normalized_prompt, *tightened_steps],
-            )
-            candidate_step = tightened_step or _normalize_continuous_prose(step_text)
-            if candidate_step and candidate_step not in tightened_steps:
-                tightened_steps.append(candidate_step)
-        if tightened_steps:
-            normalized_steps = tightened_steps[:4]
-
-        normalized_pitfall = _enforce_section_novelty(
-            _normalize_continuous_prose(scenario.common_pitfall),
-            [*prior_cross_texts, *prior_scenario_texts, normalized_prompt, *normalized_steps],
-        )
-        tightened_pitfall, _ = _tighten_stage_text(
-            stage_name="constraint",
-            text_value=normalized_pitfall,
-            prior_stage_texts=[*prior_cross_texts, *prior_scenario_texts, normalized_prompt, *normalized_steps],
-        )
-        if tightened_pitfall:
-            normalized_pitfall = tightened_pitfall
-
-        scenario_text = " ".join(
-            part for part in [normalized_prompt, " ".join(normalized_steps), normalized_pitfall] if part
-        ).strip()
-        if not scenario_text:
-            continue
-
-        if _section_redundancy_ratio(scenario_text, [*prior_cross_texts, *prior_scenario_texts]) > SECTION_REDUNDANCY_RATIO_THRESHOLD:
-            continue
-
-        scenarios.append(
-            scenario.model_copy(
-                update={
-                    "scenario_prompt": normalized_prompt,
-                    "transfer_steps": normalized_steps,
-                    "common_pitfall": normalized_pitfall,
-                }
-            )
-        )
-        prior_scenario_texts.append(scenario_text)
-    if len(scenarios) < 2:
-        raise ValueError("Model returned too few application scenarios.")
-
-    return scenarios
+    return insights, quiz
 
 
 def _store_combined_learning_sections(
@@ -4308,6 +3646,10 @@ def _truncate_sentence(text_value: str, limit: int = 260) -> str:
     if not normalized:
         return ""
 
+    # Strip markdown heading markers that may have leaked from summary generation.
+    normalized = re.sub(r"^#{1,6}\s*", "", normalized).strip()
+    normalized = re.sub(r"\s*#{1,6}\s*", " ", normalized).strip()
+
     first_sentence = normalized.split(". ", 1)[0].strip()
     candidate = first_sentence if first_sentence else normalized
     if len(candidate) > limit:
@@ -4317,14 +3659,20 @@ def _truncate_sentence(text_value: str, limit: int = 260) -> str:
 
 def _build_noncomparative_insights_and_quiz(
     source_sections: list[SourceLearningSection],
+    *,
+    user_id: str = "",
+    run_id: str = "",
 ) -> tuple[CombinedInsightSection, CombinedQuizSection]:
     if not source_sections:
         raise ValueError("source_sections cannot be empty.")
 
+    # Build clean intersections without markdown header leaks.
     intersections: list[InsightIntersection] = []
     for section in source_sections[:3]:
-        summary_sentence = _truncate_sentence(section.summary_text, limit=240)
-        deep_sentence = _truncate_sentence(section.deep_dive_text, limit=240)
+        summary_clean = _normalize_continuous_prose(section.summary_text)
+        deep_clean = _normalize_continuous_prose(section.deep_dive_text)
+        summary_sentence = _truncate_sentence(summary_clean, limit=240)
+        deep_sentence = _truncate_sentence(deep_clean, limit=240)
         emphasis_terms = [term for term in section.key_terms[:4] if term.strip()]
 
         attributed_sentences: list[AttributedSentence] = []
@@ -4359,7 +3707,7 @@ def _build_noncomparative_insights_and_quiz(
                 ),
                 integrated_explanation=(
                     deep_sentence
-                    or "Use the deep-dive section and reflection points to pressure-test understanding."
+                    or "Use the boundary analysis and reflection points to pressure-test understanding."
                 ),
                 attributed_sentences=attributed_sentences,
             )
@@ -4367,66 +3715,128 @@ def _build_noncomparative_insights_and_quiz(
 
     parallels = intersections[0].attributed_sentences if intersections else []
     primary = source_sections[0]
-    layman_bridge = _truncate_sentence(primary.under_surface_explainer, limit=320) or _truncate_sentence(
-        primary.summary_text,
+    layman_clean = _normalize_continuous_prose(primary.under_surface_explainer)
+    summary_clean = _normalize_continuous_prose(primary.summary_text)
+    layman_bridge = _truncate_sentence(layman_clean, limit=320) or _truncate_sentence(
+        summary_clean,
         limit=320,
     )
-    source_labels = ", ".join(section.generated_title for section in source_sections[:4])
-    synthesis_text = (
-        f"This run has {len(source_sections)} source(s): {source_labels}. "
-        "Use each source section's deep dive, checklist, and reflection points to reinforce understanding before asking follow-up questions in chat."
-    )
 
+    # Build source context for the LLM quiz call.
+    quiz_context_parts: list[str] = []
+    for section in source_sections[:3]:
+        source_summary = _normalize_continuous_prose(section.summary_text)
+        source_deep = _normalize_continuous_prose(section.deep_dive_text)
+        source_under = _normalize_continuous_prose(section.under_surface_explainer)
+        terms = ", ".join(section.key_terms[:8])
+        quiz_context_parts.append(
+            f"Source: {section.generated_title} (ID: {section.source_id}, type: {section.source_type})\n"
+            f"Summary: {_truncate_for_prompt(source_summary, limit=600)}\n"
+            f"Boundary analysis: {_truncate_for_prompt(source_deep, limit=400)}\n"
+            f"Hidden assumptions: {_truncate_for_prompt(source_under, limit=300)}\n"
+            f"Key terms: {terms}"
+        )
+    quiz_context = "\n\n---\n\n".join(quiz_context_parts)
+
+    # LLM-generated quiz (replaces template stubs).
+    synthesis_text = ""
+    study_advice = ""
     quiz_questions: list[QuizQuestion] = []
-    for section in source_sections[:2]:
-        key_claim = _truncate_sentence(section.summary_text, limit=180) or section.generated_title
-        under_surface = _truncate_sentence(section.under_surface_explainer, limit=220)
-        source_evidence = [
-            value for value in [
-                _truncate_sentence(section.summary_text, limit=180),
-                _truncate_sentence(section.deep_dive_text, limit=180),
-            ] if value
-        ]
 
-        quiz_questions.append(
-            QuizQuestion(
-                question=(
-                    f"For '{section.generated_title}', which statement best matches the grounded explanation in your material?"
-                ),
-                options=[
-                    key_claim,
-                    "The source mainly argues from unsupported assumptions.",
-                    "The source presents no actionable mechanism.",
-                    "The source rejects the central idea entirely.",
-                ],
-                answer_index=0,
-                explanation="The first option restates the grounded claim from your source summary.",
-                under_the_hood=under_surface or "Look for the mechanism and boundary conditions in the deep dive.",
-                difficulty_level="foundational",
-                question_type="synthesis",
-                source_evidence=source_evidence or [f"Review source {section.source_id} summary and deep dive."],
+    try:
+        payload = _run_structured_generation_step(
+            run_id=run_id or "noncomp",
+            stage_name="noncomparative_quiz",
+            user_id=user_id,
+            system_prompt=NONCOMPARATIVE_QUIZ_SYSTEM_PROMPT,
+            user_prompt=(
+                f"Generate a challenging Socratic quiz from the following {len(source_sections)} source(s):\n\n"
+                f"{quiz_context}"
+            ),
+            response_schema=NONCOMPARATIVE_QUIZ_JSON_SCHEMA,
+            required_keys=["questions", "synthesis_text", "study_advice"],
+        )
+        synthesis_text = _normalize_continuous_prose(str(payload.get("synthesis_text", "")).strip())
+        study_advice = _normalize_continuous_prose(str(payload.get("study_advice", "")).strip())
+
+        for raw_question in payload.get("questions", []):
+            try:
+                # Handle old field name if model returns it.
+                if isinstance(raw_question, dict) and "under_the_hood" in raw_question and "reasoning_traps" not in raw_question:
+                    raw_question["reasoning_traps"] = raw_question.pop("under_the_hood")
+                quiz_questions.append(QuizQuestion.model_validate(raw_question))
+            except Exception:
+                continue
+
+        if quiz_questions:
+            log_generation_stage_event(
+                run_id=run_id or "noncomp",
+                user_id=user_id,
+                stage_name="noncomparative_quiz_llm",
+                attempt_number=1,
+                status="succeeded",
+                details=f"questions={len(quiz_questions)}",
             )
+    except Exception as exc:
+        log_generation_stage_event(
+            run_id=run_id or "noncomp",
+            user_id=user_id,
+            stage_name="noncomparative_quiz_llm",
+            attempt_number=1,
+            status="failed",
+            details=f"fallback_to_template={_trim_error_detail(str(exc))}",
         )
 
-    study_advice = (
-        "If this run has one source, ask the chatbox to test assumptions and edge cases. "
-        "If it has multiple sources, ask for agreements, tensions, and transfer steps across them."
-    )
+    # Fallback: if LLM quiz fails, produce minimal stub (but still cleaner than before).
+    if not quiz_questions:
+        for section in source_sections[:2]:
+            clean_summary = _normalize_continuous_prose(section.summary_text)
+            key_claim = _truncate_sentence(clean_summary, limit=180) or section.generated_title
+            quiz_questions.append(
+                QuizQuestion(
+                    question=f"Which mechanism does '{section.generated_title}' identify as its primary contribution?",
+                    options=[
+                        key_claim,
+                        "The source argues there is no reliable mechanism in this domain.",
+                        "The source focuses exclusively on historical precedent without proposing new mechanisms.",
+                        "The source dismisses all existing approaches without alternative.",
+                    ],
+                    answer_index=0,
+                    explanation=f"The correct answer captures the core mechanism from '{section.generated_title}'.",
+                    reasoning_traps="Distractors use absolute language or misattribute the source's argument. Check whether each option reflects the actual scope of the source.",
+                    difficulty_level="foundational",
+                    question_type="synthesis",
+                    source_evidence=[key_claim, f"Review the full summary of source {section.source_id}."],
+                )
+            )
+
+    if not synthesis_text:
+        source_labels = ", ".join(section.generated_title for section in source_sections[:4])
+        synthesis_text = (
+            f"This session covers {len(source_sections)} source(s): {source_labels}. "
+            "Use each source's boundary analysis and reflection points to deepen understanding before exploring cross-source connections in chat."
+        )
+
+    if not study_advice:
+        study_advice = (
+            "Start by reviewing each source's key terms and boundary conditions. "
+            "Then test yourself with the quiz below, paying attention to the reasoning traps in each distractor."
+        )
 
     insights_section = CombinedInsightSection(
         intersections=intersections,
         parallels=parallels,
-        layman_bridge=layman_bridge or "Use the source summaries and deep dives as your grounding layer.",
+        layman_bridge=layman_bridge or "Use the source summaries and boundary analyses as your grounding layer.",
         synthesis_text=synthesis_text,
         comparative_analysis="",
         application_scenarios=[],
-        model_name="deterministic-noncomparative",
+        model_name=GENERATION_MODEL,
         schema_version=4,
     )
     quiz_section = CombinedQuizSection(
         questions=quiz_questions,
         study_advice=study_advice,
-        model_name="deterministic-noncomparative",
+        model_name=GENERATION_MODEL,
         schema_version=2,
     )
     return insights_section, quiz_section
@@ -4436,15 +3846,15 @@ def _build_source_section_text_map(section: SourceLearningSection) -> dict[str, 
     reflection_text = " ".join(
         " ".join(
             part
-            for part in [point.question.strip(), point.explanation.strip(), point.under_the_hood.strip()]
+            for part in [point.question.strip(), point.explanation.strip(), point.reasoning_traps.strip()]
             if part
         )
         for point in section.reflection_points
     ).strip()
     key_term_text = " ".join(
-        f"{entry.term.strip()}: {entry.explanation.strip()}"
+        f"{entry.term.strip()}: {entry.layman.strip()} {entry.technical.strip()}"
         for entry in section.key_term_explanations
-        if entry.term.strip() and entry.explanation.strip()
+        if entry.term.strip() and (entry.layman.strip() or entry.technical.strip())
     ).strip()
     checklist_text = " ".join(item.strip() for item in section.diagnostic_checklist if item.strip()).strip()
 
@@ -4495,7 +3905,7 @@ def _build_cross_section_text_map(
             part
             for part in [
                 question.explanation.strip(),
-                question.under_the_hood.strip(),
+                question.reasoning_traps.strip(),
                 " ".join(item.strip() for item in question.source_evidence if item.strip()),
             ]
             if part
@@ -4617,7 +4027,6 @@ def generate_tailored_learning(
             )
 
     if video_section is not None and normalized_document_ids:
-        strict_cross_gates = ENABLE_STRICT_GENERATION_GATES
         cached_combined = None
         if CACHE_PROCESSED_SOURCES:
             cached_combined = _load_cached_combined_learning_sections(
@@ -4633,436 +4042,49 @@ def generate_tailored_learning(
             status="cache_hit" if cached_combined is not None else "cache_miss",
         )
 
-        relationship_insights = _load_relationship_insights(source_ids, user_id)
-        cross_intent_map = _build_cross_intent_map(
-            video_section=video_section,
-            document_sections=document_sections,
-        )
-        mapping_lock_claims: list[str] | None = None
-
-        cache_was_accepted = False
         if cached_combined is not None:
-            cached_insights, cached_quiz = cached_combined
+            insights_section, quiz_section = cached_combined
+        else:
             try:
-                cached_insights, cached_quiz, cache_cuts = _apply_cross_hard_cuts(
-                    insights=cached_insights,
-                    quiz=cached_quiz,
+                insights_section, quiz_section = _generate_synthesis_consolidation(
+                    video_section=video_section,
+                    document_sections=document_sections,
+                    user_id=user_id,
+                    run_id=run_id,
                 )
-                if strict_cross_gates:
-                    cached_cross_texts = _build_cross_section_text_map(cached_insights, cached_quiz)
-                    cached_progressive_texts = _build_progressive_cross_stage_texts(cached_insights, cached_quiz)
-                    source_texts = [
-                        video_section.summary_text,
-                        video_section.deep_dive_text,
-                        *[section.summary_text for section in document_sections],
-                        *[section.deep_dive_text for section in document_sections],
-                    ]
-
-                    used_interaction_types: set[str] = set()
-                    cached_connection_text = " ".join(
-                        part
-                        for part in [
-                            cached_cross_texts.get("connection", ""),
-                            cached_cross_texts.get("bridge", ""),
-                        ]
-                        if part
-                    ).strip()
-                    cached_connection_types = _classify_interaction_types(cached_connection_text)
-                    if "connection" not in cached_connection_types:
-                        raise ValueError("cached cross-source section missing connection interaction markers")
-                    used_interaction_types.add("connection")
-
-                    cached_dependency_types = _assert_interaction_stage_progression(
-                        stage_name="cross-source:dependency:cached",
-                        stage_text=cached_cross_texts.get("dependency", ""),
-                        used_types=used_interaction_types,
-                        required_new_types=set(cross_intent_map["dependency"]["required_types"]),
-                        source_texts=source_texts,
-                        max_source_restatement_ratio=0.45,
-                    )
-                    used_interaction_types.update(cached_dependency_types)
-
-                    cached_tradeoff_types = _assert_interaction_stage_progression(
-                        stage_name="cross-source:tradeoff:cached",
-                        stage_text=cached_cross_texts.get("tradeoff", ""),
-                        used_types=used_interaction_types,
-                        required_new_types=set(cross_intent_map["tradeoff"]["required_types"]),
-                        source_texts=source_texts,
-                        max_source_restatement_ratio=0.42,
-                    )
-                    used_interaction_types.update(cached_tradeoff_types)
-
-                    cached_friction_text = cached_cross_texts.get("friction", "")
-                    if _normalize_continuous_prose(cached_friction_text):
-                        cached_friction_types = _classify_interaction_types(cached_friction_text)
-                        if not cached_friction_types.intersection(set(cross_intent_map["friction"]["required_types"])):
-                            raise ValueError("cached cross-source friction stage missing required interaction markers")
-                        if _source_restatement_ratio(cached_friction_text, source_texts) > 0.38:
-                            raise ValueError("cached cross-source friction stage restates source content too strongly")
-
-                    mapping_lock_claims = _assert_progressive_cross_structure(
-                        stage_texts=cached_progressive_texts,
-                        source_texts=source_texts,
-                        mapping_lock_claims=None,
-                    )
-
-                    _assert_pairwise_uniqueness(
-                        run_id=run_id,
-                        user_id=user_id,
-                        section_group="cross-source",
-                        section_texts=cached_cross_texts,
-                        max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
-                        enable_claim_gate=True,
-                    )
-                else:
-                    log_generation_stage_event(
-                        run_id=run_id,
-                        user_id=user_id,
-                        stage_name="cross_generation_gates",
-                        attempt_number=1,
-                        status="skipped",
-                        details="strict_cross_gates_disabled",
-                    )
-                if cache_cuts:
-                    _store_combined_learning_sections(
-                        user_id=user_id,
-                        video_source_id=normalized_video_id,
-                        document_source_ids=normalized_document_ids,
-                        insights=cached_insights,
-                        quiz=cached_quiz,
-                    )
-                insights_section, quiz_section = cached_insights, cached_quiz
-                cache_was_accepted = True
+                _store_combined_learning_sections(
+                    user_id=user_id,
+                    video_source_id=normalized_video_id,
+                    document_source_ids=normalized_document_ids,
+                    insights=insights_section,
+                    quiz=quiz_section,
+                )
             except Exception as exc:
                 log_generation_stage_event(
                     run_id=run_id,
                     user_id=user_id,
-                    stage_name="combined_learning_cache_gate",
+                    stage_name="combined_learning_generation",
                     attempt_number=1,
                     status="failed",
                     details=_trim_error_detail(str(exc)),
                 )
+                raise
 
-        if not cache_was_accepted:
-            last_error: str | None = None
-            fallback_insights: CombinedInsightSection | None = None
-            fallback_quiz: CombinedQuizSection | None = None
-            combined_started_at = time.perf_counter()
-            combined_max_attempts = CROSS_SECTION_MAX_ATTEMPTS if strict_cross_gates else 1
-            for combined_attempt in range(1, combined_max_attempts + 1):
-                candidate_insights: CombinedInsightSection | None = None
-                quiz_section: CombinedQuizSection | None = None
-                try:
-                    insights_section = _generate_combined_insights(
-                        video_section=video_section,
-                        document_sections=document_sections,
-                        relationship_insights=relationship_insights,
-                        intent_guidance=_format_intent_guidance(cross_intent_map["connection"]),
-                        user_id=user_id,
-                        run_id=run_id,
-                    )
-                    comparative_analysis = _generate_comparative_analysis(
-                        video_section=video_section,
-                        document_sections=document_sections,
-                        insights_section=insights_section,
-                        relationship_insights=relationship_insights,
-                        intent_guidance=_format_intent_guidance(cross_intent_map["tradeoff"]),
-                        user_id=user_id,
-                        run_id=run_id,
-                    )
-                    application_scenarios = _generate_application_scenarios(
-                        video_section=video_section,
-                        document_sections=document_sections,
-                        insights_section=insights_section,
-                        comparative_analysis_text=comparative_analysis,
-                        relationship_insights=relationship_insights,
-                        intent_guidance=_format_intent_guidance(cross_intent_map["friction"]),
-                        user_id=user_id,
-                        run_id=run_id,
-                    )
-                    quiz_section = _generate_combined_quiz(
-                        video_section=video_section,
-                        document_sections=document_sections,
-                        insights_section=insights_section,
-                        comparative_analysis_text=comparative_analysis,
-                        application_scenarios=application_scenarios,
-                        relationship_insights=relationship_insights,
-                        intent_guidance=_format_intent_guidance(cross_intent_map["quiz"]),
-                        user_id=user_id,
-                        run_id=run_id,
-                    )
-                    candidate_insights = insights_section.model_copy(
-                        update={
-                            "comparative_analysis": comparative_analysis,
-                            "application_scenarios": application_scenarios,
-                        }
-                    )
-                    candidate_insights, quiz_section, cut_labels = _apply_cross_hard_cuts(
-                        insights=candidate_insights,
-                        quiz=quiz_section,
-                    )
-
-                    if not strict_cross_gates:
-                        insights_section = candidate_insights
-                        for cut_label in cut_labels:
-                            log_generation_stage_event(
-                                run_id=run_id,
-                                user_id=user_id,
-                                stage_name="cross_source_hard_cut",
-                                attempt_number=combined_attempt,
-                                status="succeeded",
-                                details=f"cut_section={cut_label}",
-                            )
-                        log_generation_stage_event(
-                            run_id=run_id,
-                            user_id=user_id,
-                            stage_name="cross_generation_gates",
-                            attempt_number=combined_attempt,
-                            status="skipped",
-                            details="strict_cross_gates_disabled",
-                        )
-                        _store_combined_learning_sections(
-                            user_id=user_id,
-                            video_source_id=normalized_video_id,
-                            document_source_ids=normalized_document_ids,
-                            insights=insights_section,
-                            quiz=quiz_section,
-                        )
-                        break
-
-                    candidate_cross_texts = _build_cross_section_text_map(candidate_insights, quiz_section)
-                    candidate_progressive_texts = _build_progressive_cross_stage_texts(candidate_insights, quiz_section)
-
-                    source_texts = [
-                        video_section.summary_text,
-                        video_section.deep_dive_text,
-                        *[section.summary_text for section in document_sections],
-                        *[section.deep_dive_text for section in document_sections],
-                    ]
-                    used_interaction_types: set[str] = set()
-
-                    connection_text = " ".join(
-                        part
-                        for part in [
-                            candidate_cross_texts.get("connection", ""),
-                            candidate_cross_texts.get("bridge", ""),
-                        ]
-                        if part
-                    ).strip()
-                    connection_types = _classify_interaction_types(connection_text)
-                    if "connection" not in connection_types:
-                        raise ValueError("cross-source interaction typing failed: connection stage missing connection markers")
-                    used_interaction_types.add("connection")
-
-                    dependency_types = _assert_interaction_stage_progression(
-                        stage_name="cross-source:dependency",
-                        stage_text=candidate_cross_texts.get("dependency", ""),
-                        used_types=used_interaction_types,
-                        required_new_types=set(cross_intent_map["dependency"]["required_types"]),
-                        source_texts=source_texts,
-                        max_source_restatement_ratio=0.45,
-                    )
-                    used_interaction_types.update(dependency_types)
-
-                    tradeoff_types = _assert_interaction_stage_progression(
-                        stage_name="cross-source:tradeoff",
-                        stage_text=candidate_cross_texts.get("tradeoff", ""),
-                        used_types=used_interaction_types,
-                        required_new_types=set(cross_intent_map["tradeoff"]["required_types"]),
-                        source_texts=source_texts,
-                        max_source_restatement_ratio=0.42,
-                    )
-                    used_interaction_types.update(tradeoff_types)
-
-                    friction_text = candidate_cross_texts.get("friction", "")
-                    if _normalize_continuous_prose(friction_text):
-                        friction_types = _classify_interaction_types(friction_text)
-                        if not friction_types.intersection(set(cross_intent_map["friction"]["required_types"])):
-                            raise ValueError(
-                                "cross-source interaction typing failed: friction stage missing required interaction markers"
-                            )
-                        if _source_restatement_ratio(friction_text, source_texts) > 0.38:
-                            raise ValueError("cross-source friction stage restates source content too strongly")
-
-                    current_mapping_claims = _assert_progressive_cross_structure(
-                        stage_texts=candidate_progressive_texts,
-                        source_texts=source_texts,
-                        mapping_lock_claims=mapping_lock_claims,
-                    )
-                    if mapping_lock_claims is None:
-                        mapping_lock_claims = current_mapping_claims
-
-                    _assert_pairwise_uniqueness(
-                        run_id=run_id,
-                        user_id=user_id,
-                        section_group="cross-source",
-                        section_texts=candidate_cross_texts,
-                        max_overlap_ratio=CROSS_SECTION_PAIR_OVERLAP_THRESHOLD,
-                        enable_claim_gate=True,
-                    )
-                    insights_section = candidate_insights
-                    for cut_label in cut_labels:
-                        log_generation_stage_event(
-                            run_id=run_id,
-                            user_id=user_id,
-                            stage_name="cross_source_hard_cut",
-                            attempt_number=combined_attempt,
-                            status="succeeded",
-                            details=f"cut_section={cut_label}",
-                        )
-                    _store_combined_learning_sections(
-                        user_id=user_id,
-                        video_source_id=normalized_video_id,
-                        document_source_ids=normalized_document_ids,
-                        insights=insights_section,
-                        quiz=quiz_section,
-                    )
-                    break
-                except Exception as exc:
-                    last_error = str(exc)
-                    if candidate_insights is not None and quiz_section is not None:
-                        fallback_insights = candidate_insights
-                        fallback_quiz = quiz_section
-                    log_generation_stage_event(
-                        run_id=run_id,
-                        user_id=user_id,
-                        stage_name="cross_section_uniqueness_gate",
-                        attempt_number=combined_attempt,
-                        status="failed",
-                        details=_trim_error_detail(last_error),
-                    )
-                    elapsed_cross_seconds = time.perf_counter() - combined_started_at
-                    attempts_exhausted = combined_attempt >= combined_max_attempts
-                    budget_exhausted = elapsed_cross_seconds >= CROSS_SECTION_MAX_SECONDS
-
-                    if attempts_exhausted or budget_exhausted:
-                        if fallback_insights is None or fallback_quiz is None:
-                            if not strict_cross_gates:
-                                insights_section, quiz_section = _build_noncomparative_insights_and_quiz(all_sections)
-                                log_generation_stage_event(
-                                    run_id=run_id,
-                                    user_id=user_id,
-                                    stage_name="cross_section_noncomparative_fallback",
-                                    attempt_number=combined_attempt,
-                                    status="succeeded",
-                                    details="strict_cross_gates_disabled",
-                                )
-                                break
-                            raise GenerationStageError(
-                                run_id=run_id,
-                                stage_name="cross_section_uniqueness_gate",
-                                attempt_number=combined_attempt,
-                                reason=_trim_error_detail(
-                                    (
-                                        f"{last_error or 'unknown error'}; "
-                                        f"attempts_exhausted={attempts_exhausted}; "
-                                        f"budget_exhausted={budget_exhausted}; "
-                                        f"elapsed_cross_seconds={elapsed_cross_seconds:.1f}"
-                                    )
-                                ),
-                            ) from exc
-
-                        fallback_insights, fallback_quiz, fallback_cuts = _apply_cross_hard_cuts(
-                            insights=fallback_insights,
-                            quiz=fallback_quiz,
-                        )
-                        insights_section = fallback_insights
-                        quiz_section = fallback_quiz
-                        for cut_label in fallback_cuts:
-                            log_generation_stage_event(
-                                run_id=run_id,
-                                user_id=user_id,
-                                stage_name="cross_source_hard_cut_fallback",
-                                attempt_number=combined_attempt,
-                                status="succeeded",
-                                details=f"cut_section={cut_label}",
-                            )
-                        log_generation_stage_event(
-                            run_id=run_id,
-                            user_id=user_id,
-                            stage_name="cross_section_fast_fallback",
-                            attempt_number=combined_attempt,
-                            status="succeeded",
-                            details=(
-                                f"attempts_exhausted={attempts_exhausted}; "
-                                f"budget_exhausted={budget_exhausted}; "
-                                f"elapsed_cross_seconds={elapsed_cross_seconds:.1f}"
-                            ),
-                        )
-                        _store_combined_learning_sections(
-                            user_id=user_id,
-                            video_source_id=normalized_video_id,
-                            document_source_ids=normalized_document_ids,
-                            insights=insights_section,
-                            quiz=quiz_section,
-                        )
-                        break
-
-        cross_section_text_map = _build_progressive_cross_stage_texts(
-            insights_section,
-            quiz_section,
-            user_id=user_id,
-            run_id=run_id,
-            document_source_ids=normalized_document_ids,
-        )
-        cross_prior_map: dict[str, list[str]] = {
-            "mapping": [],
-            "constraint": [cross_section_text_map.get("mapping", "")],
-            "transfer": [
-                cross_section_text_map.get("mapping", ""),
-                cross_section_text_map.get("constraint", ""),
-            ],
-            "decision": [
-                cross_section_text_map.get("mapping", ""),
-                cross_section_text_map.get("constraint", ""),
-                cross_section_text_map.get("transfer", ""),
-            ],
-        }
-        for section_type, text_value in cross_section_text_map.items():
-            if not _normalize_continuous_prose(text_value):
-                continue
-            _record_novelty_ledger_entry(
-                user_id=user_id,
-                run_id=run_id,
-                source_id=None,
-                document_source_ids=normalized_document_ids,
-                section_type=f"cross:{section_type}",
-                section_text=text_value,
-                prior_texts=cross_prior_map.get(section_type, []),
-                expansion_applied=False,
-            )
     else:
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name="combined_learning_cache",
-            attempt_number=1,
-            status="skipped",
-            details="Non-comparative run: skipping combined comparative generation stages.",
+        insights_section = CombinedInsightSection(
+            synthesis_text="",
+            intersections=[],
+            parallels=[],
+            layman_bridge="",
+            comparative_analysis="",
+            application_scenarios=[],
+            model_name=CONSOLIDATION_MODEL,
         )
-        insights_section, quiz_section = _build_noncomparative_insights_and_quiz(all_sections)
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name="noncomparative_generation",
-            attempt_number=1,
-            status="succeeded",
-            details=f"source_count={len(all_sections)}",
+        quiz_section = CombinedQuizSection(
+            questions=[],
+            study_advice="",
+            model_name=CONSOLIDATION_MODEL,
         )
-
-    log_generation_stage_event(
-        run_id=run_id,
-        user_id=user_id,
-        stage_name="pipeline_end",
-        attempt_number=1,
-        status="succeeded",
-        details=(
-            f"video_source_id={normalized_video_id if normalized_video_id is not None else 'none'}; "
-            f"document_count={len(normalized_document_ids)}"
-        ),
-    )
-
-    _CRITIC_BUDGET_BY_RUN.pop(run_id, None)
 
     return GenerateTailoredLearningResponse(
         status_message="Tailored Socratic learning generated successfully.",
