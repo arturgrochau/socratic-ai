@@ -609,17 +609,11 @@ def _run_generation(
         "options",
         "answer_index",
         "explanation",
-        "under_the_hood",
-        "difficulty_level",
-        "question_type",
         "source_evidence",
     }
     for question in questions:
         if not required_question_fields.issubset(set(question.keys())):
-            raise RuntimeError("Generation payload has a malformed advanced quiz question entry.")
-
-    if questions and not str(quiz.get("study_advice", "")).strip():
-        raise RuntimeError("Generation payload has quiz questions but no study advice.")
+            raise RuntimeError("Generation payload has a malformed quiz question entry.")
 
     if strict_generation_quality:
         _assert_cross_progression_structure(insights, quiz)

@@ -8,6 +8,10 @@ from sqlalchemy import text
 from app.cost_logging import log_api_usage
 from app.models import ConceptExtractionPayload, ProcessSourceResponse
 from config import CACHE_PROCESSED_SOURCES, PROCESSING_MODEL, db_engine, openai_client
+from prompts.combined_processing import (
+    COMBINED_PROCESSING_JSON_SCHEMA,
+    COMBINED_PROCESSING_SYSTEM_PROMPT,
+)
 from prompts.concept_extraction import (
     CONCEPT_EXTRACTION_JSON_SCHEMA,
     CONCEPT_EXTRACTION_SYSTEM_PROMPT,
@@ -302,6 +306,51 @@ def build_source_context(source_type: str, chunks: list[str]) -> str:
     return f"Source Type: {source_type}\n\n" + "\n\n".join(chunk_blocks)
 
 
+def process_source_combined(
+    source_type: Literal["video", "document"],
+    source_context: str,
+    user_id: str,
+) -> tuple[ConceptExtractionPayload, str]:
+    """Single call that returns both concept extraction and source summary."""
+    import json as _json
+    completion = openai_client.chat.completions.create(
+        model=PROCESSING_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": COMBINED_PROCESSING_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Source type: {source_type}\n\n"
+                    "Analyze this source and return concepts and summary:\n\n"
+                    f"{source_context}"
+                ),
+            },
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": COMBINED_PROCESSING_JSON_SCHEMA,
+        },
+    )
+    log_api_usage(
+        response=completion,
+        user_id=user_id,
+        call_stage="processing",
+        model_name=PROCESSING_MODEL,
+    )
+
+    content = completion.choices[0].message.content
+    if not content:
+        raise ValueError("Model returned empty combined processing content.")
+
+    payload = _json.loads(content)
+    extraction = ConceptExtractionPayload.model_validate({"concepts": payload.get("concepts", [])})
+    summary_text = str(payload.get("source_summary", "")).strip()
+    if not summary_text:
+        raise ValueError("Model returned empty source summary in combined call.")
+    return extraction, summary_text
+
+
 def extract_concepts_once(source_context: str, user_id: str) -> ConceptExtractionPayload:
     completion = openai_client.chat.completions.create(
         model=PROCESSING_MODEL,
@@ -528,8 +577,12 @@ def process_source(source_id: int, user_id: str) -> ProcessSourceResponse:
         chunks = chunk_document_text(raw_text)
 
     source_context = build_source_context(source_type, chunks)
-    extraction_payload = existing_payload or extract_concepts_once(source_context, user_id)
-    summary_text = existing_summary or generate_source_summary(source_type, source_context, user_id)
+
+    if existing_payload is None and existing_summary is None:
+        extraction_payload, summary_text = process_source_combined(source_type, source_context, user_id)
+    else:
+        extraction_payload = existing_payload or extract_concepts_once(source_context, user_id)
+        summary_text = existing_summary or generate_source_summary(source_type, source_context, user_id)
 
     if existing_payload is None:
         store_concept_extraction(

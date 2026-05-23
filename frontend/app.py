@@ -1899,6 +1899,14 @@ def main() -> None:
         st.header("Learning Dashboard")
         _render_generation_tabs(has_user_id)
 
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        "<div style='text-align: center; color: #888; font-size: 0.75rem;'>"
+        "Made by <strong>Artur Grochau</strong>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
 
 if __name__ == "__main__":
     main()

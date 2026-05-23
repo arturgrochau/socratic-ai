@@ -178,7 +178,6 @@ class DeduplicationTests(unittest.TestCase):
             ReflectionPoint(
                 question="What fails first?",
                 explanation="Delayed feedback stability and constrained updates are central constraints in this mechanism.",
-                under_the_hood="Delayed feedback stability and constrained updates are central constraints in this mechanism.",
                 depth_level="foundational",
             )
         ]
@@ -186,6 +185,7 @@ class DeduplicationTests(unittest.TestCase):
         (
             cut_deep,
             cut_under,
+            cut_fps,
             cut_reflection,
             cut_checklist,
             cut_terms,
@@ -194,6 +194,7 @@ class DeduplicationTests(unittest.TestCase):
             summary_text=summary,
             deep_dive_text=deep,
             under_surface_explainer=under,
+            first_principles_synthesis="",
             reflection_points=reflection_points,
             diagnostic_checklist=["Check whether delayed feedback is stable."],
             key_term_explanations=[],
@@ -214,12 +215,13 @@ class ProgressionOutlineEfficiencyTests(unittest.TestCase):
         )
         self.assertFalse(should_use_model)
 
-    def test_long_sources_use_model_outline_stage(self) -> None:
+    def test_long_sources_also_use_heuristic_outline_stage(self) -> None:
+        # OUTLINE_MODEL_MIN_GROUNDING_ROWS = 999999 disables the model path entirely
         should_use_model = _should_use_model_progression_outline(
             total_rows=24,
             grounding_chunks=[str(index) for index in range(7)],
         )
-        self.assertTrue(should_use_model)
+        self.assertFalse(should_use_model)
 
 
 class ControllerGuardTests(unittest.TestCase):

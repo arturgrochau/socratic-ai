@@ -42,21 +42,9 @@ from config import (
     db_engine,
     openai_client,
 )
-from prompts.synthesis_consolidator import (
-    SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
-    SYNTHESIS_CONSOLIDATOR_SYSTEM_PROMPT,
-)
 from prompts.chunk_diff import (
     CHUNK_DIFF_JSON_SCHEMA,
     CHUNK_DIFF_SYSTEM_PROMPT,
-)
-from prompts.source_consolidator import (
-    SOURCE_CONSOLIDATOR_JSON_SCHEMA,
-    SOURCE_CONSOLIDATOR_SYSTEM_PROMPT,
-)
-from prompts.synthesis_consolidator import (
-    SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
-    SYNTHESIS_CONSOLIDATOR_SYSTEM_PROMPT,
 )
 from prompts.noncomparative_quiz import (
     NONCOMPARATIVE_QUIZ_JSON_SCHEMA,
@@ -66,19 +54,22 @@ from prompts.socratic_reflection import (
     SOCRATIC_REFLECTION_JSON_SCHEMA,
     SOCRATIC_REFLECTION_SYSTEM_PROMPT,
 )
+from prompts.source_content_pack import (
+    SOURCE_CONTENT_PACK_JSON_SCHEMA,
+    SOURCE_CONTENT_PACK_SYSTEM_PROMPT,
+)
 from prompts.source_deep_dive import (
     SOURCE_DEEP_DIVE_JSON_SCHEMA,
     SOURCE_DEEP_DIVE_SYSTEM_PROMPT,
 )
-from prompts.source_progression_outline import (
-    SOURCE_PROGRESSION_OUTLINE_JSON_SCHEMA,
-    SOURCE_PROGRESSION_OUTLINE_SYSTEM_PROMPT,
+from prompts.synthesis_consolidator import (
+    SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
+    SYNTHESIS_CONSOLIDATOR_SYSTEM_PROMPT,
 )
-from prompts.source_title import SOURCE_TITLE_JSON_SCHEMA, SOURCE_TITLE_SYSTEM_PROMPT
 from prompts.under_surface import UNDER_SURFACE_JSON_SCHEMA, UNDER_SURFACE_SYSTEM_PROMPT
 
 
-GENERATION_SCHEMA_VERSION = 10
+GENERATION_SCHEMA_VERSION = 11
 MAX_GROUNDING_CHUNKS = 10
 MAX_GROUNDING_CHARS = 9000
 MAX_UNDER_SURFACE_GROUNDING_CHUNKS = 6
@@ -93,7 +84,7 @@ DEDUPLICATION_SIMILARITY_THRESHOLD = 0.9
 DEDUPLICATION_TOKEN_OVERLAP_THRESHOLD = 0.58
 DEDUPLICATION_MIN_CHAR_RATIO = 0.35
 DEDUPLICATION_MIN_TOKEN_LENGTH = 4
-OUTLINE_MODEL_MIN_GROUNDING_ROWS = 12
+OUTLINE_MODEL_MIN_GROUNDING_ROWS = 999999
 MAX_EXPANSION_GROUNDING_CHARS = 8000
 MAX_DEEP_DIVE_WORDS = 900
 SECTION_REDUNDANCY_RATIO_THRESHOLD = 0.34
@@ -389,13 +380,25 @@ def _run_structured_generation_step(
         )
 
         try:
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if attempt_number > 1 and last_error_detail and last_error_detail != "Retry budget exhausted.":
+                messages += [
+                    {"role": "assistant", "content": "(previous attempt returned malformed output)"},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Previous attempt failed: {last_error_detail[:400]}. "
+                            "Please return valid JSON exactly matching the required schema."
+                        ),
+                    },
+                ]
             completion = openai_client.chat.completions.create(
                 model=model_name,
                 temperature=0,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=messages,
                 response_format={"type": "json_schema", "json_schema": response_schema},
             )
             log_api_usage(
@@ -984,43 +987,6 @@ def _token_overlap_ratio(left_text: str, right_text: str) -> float:
     return intersection_size / union_size
 
 
-def _generate_source_progression_outline(
-    *,
-    summary_text: str,
-    source_type: str,
-    grounding_chunks: list[str],
-    user_id: str,
-    run_id: str,
-) -> str:
-    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
-    payload = _run_structured_generation_step(
-        run_id=run_id,
-        stage_name=f"source_progression_outline:{source_type}",
-        user_id=user_id,
-        system_prompt=SOURCE_PROGRESSION_OUTLINE_SYSTEM_PROMPT,
-        user_prompt=(
-            f"Source type: {source_type}\n\n"
-            f"Summary:\n{summary_text}\n\n"
-            "Distributed grounding chunks:\n"
-            f"{chunk_text}"
-        ),
-        response_schema=SOURCE_PROGRESSION_OUTLINE_JSON_SCHEMA,
-        required_keys=["progression_outline", "transition_points"],
-    )
-
-    progression_outline = str(payload.get("progression_outline") or "").strip()
-    transition_points = [
-        str(item).strip()
-        for item in payload.get("transition_points", [])
-        if str(item).strip()
-    ]
-    if not progression_outline:
-        raise ValueError("Model returned empty progression outline text.")
-
-    if transition_points:
-        transition_block = "\n".join(f"- {item}" for item in transition_points)
-        return f"{progression_outline}\n\nCore transitions:\n{transition_block}"
-    return progression_outline
 
 
 def _split_into_sentences(text_value: str) -> list[str]:
@@ -2309,7 +2275,7 @@ def _find_worst_overlap_pair(
 
 def _reflection_points_to_text(reflection_points: list[ReflectionPoint]) -> str:
     return " ".join(
-        " ".join(part for part in [point.question, point.explanation, point.reasoning_traps] if part)
+        " ".join(part for part in [point.question, point.explanation] if part)
         for point in reflection_points
     ).strip()
 
@@ -2489,24 +2455,80 @@ def _expand_nonredundant_text(
     return str(payload.get("expanded_text") or "").strip()
 
 
-def _generate_source_title(summary_text: str, source_type: str, user_id: str, run_id: str) -> str:
+def _derive_title_from_filename(source_name: str, source_type: str) -> str:
+    from pathlib import Path as _Path
+    stem = _Path(source_name).stem if source_name else f"{source_type}_source"
+    title = stem.replace("_", " ").replace("-", " ").strip()
+    title = " ".join(w.capitalize() for w in title.split())
+    return title[:60] or f"{source_type.capitalize()} Source"
+
+
+def _generate_source_content_pack(
+    *,
+    summary_text: str,
+    source_type: str,
+    claim_ledger: list[ClaimLedgerEntry],
+    progression_outline: str,
+    grounding_chunks: list[str],
+    user_id: str,
+    run_id: str,
+) -> tuple[str, list[str], str, str, list[ReflectionPoint]]:
+    """Single call replacing deep_dive + under_surface + reflection."""
+    claim_text = _format_claim_ledger(claim_ledger)
+    chunk_text = "\n\n".join(grounding_chunks) if grounding_chunks else "[No grounding chunks available]"
     payload = _run_structured_generation_step(
         run_id=run_id,
-        stage_name=f"source_title:{source_type}",
+        stage_name=f"source_content_pack:{source_type}",
         user_id=user_id,
-        system_prompt=SOURCE_TITLE_SYSTEM_PROMPT,
+        system_prompt=SOURCE_CONTENT_PACK_SYSTEM_PROMPT,
         user_prompt=(
             f"Source type: {source_type}\n\n"
-            "Generate a concise title from this summary:\n\n"
-            f"{summary_text}"
+            f"Source summary (do not restate this — build on it):\n{summary_text}\n\n"
+            f"Progression outline:\n{progression_outline}\n\n"
+            "CLAIM LEDGER (novel facts not in summary — use as primary material for deep_dive):\n"
+            f"{claim_text}\n\n"
+            f"Grounding chunks:\n{chunk_text}"
         ),
-        response_schema=SOURCE_TITLE_JSON_SCHEMA,
-        required_keys=["title"],
+        response_schema=SOURCE_CONTENT_PACK_JSON_SCHEMA,
+        required_keys=["deep_dive_text", "key_terms", "first_principles_synthesis", "under_surface_explainer", "reflection_points"],
     )
-    title = str(payload.get("title", "")).strip()
-    if not title:
-        raise ValueError("Model returned an empty source title.")
-    return title
+
+    deep_dive_text = _truncate_to_max_words(
+        _normalize_continuous_prose(str(payload.get("deep_dive_text", "")).strip()),
+        max_words=MAX_DEEP_DIVE_WORDS,
+    )
+    key_terms = [
+        str(t).strip() for t in payload.get("key_terms", []) if str(t).strip()
+    ]
+    first_principles_synthesis = str(payload.get("first_principles_synthesis", "")).strip()
+    under_surface_explainer = _normalize_continuous_prose(
+        str(payload.get("under_surface_explainer", "")).strip()
+    )
+
+    raw_points = payload.get("reflection_points", [])
+    reflection_points: list[ReflectionPoint] = []
+    for raw_point in raw_points:
+        try:
+            reflection_points.append(ReflectionPoint.model_validate(raw_point))
+        except Exception:
+            point_text = str(raw_point).strip()
+            if point_text:
+                reflection_points.append(
+                    ReflectionPoint(
+                        question=point_text,
+                        explanation="Reflect on how this idea works in concrete situations.",
+                        depth_level="foundational",
+                    )
+                )
+
+    if not deep_dive_text:
+        raise ValueError("Model returned an empty deep-dive section.")
+    if len(key_terms) < 5:
+        raise ValueError("Model returned too few key terms.")
+    if len(reflection_points) < 4:
+        raise ValueError("Model returned too few reflection points.")
+
+    return deep_dive_text, key_terms, first_principles_synthesis, under_surface_explainer, reflection_points
 
 
 def _build_chunk_windows(
@@ -2698,9 +2720,6 @@ def _generate_reflection_points(
     points: list[ReflectionPoint] = []
     for raw_point in raw_points:
         try:
-            # Handle both old (under_the_hood) and new (reasoning_traps) field names
-            if isinstance(raw_point, dict) and "under_the_hood" in raw_point and "reasoning_traps" not in raw_point:
-                raw_point["reasoning_traps"] = raw_point.pop("under_the_hood")
             points.append(ReflectionPoint.model_validate(raw_point))
         except Exception:
             point_text = str(raw_point).strip()
@@ -2709,7 +2728,6 @@ def _generate_reflection_points(
                     ReflectionPoint(
                         question=point_text,
                         explanation="Reflect on how this idea works in concrete situations.",
-                        reasoning_traps="Trace the mechanism that makes this idea true and identify where it could mislead.",
                         depth_level="foundational",
                     )
                 )
@@ -2906,7 +2924,6 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
                     ReflectionPoint(
                         question=value,
                         explanation="Reflect on what this means in context.",
-                        reasoning_traps="Identify the underlying mechanism behind this idea.",
                         depth_level="foundational",
                     )
                 )
@@ -2992,20 +3009,10 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
     summary_text = _normalize_continuous_prose(summary_text)
 
     grounding_rows = _load_grounding_chunk_rows(source_id, user_id)
-    grounding_chunks, deep_dive_chunk_indexes = _select_distributed_grounding_chunks(
+    grounding_chunks, grounding_chunk_indexes = _select_distributed_grounding_chunks(
         grounding_rows,
         max_chunks=MAX_GROUNDING_CHUNKS,
         max_chars=MAX_GROUNDING_CHARS,
-    )
-    under_surface_chunks, under_surface_chunk_indexes = _select_distributed_grounding_chunks(
-        grounding_rows,
-        max_chunks=MAX_UNDER_SURFACE_GROUNDING_CHUNKS,
-        max_chars=MAX_UNDER_SURFACE_GROUNDING_CHARS,
-    )
-    reflection_chunks, reflection_chunk_indexes = _select_distributed_grounding_chunks(
-        grounding_rows,
-        max_chunks=MAX_REFLECTION_GROUNDING_CHUNKS,
-        max_chars=MAX_REFLECTION_GROUNDING_CHARS,
     )
 
     log_generation_stage_event(
@@ -3014,49 +3021,18 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         stage_name=f"source_grounding_selection:{source_type}",
         attempt_number=1,
         status="succeeded",
-        details=(
-            f"total_rows={len(grounding_rows)};"
-            f"deep_dive={deep_dive_chunk_indexes};"
-            f"under_surface={under_surface_chunk_indexes};"
-            f"reflection={reflection_chunk_indexes}"
-        ),
+        details=f"total_rows={len(grounding_rows)};selected={grounding_chunk_indexes}",
     )
 
-    if _should_use_model_progression_outline(
-        total_rows=len(grounding_rows),
-        grounding_chunks=grounding_chunks,
-    ):
-        progression_outline = _generate_source_progression_outline(
-            summary_text=summary_text,
-            source_type=source_type,
-            grounding_chunks=grounding_chunks,
-            user_id=user_id,
-            run_id=run_id,
-        )
-    else:
-        progression_outline = _build_heuristic_progression_outline(
-            summary_text=summary_text,
-            grounding_chunks=grounding_chunks,
-        )
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_progression_outline:{source_type}",
-            attempt_number=1,
-            status="skipped",
-            details=(
-                "heuristic_short_source;"
-                f"total_rows={len(grounding_rows)};"
-                f"grounding_chunk_count={len(grounding_chunks)}"
-            ),
-        )
-    generated_title = _generate_source_title(summary_text, source_type, user_id, run_id)
-    source_intent_map = _build_source_intent_map(
+    # Always use heuristic outline — cheaper and sufficient for deep dive context
+    progression_outline = _build_heuristic_progression_outline(
         summary_text=summary_text,
-        progression_outline=progression_outline,
+        grounding_chunks=grounding_chunks,
     )
 
-    # Stage 3: Extract novel claims from chunk windows
+    generated_title = _derive_title_from_filename(str(source_name), source_type)
+
+    # Extract novel claims (1 window only)
     claim_ledger = _extract_chunk_diff_claims(
         summary_text=summary_text,
         grounding_chunks=grounding_chunks,
@@ -3065,102 +3041,28 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         run_id=run_id,
     )
 
-    # Stage 4: Boundary conditions & failure modes (uses claim ledger)
-    deep_dive_text, key_terms = _generate_source_deep_dive(
-        summary_text,
-        source_type,
-        claim_ledger,
-        progression_outline,
-        _format_intent_guidance(source_intent_map["deep_dive"]),
-        user_id,
-        run_id,
+    # Single combined call: deep_dive + under_surface + reflection
+    deep_dive_text, key_terms, first_principles_synthesis, under_surface_explainer, reflection_points = (
+        _generate_source_content_pack(
+            summary_text=summary_text,
+            source_type=source_type,
+            claim_ledger=claim_ledger,
+            progression_outline=progression_outline,
+            grounding_chunks=grounding_chunks,
+            user_id=user_id,
+            run_id=run_id,
+        )
     )
+
+    # Deterministic dedup (no LLM calls)
     deep_dive_text = _truncate_to_max_words(
         _enforce_section_novelty(deep_dive_text, [summary_text, progression_outline]),
         max_words=MAX_DEEP_DIVE_WORDS,
     )
-
-    # Soft flag instead of hard gate kill
-    low_mechanism_density = False
-    if deep_dive_text and not _section_has_required_variables(
-        section_text=deep_dive_text,
-        prior_texts=[summary_text, progression_outline],
-        required_families=source_intent_map["deep_dive"]["required_variables"],
-    ):
-        low_mechanism_density = True
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_variable_gate_deep:{source_type}",
-            attempt_number=1,
-            status="soft_flag",
-            details="No new required variable family introduced; flagged as low_mechanism_density but kept.",
-        )
-
-    # Stage 6: Reflection points (uses claim ledger, not raw chunks)
-    remaining_claims_for_reflection = _filter_used_claims(claim_ledger, deep_dive_text)
-    reflection_points = _generate_reflection_points(
-        summary_text,
-        deep_dive_text,
-        source_type,
-        progression_outline,
-        remaining_claims_for_reflection,
-        _format_intent_guidance(source_intent_map["reflection"]),
-        user_id,
-        run_id,
-    )
-    reflection_points = [
-        point.model_copy(
-            update={
-                "explanation": _enforce_section_novelty(
-                    point.explanation,
-                    [summary_text, deep_dive_text],
-                ),
-                "reasoning_traps": _enforce_section_novelty(
-                    point.reasoning_traps,
-                    [summary_text, deep_dive_text, point.explanation],
-                ),
-            }
-        )
-        for point in reflection_points
-    ]
-    reflection_text_pre = _reflection_points_to_text(reflection_points)
-
-    # Stage 5: Hidden assumptions (uses remaining claims not used in deep dive)
-    remaining_claims_for_under = _filter_used_claims(claim_ledger, deep_dive_text)
-    under_surface_explainer, first_principles_synthesis, diagnostic_checklist, key_term_explanations = _generate_under_surface_pack(
-        summary_text=summary_text,
-        deep_dive_text=deep_dive_text,
-        key_terms=key_terms,
-        source_type=source_type,
-        grounding_chunks=under_surface_chunks,
-        progression_outline=progression_outline,
-        intent_guidance=_format_intent_guidance(source_intent_map["under_surface"]),
-        user_id=user_id,
-        run_id=run_id,
-    )
     under_surface_explainer = _deduplicate_section_text(
         under_surface_explainer,
-        [summary_text, deep_dive_text, reflection_text_pre],
+        [summary_text, deep_dive_text],
     )
-    under_surface_explainer = _normalize_continuous_prose(under_surface_explainer)
-
-    # Soft flag instead of hard gate kill for under-surface
-    if under_surface_explainer and not _section_has_required_variables(
-        section_text=under_surface_explainer,
-        prior_texts=[summary_text, deep_dive_text, reflection_text_pre],
-        required_families=source_intent_map["under_surface"]["required_variables"],
-    ):
-        low_mechanism_density = True
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_variable_gate_under:{source_type}",
-            attempt_number=1,
-            status="soft_flag",
-            details="No new required variable family introduced; flagged but content kept.",
-        )
-
     reflection_points = [
         point.model_copy(
             update={
@@ -3168,51 +3070,12 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
                     point.explanation,
                     [summary_text, deep_dive_text, under_surface_explainer],
                 ),
-                "reasoning_traps": _enforce_section_novelty(
-                    point.reasoning_traps,
-                    [summary_text, deep_dive_text, under_surface_explainer, point.explanation],
-                ),
             }
         )
         for point in reflection_points
     ]
 
-    required_reflection_vars = source_intent_map["reflection"]["required_variables"]
-    filtered_reflection_points: list[ReflectionPoint] = []
-    for point in reflection_points:
-        point_text = " ".join(part for part in [point.explanation, point.reasoning_traps] if part)
-        if _section_has_required_variables(
-            section_text=point_text,
-            prior_texts=[summary_text, deep_dive_text, under_surface_explainer],
-            required_families=required_reflection_vars,
-        ):
-            filtered_reflection_points.append(point)
-    if filtered_reflection_points:
-        reflection_points = filtered_reflection_points
-    else:
-        log_generation_stage_event(
-            run_id=run_id,
-            user_id=user_id,
-            stage_name=f"source_variable_gate_reflection:{source_type}",
-            attempt_number=1,
-            status="failed",
-            details="No reflection points introduced new required variable families; omitting reflection section.",
-        )
-        reflection_points = []
-
-    refined_checklist: list[str] = []
-    for checklist_item in diagnostic_checklist:
-        normalized_item = _normalize_continuous_prose(checklist_item)
-        if not normalized_item:
-            continue
-        constrained_item = _enforce_section_novelty(
-            normalized_item,
-            [summary_text, deep_dive_text, under_surface_explainer, reflection_text_pre, *refined_checklist],
-        )
-        if constrained_item:
-            refined_checklist.append(constrained_item)
-    diagnostic_checklist = refined_checklist[:6]
-
+    low_mechanism_density = False
     reflection_text = _reflection_points_to_text(reflection_points)
 
     source_section_texts = {
@@ -3230,103 +3093,35 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
             max_overlap_ratio=SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD,
             enable_claim_gate=True,
         )
-    except Exception as exc:
-        try:
-            refined_deep_dive = _expand_nonredundant_text(
-                run_id=run_id,
-                stage_name=f"source_role_refine_deep:{source_type}",
-                user_id=user_id,
-                context_label=f"{source_type} deep dive role-separation refinement",
-                base_text=deep_dive_text,
-                avoid_texts=[summary_text, under_surface_explainer, reflection_text],
-                grounding_chunks=grounding_chunks,
-                key_terms=key_terms,
-                extra_context=(
-                    "Keep this section focused on mechanism-level explanation only. "
-                    "Do not restate reflection content or practical checklist language."
-                ),
-            )
-            if refined_deep_dive:
-                deep_dive_text = _truncate_to_max_words(
-                    _enforce_section_novelty(refined_deep_dive, [summary_text, under_surface_explainer, reflection_text]),
-                    max_words=MAX_DEEP_DIVE_WORDS,
-                )
-
-            refined_under_surface = _expand_nonredundant_text(
-                run_id=run_id,
-                stage_name=f"source_role_refine_under:{source_type}",
-                user_id=user_id,
-                context_label=f"{source_type} under-surface role-separation refinement",
-                base_text=under_surface_explainer,
-                avoid_texts=[summary_text, deep_dive_text, reflection_text],
-                grounding_chunks=under_surface_chunks,
-                key_terms=key_terms,
-                extra_context=(
-                    "Keep this section focused on first-principles and theoretical lens only. "
-                    "Do not repeat deep-dive sequence descriptions or reflection prompts."
-                ),
-            )
-            if refined_under_surface:
-                under_surface_explainer = _enforce_section_novelty(
-                    refined_under_surface,
-                    [summary_text, deep_dive_text, reflection_text],
-                )
-
-            _assert_pairwise_uniqueness(
+    except Exception:
+        # Hard cuts as last resort — no extra LLM calls
+        (
+            deep_dive_text,
+            under_surface_explainer,
+            first_principles_synthesis,
+            reflection_points,
+            _diagnostic_checklist,
+            _key_term_explanations,
+            applied_cuts,
+        ) = _apply_source_hard_cuts(
+            summary_text=summary_text,
+            deep_dive_text=deep_dive_text,
+            under_surface_explainer=under_surface_explainer,
+            first_principles_synthesis=first_principles_synthesis,
+            reflection_points=reflection_points,
+            diagnostic_checklist=[],
+            key_term_explanations=[],
+        )
+        for cut_label in applied_cuts:
+            log_generation_stage_event(
                 run_id=run_id,
                 user_id=user_id,
-                section_group=f"source:{source_id}",
-                section_texts={
-                    "summary": summary_text,
-                    "deep_dive": deep_dive_text,
-                    "under_surface": under_surface_explainer,
-                    "reflection": reflection_text,
-                },
-                max_overlap_ratio=SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD,
-                enable_claim_gate=True,
+                stage_name=f"source_hard_cut:{source_id}",
+                attempt_number=1,
+                status="succeeded",
+                details=f"cut_section={cut_label}",
             )
-        except Exception as refinement_exc:
-            (
-                deep_dive_text,
-                under_surface_explainer,
-                first_principles_synthesis,
-                reflection_points,
-                diagnostic_checklist,
-                key_term_explanations,
-                applied_cuts,
-            ) = _apply_source_hard_cuts(
-                summary_text=summary_text,
-                deep_dive_text=deep_dive_text,
-                under_surface_explainer=under_surface_explainer,
-                reflection_points=reflection_points,
-                diagnostic_checklist=diagnostic_checklist,
-                key_term_explanations=key_term_explanations,
-            )
-
-            for cut_label in applied_cuts:
-                log_generation_stage_event(
-                    run_id=run_id,
-                    user_id=user_id,
-                    stage_name=f"source_hard_cut:{source_id}",
-                    attempt_number=1,
-                    status="succeeded",
-                    details=f"cut_section={cut_label}",
-                )
-
-            reflection_text = _reflection_points_to_text(reflection_points)
-            _assert_pairwise_uniqueness(
-                run_id=run_id,
-                user_id=user_id,
-                section_group=f"source:{source_id}",
-                section_texts={
-                    "summary": summary_text,
-                    "deep_dive": deep_dive_text,
-                    "under_surface": under_surface_explainer,
-                    "reflection": reflection_text,
-                },
-                max_overlap_ratio=SOURCE_SECTION_PAIR_OVERLAP_THRESHOLD,
-                enable_claim_gate=True,
-            )
+        low_mechanism_density = True
 
     section = SourceLearningSection(
         source_id=source_id,
@@ -3338,8 +3133,8 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         key_terms=key_terms,
         under_surface_explainer=under_surface_explainer,
         first_principles_synthesis=first_principles_synthesis,
-        diagnostic_checklist=diagnostic_checklist,
-        key_term_explanations=key_term_explanations,
+        diagnostic_checklist=[],
+        key_term_explanations=[],
         reflection_points=reflection_points,
         low_mechanism_density=low_mechanism_density,
         model_name=GENERATION_MODEL,
@@ -3444,9 +3239,52 @@ def _generate_synthesis_consolidation(
             )
         )
 
+    all_sections = [video_section] + list(document_sections)
+    intersections: list[InsightIntersection] = []
+    for section in all_sections[:3]:
+        summary_clean = _normalize_continuous_prose(section.summary_text)
+        deep_clean = _normalize_continuous_prose(section.deep_dive_text)
+        summary_sentence = _truncate_sentence(summary_clean, limit=240)
+        deep_sentence = _truncate_sentence(deep_clean, limit=240)
+        emphasis_terms = [term for term in section.key_terms[:4] if term.strip()]
+        attributed: list[AttributedSentence] = []
+        for snippet in [summary_sentence, deep_sentence]:
+            if snippet:
+                attributed.append(
+                    AttributedSentence(
+                        text=snippet,
+                        source_id=section.source_id,
+                        source_type=section.source_type,
+                        emphasis_terms=emphasis_terms,
+                    )
+                )
+        if not attributed:
+            attributed.append(
+                AttributedSentence(
+                    text=f"Focus on the core mechanism behind '{section.generated_title}'.",
+                    source_id=section.source_id,
+                    source_type=section.source_type,
+                    emphasis_terms=emphasis_terms,
+                )
+            )
+        intersections.append(
+            InsightIntersection(
+                intersection_title=f"Focus Area: {section.generated_title}",
+                why_it_matters=(
+                    summary_sentence
+                    or f"This source defines the core mechanism for {section.generated_title}."
+                ),
+                integrated_explanation=(
+                    deep_sentence
+                    or "Use the boundary analysis and reflection points to pressure-test understanding."
+                ),
+                attributed_sentences=attributed,
+            )
+        )
+
     insights = CombinedInsightSection(
         synthesis_text=synthesis_text,
-        intersections=[],
+        intersections=intersections,
         parallels=[],
         layman_bridge="",
         comparative_analysis="",
@@ -3761,9 +3599,6 @@ def _build_noncomparative_insights_and_quiz(
 
         for raw_question in payload.get("questions", []):
             try:
-                # Handle old field name if model returns it.
-                if isinstance(raw_question, dict) and "under_the_hood" in raw_question and "reasoning_traps" not in raw_question:
-                    raw_question["reasoning_traps"] = raw_question.pop("under_the_hood")
                 quiz_questions.append(QuizQuestion.model_validate(raw_question))
             except Exception:
                 continue
@@ -3803,9 +3638,6 @@ def _build_noncomparative_insights_and_quiz(
                     ],
                     answer_index=0,
                     explanation=f"The correct answer captures the core mechanism from '{section.generated_title}'.",
-                    reasoning_traps="Distractors use absolute language or misattribute the source's argument. Check whether each option reflects the actual scope of the source.",
-                    difficulty_level="foundational",
-                    question_type="synthesis",
                     source_evidence=[key_claim, f"Review the full summary of source {section.source_id}."],
                 )
             )
@@ -3846,7 +3678,7 @@ def _build_source_section_text_map(section: SourceLearningSection) -> dict[str, 
     reflection_text = " ".join(
         " ".join(
             part
-            for part in [point.question.strip(), point.explanation.strip(), point.reasoning_traps.strip()]
+            for part in [point.question.strip(), point.explanation.strip()]
             if part
         )
         for point in section.reflection_points
@@ -3905,7 +3737,6 @@ def _build_cross_section_text_map(
             part
             for part in [
                 question.explanation.strip(),
-                question.reasoning_traps.strip(),
                 " ".join(item.strip() for item in question.source_evidence if item.strip()),
             ]
             if part

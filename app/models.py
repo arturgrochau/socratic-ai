@@ -194,7 +194,7 @@ class ClaimLedgerEntry(BaseModel):
 class ReflectionPoint(BaseModel):
     question: str
     explanation: str
-    reasoning_traps: str
+    reasoning_traps: str = ""
     depth_level: Literal["foundational", "intermediate", "advanced"]
 
 

@@ -1,170 +1,98 @@
-# Socratic AI Study Assistant
+# Socratic AI
 
-Socratic AI turns your sources into a grounded learning workflow with generation plus chat follow-up. It supports three intake modes: video only, documents only, or video plus documents.
+> *Sapere aude* — Dare to know. — Immanuel Kant
 
-## Learning Goal
+Turn videos, PDFs, and lectures into a structured thinking workout — not a summary to scroll past.
 
-The product goal is structured, engaged learning rather than passive summarization. It is designed to help you build concepts on top of each other, connect intertwined ideas across sources, and move from first-principles understanding to practical transfer. Deep dives, cross-source synthesis, and Socratic chat all push toward mechanism-level clarity without repetitive restatement.
+---
 
-## Design Choice (Short Version)
+## Why This Exists
 
-The app is intentionally retrieval-first and stage-based instead of one-shot chat. Ingestion stores transcript and document chunks, processing builds source concepts and summaries, and generation produces structured learning artifacts. This keeps answers tied to your material, makes failures observable by stage, and allows selective skipping of expensive comparative calls when a run has only one source type.
+We are living through a strange inversion. For the first time in history, the bottleneck to understanding is not access to information — it is the willingness to do the cognitive work of understanding it. AI makes this worse, not better, if you use it wrong. It is trivially easy to paste a lecture into a chatbot, read the three-paragraph summary it spits back, and feel like you learned something. You didn't. You consumed output. That is not the same thing.
 
-## In-Depth Pipeline Overview
+The Enlightenment philosophers had a name for the courage to think for yourself: *sapere aude*. Dare to know. Not dare to read a summary. Not dare to let someone else chew your food and hand it back to you. Dare to actually engage with ideas, wrestle with them, find where they break, and build your own understanding from the ground up.
 
-Socratic AI is designed to break down dense educational material into a highly readable, first-principles learning journey. It does this by processing each source individually before synthesizing them together using a powerful language model (GPT-4o).
+Socratic AI is built on that premise. It does not answer your questions — it generates better questions. It does not explain what the source says — it forces you to figure out whether you can explain it yourself. The reflection questions are not comprehension checks. They are designed to find the exact point where your understanding runs out, because that is where learning begins.
 
-### Per-Source Analysis (The 4-Section Framework)
-For each document or video, the pipeline generates a structured breakdown:
-1. **Summary:** A concise overview of the core arguments and narrative.
-2. **Deep Dive:** A detailed exploration of the mechanics and evidence behind the source's claims.
-3. **Key Concepts:** A clean, bulleted list of essential terminology defined in layman's terms. This section includes a "Read more" expander containing a **first principles synthesis**—a cohesive teaching paragraph that seamlessly interrelates all the key terms to explain *how* the system works from the ground up.
-4. **Reflection:** A set of Socratic reflection questions designed to test comprehension, complete with detailed explanations that reveal the nuances of the answers.
+The name is not an accident. Socrates did not lecture. He asked questions until his interlocutors discovered that they did not know what they thought they knew. That is still the most effective pedagogy ever devised, and it scales to any source material you feed it.
 
-### Cross-Source Synthesis & Consolidation
-When multiple sources are uploaded (e.g., a video lecture and a textbook chapter), the pipeline uses a single, high-density prompt (`synthesis_consolidator.py`) passed to GPT-4o. This step ingests the summaries and deep dives from all sources at once, producing:
-- **Flowing Synthesis Prose:** 3-5 cohesive paragraphs that contrast, compare, and build upon the sources. It eliminates the need for rigid headers or repetitive mapping, reading naturally like a personalized tutor.
-- **Integrated Reflection Quizzes:** Carefully crafted multiple-choice questions focusing on the *intersection* of the sources. The explanations are written to be informative and natural, avoiding robotic "Distractor A is wrong because..." phrasing.
+---
 
-## What It Supports
+## What It Does
 
-- Upload one video file.
-- Paste one YouTube URL (downloaded with yt-dlp, then transcribed through the same Whisper path).
-- Upload one or more documents.
-- Run with:
-  - video only
-  - documents only
-  - video + documents
-- Unified Socratic chat over generated and retrieved context.
+Upload a video (YouTube link or `.mp4`) and/or documents (PDFs). Socratic AI runs a structured pipeline:
 
-## Implementation Flow
+- **Ingestion** — transcribes video via Whisper, extracts text from PDFs, chunks and embeds everything into a local vector store
+- **Processing** — extracts key concepts and a source summary in a single LLM call per source
+- **Generation** — produces a full learning pack per source: deep dive, first-principles synthesis, under-the-surface assumptions, and Socratic reflection questions — all in one call, with explicit role contracts so sections never repeat each other
+- **Cross-source linking** — finds conceptual bridges and contradictions between sources (batched, efficient)
+- **Synthesis** — if you have multiple sources, generates integrated prose that contrasts, connects, and builds across them
+- **Socratic chat** — ask follow-up questions grounded in your actual material, not the model's training data
 
-1. Ingestion
-- `POST /upload` accepts optional `video`, optional `video_url`, and optional `documents`.
-- Constraint: at most one video source per request (`video` XOR `video_url`).
-- YouTube URLs are downloaded via yt-dlp and converted to WAV with ffmpeg.
-- Whisper transcription produces timestamped segments for video sources.
-- Documents are parsed (`pdf`, `txt`, `md`) and chunked.
+The pipeline runs ~16 LLM calls for a 3-source session (down from 105 in earlier versions). It costs roughly $0.05–0.15 per full session on `gpt-4o-mini`.
 
-2. Processing and linking
-- `/process` now runs with any non-empty source set.
-- For mixed mode (video + documents): process all sources and link video concepts to document concepts.
-- For single-source mode: process only, skip linking.
+---
 
-3. Tailored generation
-- `/generate-tailored-learning` always returns source learning sections and quiz/insight payloads.
-- Mixed mode uses full comparative stages (intersections, quiz, comparative analysis, scenarios).
-- Non-comparative mode uses deterministic, grounded synthesis objects and skips comparative model calls.
+## Download
 
-### Depth and Non-Redundancy Strategy
+| Platform | Link |
+|---|---|
+| **Mac** (Apple Silicon + Intel) | [→ GitHub Releases](https://github.com/arturgrochau/socratic_ai/releases/latest) |
+| **Windows** | [→ GitHub Releases](https://github.com/arturgrochau/socratic_ai/releases/latest) |
+| **Self-hosted** | See below |
 
-- **First Principles Synthesis:** Instead of listing disconnected definitions, the pipeline generates a single, cohesive paragraph that teaches the foundational mechanism behind the concepts.
-- **Unified Cross-Source Pass:** Replaced the previous rigid, multi-stage heuristic loops (which were prone to generating bloated, repetitive "traps") with a single, highly optimized GPT-4o call. This ensures natural text flow and maximum conceptual density while drastically reducing API calls.
-- **Density Controls:** Prompts include strict length boundaries (e.g., exactly 3-5 paragraphs of 4-6 sentences) to guarantee consistently high signal-to-noise ratios.
+Download the binary for your platform. On first launch it will:
+1. Check for a `.env` file with your `OPENAI_API_KEY`
+2. Create a local Python environment and install dependencies (once, ~60 seconds)
+3. Start the app and open your browser automatically
 
-4. Interaction
-- `/ask` uses source-scoped retrieval and generated context.
-- Streamlit quick actions can auto-navigate to chat and auto-submit the generated query.
+---
 
-## Streamlit UX Notes
+## Quick Start (Self-Hosted)
 
-- Step 1 lets users choose one video source mode: upload or YouTube link.
-- After a source is saved, the input is replaced by a selected-state card plus replace button.
-- Step 1 and Step 2 each provide an explicit skip button.
-- Step 3 enables generation only when at least one source is selected.
-- Source and cross-source sections include “Elaborate further” actions that auto-jump to the chatbox and auto-send context-rich prompts.
-- New assistant responses in chat auto-scroll into view and get a brief highlight flash for visibility.
-- Cross-source grounded evidence is rendered as mechanism-grounded evidence cards with source attribution and concept signals.
-
-## Cost Expectations (gpt-4o-mini + current defaults)
-
-Assumptions:
-- Prompt/response sizes are based on current prompts and average medium-length material.
-- Whisper is treated as $0.00 in this project estimator.
-- Cost logging is enabled and includes generation, linking, processing, retrieval, interaction.
-
-Average ranges per run:
-
-| Scenario                               | Typical model work                                                 |  Estimated cost |
-| -------------------------------------- | ------------------------------------------------------------------ | --------------: |
-| Video only                             | Transcription + per-source generation + chat-ready retrieval setup |  $0.12 to $0.35 |
-| Documents only (1-3 docs)              | Per-source processing/generation, no video linking                 |  $0.10 to $0.45 |
-| Video + documents (1 video + 1-3 docs) | Full processing + linking + comparative generation                 |  $0.55 to $1.80 |
-| One chat ask                           | 1 embedding + 1 interaction completion                             | $0.001 to $0.01 |
-
-Why mixed mode costs more:
-- Concept linking plus comparative generation stages dominate token usage.
-- Single-source runs skip those stages by design.
-
-## Quick Start
-
-1. Install dependencies
+**Requirements**: Python 3.11+, `ffmpeg` on PATH
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/arturgrochau/socratic_ai.git
+cd socratic_ai
+
+# Set your OpenAI API key
+echo "OPENAI_API_KEY=sk-..." > .env
+
+# Launch (creates venv and installs deps on first run)
+python launcher.py
 ```
 
-2. Configure environment
+The app opens at `http://localhost:8501`.
 
-```env
-OPENAI_API_KEY=your_key_here
-```
+---
 
-Optional:
+## How the Pipeline Works
 
-```env
-FRONTEND_REQUEST_TIMEOUT=600
-```
+**Per-source analysis** (one combined LLM call per source):
 
-3. Run API
+| Section | What it covers |
+|---|---|
+| Summary | Core arguments and narrative arc |
+| Deep Dive | Mechanisms, tradeoffs, failure modes — how it actually works |
+| First Principles | The foundational logic in 2-3 sentences, from scratch |
+| Under the Surface | Hidden assumptions, practitioner warnings, what most explanations skip |
+| Reflection Points | Socratic questions targeting the exact points where understanding typically breaks |
 
-```bash
-uvicorn main:app --reload
-```
+**Cross-source synthesis** (when you have more than one source):
 
-4. Run Streamlit
+Concept pairs are compared in batches to find reinforcements, contradictions, and gaps. A final synthesis call produces integrated prose — not a side-by-side comparison table, but actual connected reasoning across your sources.
 
-```bash
-streamlit run frontend/app.py
-```
+**Architecture**: FastAPI backend + Streamlit frontend + SQLite (session storage) + ChromaDB (vector embeddings) + OpenAI (`gpt-4o-mini` for generation, Whisper for transcription).
 
-## Validation and Tests
+---
 
-Run unit tests:
+## Versioning
 
-```bash
-python -m pytest tests/test_json_reliability.py tests/test_optional_source_modes.py -v
-```
+Releases follow [semantic versioning](https://semver.org/). The `GENERATION_SCHEMA_VERSION` constant in `app/generation.py` controls cache invalidation — bumping it forces regeneration of all cached learning sections on the next run.
 
-Run end-to-end validator:
+---
 
-```bash
-python scripts/validate_pipeline.py --api-base-url http://127.0.0.1:8000
+## License
 
-# Repeated-run redundancy audit (cross-source overlap telemetry)
-python scripts/evaluate_redundancy.py \
-  --api-base-url http://127.0.0.1:8000 \
-  --video /path/to/video.mp4 \
-  --document /path/to/document.pdf \
-  --iterations 10
-```
-
-## Key Files
-
-- `frontend/app.py` : wizard UX, skip controls, auto-jump and auto-submit behavior.
-- `routes/upload.py` : optional upload contract with `video_url` support.
-- `app/ingestion.py` : yt-dlp download, WAV conversion, Whisper ingestion.
-- `app/workflow.py` : optional-source processing/linking orchestration.
-- `app/generation.py` : mixed-mode comparative path and non-comparative cost-saving path.
-- `app/cost_logging.py` : token usage logging per stage/model.
-- `scripts/validate_pipeline.py` : integration and usage summary checks.
-- `scripts/evaluate_redundancy.py` : repeated-run overlap and claim-overlap audit with aggregate stats.
-
-## Operational Notes
-
-- All API calls are user-scoped via `X-User-ID`.
-- ffmpeg is required for audio extraction.
-- yt-dlp is required for YouTube URL ingestion.
-- Cached processing and generation can reduce repeated-call cost.
+MIT © Artur Grochau

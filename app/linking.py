@@ -16,13 +16,16 @@ from app.models import (
 )
 from config import CACHE_PROCESSED_SOURCES, LINKING_MODEL, db_engine, openai_client
 from prompts.cross_reference import (
+    CROSS_REFERENCE_BATCH_JSON_SCHEMA,
+    CROSS_REFERENCE_BATCH_SYSTEM_PROMPT,
     CROSS_REFERENCE_JSON_SCHEMA,
     CROSS_REFERENCE_SYSTEM_PROMPT,
 )
 
 
 MAX_TARGETS_PER_SOURCE_CONCEPT = 3
-MAX_COMPARISONS_PER_RUN = 30
+MAX_COMPARISONS_PER_RUN = 15
+LINKING_BATCH_SIZE = 5
 MIN_TOPIC_TOKEN_LENGTH = 3
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
 
@@ -254,6 +257,76 @@ def get_concept_by_id(concept_id: str, user_id: str) -> LinkedConcept:
     return concepts[concept_index - 1]
 
 
+def compare_concept_pair_batch(
+    pairs: list[tuple[LinkedConcept, LinkedConcept]],
+    user_id: str,
+    batch_size: int = LINKING_BATCH_SIZE,
+) -> list[CrossReferenceResult]:
+    """Compare multiple concept pairs in batched API calls. Returns results in input order."""
+    if not pairs:
+        return []
+
+    results: dict[int, CrossReferenceResult] = {}
+
+    for batch_start in range(0, len(pairs), batch_size):
+        batch = pairs[batch_start : batch_start + batch_size]
+        batch_payload = [
+            {
+                "pair_index": batch_start + i,
+                "source_concept": source.model_dump(),
+                "target_concept": target.model_dump(),
+            }
+            for i, (source, target) in enumerate(batch)
+        ]
+
+        completion = openai_client.chat.completions.create(
+            model=LINKING_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": CROSS_REFERENCE_BATCH_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Classify relationships for these concept pairs:\n\n"
+                        f"{json.dumps(batch_payload, ensure_ascii=True)}"
+                    ),
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": CROSS_REFERENCE_BATCH_JSON_SCHEMA,
+            },
+        )
+        log_api_usage(
+            response=completion,
+            user_id=user_id,
+            call_stage="linking",
+            model_name=LINKING_MODEL,
+        )
+
+        content = completion.choices[0].message.content
+        if not content:
+            continue
+
+        parsed = json.loads(content)
+        for item in parsed.get("results", []):
+            try:
+                idx = int(item["pair_index"])
+                results[idx] = CrossReferenceResult(
+                    relation_type=item["relation_type"],
+                    explanation=str(item.get("explanation", "")),
+                    confidence=float(item.get("confidence", 0.5)),
+                )
+            except (KeyError, ValueError):
+                continue
+
+    return [
+        results[i]
+        for i in range(len(pairs))
+        if i in results
+    ]
+
+
 def compare_concept_pair(
     source_concept: LinkedConcept,
     target_concept: LinkedConcept,
@@ -446,18 +519,24 @@ def link_source_pair(video_source_id: int, document_source_id: int, user_id: str
 
     candidate_pairs = build_candidate_pairs(video_concepts, document_concepts)
 
-    stored_edges = 0
-    for source_concept, target_concept in candidate_pairs:
-        if CACHE_PROCESSED_SOURCES:
+    # Filter out already-cached pairs before batching
+    pairs_to_compare: list[tuple[LinkedConcept, LinkedConcept]] = []
+    if CACHE_PROCESSED_SOURCES:
+        for source_concept, target_concept in candidate_pairs:
             existing_edge = load_existing_relationship_edge(
                 source_concept.concept_id,
                 target_concept.concept_id,
                 user_id,
             )
-            if existing_edge is not None:
-                continue
+            if existing_edge is None:
+                pairs_to_compare.append((source_concept, target_concept))
+    else:
+        pairs_to_compare = list(candidate_pairs)
 
-        result = compare_concept_pair(source_concept, target_concept, user_id)
+    results = compare_concept_pair_batch(pairs_to_compare, user_id)
+
+    stored_edges = 0
+    for (source_concept, target_concept), result in zip(pairs_to_compare, results):
         store_relationship_edge(source_concept, target_concept, result, user_id)
         stored_edges += 1
 
