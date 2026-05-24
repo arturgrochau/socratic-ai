@@ -817,7 +817,11 @@ def handle_user_query(
     if _should_include_generated_context(expanded_query):
         generated_learning_context = _load_generated_learning_context(normalized_source_ids, user_id)
     relationship_insights = _load_relationship_insights(normalized_source_ids, user_id)
-    is_broad_query = _is_broad_query(expanded_query)
+    # Classify against the user's ORIGINAL query, not the expanded one — the
+    # follow-up expansion appends prior assistant claims, which can contain
+    # broad-pattern keywords ("overall", "summary") that wrongly route a
+    # deepening question through the summary path.
+    is_broad_query = _is_broad_query(normalized_query)
     effective_top_k = max(4, min(top_k, 8 if long_form else 6))
 
     has_context_signal = bool(source_summaries) or _has_meaningful_text(generated_learning_context)

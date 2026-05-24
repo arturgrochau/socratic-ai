@@ -2607,10 +2607,11 @@ def _extract_chunk_diff_claims(
     run_id: str,
 ) -> list[ClaimLedgerEntry]:
     """Stage 3: Extract novel claims from chunk windows that are NOT in the summary."""
-    # Tune applied from a diagnostic run: when grounding has only one chunk the
-    # chunk-diff prompt spends ~500+ tokens on a near-empty response (model has
-    # nothing new to compare against). Skip the stage in that case.
-    if len(grounding_chunks) <= 1:
+    # Tune applied from a diagnostic run: on small sources the chunk-diff
+    # prompt spends ~500+ tokens to extract 0 new claims (the model has too
+    # little material to differentiate). Empirically the call earns its keep
+    # only when there are 3+ chunks to actually compare across.
+    if len(grounding_chunks) <= 2:
         return []
 
     windows = _build_chunk_windows(grounding_chunks)
