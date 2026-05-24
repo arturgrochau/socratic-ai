@@ -613,6 +613,23 @@ def process_source(source_id: int, user_id: str) -> ProcessSourceResponse:
             user_id=user_id,
         )
 
+    # Warm retrieval embeddings now (idempotent — chromadb skips existing ids).
+    # This shifts the per-source embed cost out of the first chat query's
+    # critical path. Failure is non-fatal: chat retrieval falls back to its
+    # own warm-up path.
+    try:
+        from app.retrieval import upsert_retrieval_embeddings
+        upsert_retrieval_embeddings([source_id], user_id)
+        get_active_logger().record(
+            "retrieval_warmup",
+            {"source_id": source_id, "source_type": source_type, "ok": True},
+        )
+    except Exception as exc:
+        get_active_logger().record(
+            "retrieval_warmup",
+            {"source_id": source_id, "source_type": source_type, "ok": False, "error": str(exc)[:200]},
+        )
+
     return ProcessSourceResponse(
         source_id=source_id,
         source_type=source_type,
