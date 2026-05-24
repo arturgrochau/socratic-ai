@@ -388,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline", action="store_true", help="Force GENERATION_PROGRESSIVE_CHUNKING=false (default)")
     parser.add_argument("--progressive", action="store_true", help="Force GENERATION_PROGRESSIVE_CHUNKING=true")
     parser.add_argument("--skip-chat", action="store_true", help="Skip the 5 chat probes")
+    parser.add_argument(
+        "--validate-cache",
+        action="store_true",
+        help="After the main run, call /generate again on the same source IDs to validate the cache. Should be near-zero cost; flagged if not.",
+    )
     args = parser.parse_args(argv)
 
     fixture_paths = [Path(p).resolve() for p in args.fixture]
@@ -462,6 +467,40 @@ def main(argv: list[str] | None = None) -> int:
                 except requests.HTTPError as exc:
                     chat_results.append({"label": label, "query": query, "error": str(exc)})
 
+        # 5. Cache validation (optional): rerun /generate against the same
+        # source IDs. With caches working, the second pass should make ~0
+        # additional generation calls.
+        cache_validation: dict[str, Any] | None = None
+        if args.validate_cache:
+            print("[diagnostic] Validating cache: re-running /generate on same source IDs...")
+            # Snapshot the highest existing api_call_usage row id for this user
+            # so the check can count strictly-newer rows. SQLite's CURRENT_TIMESTAMP
+            # only resolves to seconds; using row id avoids the boundary problem
+            # where the last chat probe and the rerun start land in the same second.
+            from config import db_engine as _db_pre
+            from sqlalchemy import text as _text_pre
+            with _db_pre.connect() as _conn:
+                pre_max_id = _conn.execute(
+                    _text_pre("SELECT COALESCE(MAX(id), 0) FROM api_call_usage WHERE user_id = :u"),
+                    {"u": user_id},
+                ).scalar() or 0
+            cache_t0 = time.time()
+            try:
+                _generate(base_url, user_id, video_id=video_id, document_ids=document_ids)
+                cache_validation = {
+                    "ok": True,
+                    "rerun_started_at": cache_t0,
+                    "rerun_duration_s": time.time() - cache_t0,
+                    "pre_max_id": int(pre_max_id),
+                }
+            except Exception as exc:
+                cache_validation = {
+                    "ok": False,
+                    "rerun_started_at": cache_t0,
+                    "error": str(exc)[:200],
+                    "pre_max_id": int(pre_max_id),
+                }
+
     duration_s = time.time() - started_at
 
     # 5. Find the run's session JSONL
@@ -493,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         source_texts=source_texts,
         synthesis_text=synthesis_text,
         synthesis_payload=generation_result.get("insights"),
+        cache_validation=cache_validation,
         run_started_at=started_at,
     )
     tunes = suggest_tunes(checks, top_n=3)
