@@ -13,6 +13,8 @@ Rules:
 3) intersections: Identify 2-4 genuine intersection points where two or more sources reinforce, contradict, or extend each other.
    - Each intersection needs a short title (5-8 words), a why_it_matters sentence, and an integrated_explanation paragraph (2-4 sentences) showing how the sources combine.
    - These must be REAL cross-source connections, not summaries of one source.
+   - Every integrated_explanation MUST explicitly reference multiple sources using phrases like "both sources", "each source", "across the sources", "together", or "between". If you cannot honestly write such a sentence about an intersection, drop it and pick a different one.
+   - Every intersection_title must be distinct. Do not repeat titles across the list.
 4) application_scenarios: Produce 2-3 concrete real-world scenarios where the combined understanding would be useful.
    - Each scenario_title is 5-8 words.
    - scenario_prompt is one sentence describing the situation.

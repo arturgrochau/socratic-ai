@@ -3373,20 +3373,25 @@ def _normalize_attributed_sentence(
 
 
 def _generate_synthesis_consolidation(
-    video_section: SourceLearningSection,
+    video_section: SourceLearningSection | None,
     document_sections: list[SourceLearningSection],
     user_id: str,
     run_id: str,
 ) -> tuple[CombinedInsightSection, CombinedQuizSection]:
-    source_catalog = [
-        {
+    # Build catalog from whichever sections actually exist. Multi-document
+    # sessions (no video) get genuine cross-source synthesis now too — the
+    # original gate required video+documents, which left documents-only
+    # multi-source runs producing empty insights.
+    source_catalog: list[dict[str, Any]] = []
+    if video_section is not None:
+        source_catalog.append({
             "source_id": video_section.source_id,
             "source_type": "video",
             "title": video_section.generated_title,
             "summary": video_section.summary_text,
             "deep_dive": video_section.deep_dive_text,
-        }
-    ] + [
+        })
+    source_catalog.extend(
         {
             "source_id": section.source_id,
             "source_type": "document",
@@ -3395,7 +3400,7 @@ def _generate_synthesis_consolidation(
             "deep_dive": section.deep_dive_text,
         }
         for section in document_sections
-    ]
+    )
 
     payload = _run_structured_generation_step(
         run_id=run_id,
@@ -3438,8 +3443,11 @@ def _generate_synthesis_consolidation(
 
     # Build intersections from the model output. Each intersection gets one
     # attributed_sentence per source so the downstream UI has provenance.
-    all_sections = [video_section] + list(document_sections)
-    default_emphasis = []
+    all_sections: list[SourceLearningSection] = []
+    if video_section is not None:
+        all_sections.append(video_section)
+    all_sections.extend(document_sections)
+    default_emphasis: list[str] = []
     for s in all_sections[:2]:
         default_emphasis.extend(s.key_terms[:3])
     intersections: list[InsightIntersection] = []
@@ -4117,9 +4125,15 @@ def _generate_tailored_learning_inner(
                 expansion_applied=False,
             )
 
-    if video_section is not None and normalized_document_ids:
+    # Synthesis now fires whenever we have 2+ sources of ANY combination —
+    # not just video+docs (which left multi-document sessions producing empty
+    # insights). For documents-only multi-source runs we skip the combined
+    # cache (its key requires a video_source_id) and always recompute; cheap
+    # enough not to matter, and avoids broadening the cache schema.
+    total_source_count = (1 if video_section is not None else 0) + len(document_sections)
+    if total_source_count >= 2:
         cached_combined = None
-        if CACHE_PROCESSED_SOURCES:
+        if CACHE_PROCESSED_SOURCES and normalized_video_id is not None:
             cached_combined = _load_cached_combined_learning_sections(
                 user_id=user_id,
                 video_source_id=normalized_video_id,
@@ -4143,13 +4157,14 @@ def _generate_tailored_learning_inner(
                     user_id=user_id,
                     run_id=run_id,
                 )
-                _store_combined_learning_sections(
-                    user_id=user_id,
-                    video_source_id=normalized_video_id,
-                    document_source_ids=normalized_document_ids,
-                    insights=insights_section,
-                    quiz=quiz_section,
-                )
+                if normalized_video_id is not None:
+                    _store_combined_learning_sections(
+                        user_id=user_id,
+                        video_source_id=normalized_video_id,
+                        document_source_ids=normalized_document_ids,
+                        insights=insights_section,
+                        quiz=quiz_section,
+                    )
             except Exception as exc:
                 log_generation_stage_event(
                     run_id=run_id,

@@ -40,8 +40,10 @@ GENERATION_PROGRESSIVE_ROUNDS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_ROU
 GENERATION_PROGRESSIVE_MIN_CHUNKS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_MIN_CHUNKS", "4")))
 
 # Token ceiling for the diagnostic harness. Soft assertion only — runs that
-# exceed this get a warn in the report, not a failure.
-DIAGNOSTIC_TOKEN_CEILING = int(os.getenv("DIAGNOSTIC_TOKEN_CEILING", "40000"))
+# exceed this get a warn in the report, not a failure. Set at 60k after
+# observing that multi-source-long runs (2 substantive docs + chat) legitimately
+# cost ~45k under the now-accurate telemetry.
+DIAGNOSTIC_TOKEN_CEILING = int(os.getenv("DIAGNOSTIC_TOKEN_CEILING", "60000"))
 USER_ID_HEADER = os.getenv("USER_ID_HEADER", "X-User-ID")
 ENABLE_COST_LOGGING = os.getenv("ENABLE_COST_LOGGING", "true").lower() == "true"
 CACHE_PROCESSED_SOURCES = os.getenv("CACHE_PROCESSED_SOURCES", "true").lower() == "true"
