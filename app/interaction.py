@@ -680,7 +680,12 @@ def _run_unified_completion(
     user_prompt = (
         "Priority instruction: answer the user query directly in the opening sentence, then give only essential grounded support.\n"
         + (
-            "Provide a deeper and longer answer (approximately 3-5 substantial paragraphs) with mechanism-level explanation in plain language.\n\n"
+            "DEEPENING REQUEST. Produce a substantial answer that covers at least three "
+            "distinct dimensions chosen from: mechanism, hidden assumption, constraint, "
+            "failure mode, edge case, tradeoff. Move from the concrete grounding to "
+            "first-principles reasoning. Aim for 4-6 substantive paragraphs (roughly "
+            "200-400 words each). Do not pad with restatement; if the sources are thin, "
+            "lean on the genuine mechanism and label any synthesis 'Inferred extension:'.\n\n"
             if long_form
             else "\n"
         )
@@ -740,7 +745,12 @@ def _run_summary_completion(
     user_prompt = (
         "Priority instruction: answer the user query directly in the opening sentence, then give only essential grounded support.\n"
         + (
-            "Provide a deeper and longer answer (approximately 3-5 substantial paragraphs) with mechanism-level explanation in plain language.\n\n"
+            "DEEPENING REQUEST. Produce a substantial answer that covers at least three "
+            "distinct dimensions chosen from: mechanism, hidden assumption, constraint, "
+            "failure mode, edge case, tradeoff. Move from the concrete grounding to "
+            "first-principles reasoning. Aim for 4-6 substantive paragraphs (roughly "
+            "200-400 words each). Do not pad with restatement; if the sources are thin, "
+            "lean on the genuine mechanism and label any synthesis 'Inferred extension:'.\n\n"
             if long_form
             else "\n"
         )
