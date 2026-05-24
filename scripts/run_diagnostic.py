@@ -213,6 +213,7 @@ def _render_report(
     checks: list[CheckResult],
     tunes: list[str],
     duration_s: float,
+    started_at: float,
 ) -> str:
     rows = _read_jsonl(session_jsonl)
     chat_rows = _read_jsonl(chat_jsonl) if chat_jsonl else []
@@ -221,11 +222,14 @@ def _render_report(
 
     # Pull complete cost from api_call_usage DB (covers processing + linking +
     # chat + embeddings, which run outside the generate-tailored-learning
-    # session context and so don't land in the JSONL).
+    # session context and so don't land in the JSONL). NB: the cost query
+    # window starts from the *diagnostic's* started_at (captured by the
+    # harness before /upload), not from session_start (which only fires once
+    # /generate-tailored-learning opens its context — too late).
     from config import db_engine as _db
     session_start = next((r for r in rows if r.get("stage") == "session_start"), None)
     db_user_id = (session_start or {}).get("user_id", user_id)
-    started_at = float((session_start or {}).get("started_at") or 0.0)
+    # NOTE: caller wires started_at = the harness wall-clock start.
     with _db.connect() as conn:
         from sqlalchemy import text as _text
         db_rolled = conn.execute(
@@ -479,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         extra_jsonl_paths=extras,
         source_texts=source_texts,
         synthesis_text=synthesis_text,
+        run_started_at=started_at,
     )
     tunes = suggest_tunes(checks, top_n=3)
 
@@ -497,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
         checks=checks,
         tunes=tunes,
         duration_s=duration_s,
+        started_at=started_at,
     )
     report_path = DIAGNOSTIC_DIR / f"{run_id}-{mode}.md"
     report_path.write_text(report, encoding="utf-8")

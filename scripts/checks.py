@@ -301,6 +301,14 @@ def check_chat_quality(rows: list[dict[str, Any]], db_engine: Any, run_id: str) 
     refused = [q for q in chat_queries if q.get("contains_refusal_pattern")]
     no_context = [q for q in chat_queries if q.get("route") == "no_context"]
     low_score = [q for q in chat_queries if (q.get("top_retrieval_score") or 0.0) < 0.4 and q.get("route") == "grounded"]
+    # Deepening probes ("go deeper", "elaborate") should produce richer
+    # responses than a default answer. If they're under 800 chars they're
+    # likely not actually deepening — flag the relaxed prompt isn't doing
+    # its job for the deepening intent.
+    thin_deepening = [
+        q for q in chat_queries
+        if q.get("is_deepening") and int(q.get("answer_length") or 0) < 800
+    ]
 
     if refused:
         return CheckResult(
@@ -311,15 +319,26 @@ def check_chat_quality(rows: list[dict[str, Any]], db_engine: Any, run_id: str) 
             "system prompt was actually loaded (no caching of an older version).",
             {"refused_count": len(refused)},
         )
-    if len(low_score) > len(chat_queries) // 3 or len(no_context) > len(chat_queries) // 3:
+    issues: list[str] = []
+    if thin_deepening:
+        issues.append(f"{len(thin_deepening)} deepening answer(s) under 800 chars")
+    if len(low_score) > len(chat_queries) // 3:
+        issues.append(f"{len(low_score)} low-confidence grounded answers")
+    if len(no_context) > len(chat_queries) // 3:
+        issues.append(f"{len(no_context)} no-context fallbacks")
+    if issues:
         return CheckResult(
             "chat_quality",
             "warn",
-            f"{len(low_score)} low-confidence grounded answers, {len(no_context)} no-context fallbacks "
-            f"of {len(chat_queries)} queries.",
-            "Either the sources don't cover the question space, or embeddings are stale. "
-            "Consider wiring embed-at-ingestion (deferred work).",
-            {"low_score": len(low_score), "no_context": len(no_context)},
+            "; ".join(issues) + f" (of {len(chat_queries)} queries)",
+            "If deepening is thin: strengthen the long-form clause in prompts/interaction.py "
+            "or bump effective_top_k for deepening intents. If low confidence: sources may not "
+            "cover the question space.",
+            {
+                "thin_deepening": len(thin_deepening),
+                "low_score": len(low_score),
+                "no_context": len(no_context),
+            },
         )
     return CheckResult(
         "chat_quality",
@@ -395,10 +414,24 @@ def run_checks(
     extra_jsonl_paths: list[Path] | None = None,
     source_texts: list[str] | None = None,
     synthesis_text: str | None = None,
+    run_started_at: float | None = None,
 ) -> list[CheckResult]:
+    """Run all checks. `run_started_at` is the diagnostic harness's wall-clock
+    start time — if provided, time-windowed DB queries use it instead of the
+    session JSONL's session_start.started_at (which only records when
+    generation entered its session_log context, missing earlier ingestion/
+    processing/linking calls)."""
     rows = _load_jsonl(session_jsonl_path)
     for extra in extra_jsonl_paths or []:
         rows.extend(_load_jsonl(extra))
+
+    # Stamp the diagnostic's true start into the first session_start record so
+    # checks read a single source of truth.
+    if run_started_at is not None:
+        for r in rows:
+            if r.get("stage") == "session_start":
+                r["started_at"] = float(run_started_at)
+                break
 
     results: list[CheckResult] = []
     for func in CHECK_FUNCTIONS:
