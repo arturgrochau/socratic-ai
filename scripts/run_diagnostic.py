@@ -51,6 +51,10 @@ CHAT_PROBE_QUERIES = [
     ("off_topic", "What does the source say about climate policy?"),
     ("deepening", "Go deeper on the most important mechanism."),
     ("ambiguous", "Why does it work that way?"),
+    # Tests multi-turn coherence: this probe makes no sense without the prior
+    # conversation. A grounded answer here proves recent_turns is actually
+    # being used and that the chat is coherent across turns.
+    ("followup_coherence", "Building on the previous answer, what assumption is most likely to fail in a real-world setting?"),
 ]
 
 
@@ -70,7 +74,11 @@ CHAT_JUDGE_SYSTEM_PROMPT = (
     "1 if it produces a generic refusal with no redirect.\n"
     "  - For a deepening request ('go deeper'), grade 5 only if the answer "
     "introduces genuinely new dimensions (mechanism, constraint, tradeoff), "
-    "not just rephrases.\n\n"
+    "not just rephrases.\n"
+    "  - For a followup_coherence probe ('building on the previous answer...'), "
+    "grade 5 only if the answer treats the prior conversation as context and "
+    "extends from it rather than restarting from scratch; grade 2 if the "
+    "answer ignores the prior turn entirely.\n\n"
     "Return ONLY JSON: {\"grade\": int, \"reasoning\": str (≤200 chars)}."
 )
 
