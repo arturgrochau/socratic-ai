@@ -54,6 +54,85 @@ CHAT_PROBE_QUERIES = [
 ]
 
 
+CHAT_JUDGE_SYSTEM_PROMPT = (
+    "You are grading a study chat answer on a 1-5 scale. The user uploaded "
+    "study material and asked a question. The assistant produced an answer. "
+    "Your job is to grade the answer against this rubric:\n"
+    "  5 = excellent: directly answers the question, grounded in the material, "
+    "specific and mechanism-level\n"
+    "  4 = good: answers the question, mostly grounded, some specifics\n"
+    "  3 = adequate: relevant but generic or partly off-target\n"
+    "  2 = weak: barely relevant or vague\n"
+    "  1 = bail: refuses to answer or produces a one-line dodge\n\n"
+    "Special cases:\n"
+    "  - For an off-topic question (the material doesn't cover it), grade 4 "
+    "if the answer acknowledges this honestly and offers a useful redirect; "
+    "1 if it produces a generic refusal with no redirect.\n"
+    "  - For a deepening request ('go deeper'), grade 5 only if the answer "
+    "introduces genuinely new dimensions (mechanism, constraint, tradeoff), "
+    "not just rephrases.\n\n"
+    "Return ONLY JSON: {\"grade\": int, \"reasoning\": str (≤200 chars)}."
+)
+
+CHAT_JUDGE_JSON_SCHEMA = {
+    "name": "chat_judge_result",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "grade": {"type": "integer", "minimum": 1, "maximum": 5},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["grade", "reasoning"],
+    },
+}
+
+
+def _judge_chat_answer(
+    *,
+    probe_label: str,
+    query: str,
+    answer: str,
+    follow_up: str | None,
+    source_titles: list[str],
+) -> dict[str, Any]:
+    """Call gpt-4o-mini to grade a single chat answer. Returns a dict with
+    grade + reasoning + probe label. Errors fall through to grade=0 (no signal)."""
+    import os
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY")
+    if not api_key:
+        return {"probe": probe_label, "grade": 0, "reasoning": "no API key"}
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    user_msg = (
+        f"Probe type: {probe_label}\n"
+        f"Source titles: {', '.join(source_titles) or '(none)'}\n\n"
+        f"Question: {query}\n\n"
+        f"Answer: {answer or '(empty)'}\n\n"
+        f"Follow-up Socratic question (if any): {follow_up or '(none)'}"
+    )
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": CHAT_JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format={"type": "json_schema", "json_schema": CHAT_JUDGE_JSON_SCHEMA},
+        )
+        import json as _json
+        payload = _json.loads(completion.choices[0].message.content or "{}")
+        return {
+            "probe": probe_label,
+            "grade": int(payload.get("grade") or 0),
+            "reasoning": str(payload.get("reasoning") or "")[:200],
+        }
+    except Exception as exc:
+        return {"probe": probe_label, "grade": 0, "reasoning": f"judge call failed: {exc!r}"[:200]}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Backend lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
@@ -393,6 +472,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="After the main run, call /generate again on the same source IDs to validate the cache. Should be near-zero cost; flagged if not.",
     )
+    parser.add_argument(
+        "--judge-chat",
+        action="store_true",
+        help="Use gpt-4o-mini to grade each chat probe answer 1-5. Adds ~5 small LLM calls per run.",
+    )
     args = parser.parse_args(argv)
 
     fixture_paths = [Path(p).resolve() for p in args.fixture]
@@ -503,6 +587,31 @@ def main(argv: list[str] | None = None) -> int:
 
     duration_s = time.time() - started_at
 
+    # Optional LLM-as-judge grading of chat answers. Fires outside the
+    # backend subprocess (uses its own OpenAI client) so it doesn't appear in
+    # the run's api_call_usage rows under this user_id.
+    chat_judgements: list[dict[str, Any]] = []
+    if args.judge_chat and chat_results:
+        source_titles: list[str] = []
+        if generation_result.get("video"):
+            source_titles.append(generation_result["video"].get("generated_title") or "video")
+        for d in generation_result.get("documents") or []:
+            source_titles.append(d.get("generated_title") or "document")
+        print(f"[diagnostic] LLM-judging {len(chat_results)} chat answers...")
+        for r in chat_results:
+            if r.get("error"):
+                chat_judgements.append({"probe": r.get("label"), "grade": 0, "reasoning": "chat call failed"})
+                continue
+            chat_judgements.append(
+                _judge_chat_answer(
+                    probe_label=str(r.get("label", "?")),
+                    query=str(r.get("query", "")),
+                    answer=str(r.get("answer", "")),
+                    follow_up=r.get("follow_up_question"),
+                    source_titles=source_titles,
+                )
+            )
+
     # 5. Find the run's session JSONL
     found = _find_run_id(SESSION_LOG_DIR, started_at)
     if found is None:
@@ -533,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
         synthesis_text=synthesis_text,
         synthesis_payload=generation_result.get("insights"),
         cache_validation=cache_validation,
+        chat_judgements=chat_judgements if chat_judgements else None,
         run_started_at=started_at,
     )
     tunes = suggest_tunes(checks, top_n=3)

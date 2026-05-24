@@ -300,6 +300,51 @@ def check_prompt_completion_ratio(rows: list[dict[str, Any]], db_engine: Any, ru
     )
 
 
+def check_chat_judge(rows: list[dict[str, Any]], db_engine: Any, run_id: str, *, chat_judgements: list[dict[str, Any]] | None = None) -> CheckResult:
+    """LLM-as-judge semantic grade of chat answers (1-5 scale). The diagnostic
+    harness computes this by sending each (probe, answer) pair to gpt-4o-mini
+    with a strict rubric. Threshold: average grade must be ≥3.5, no individual
+    answer below 2.0 (a true bail).
+
+    Skipped when the harness didn't request judgements (no extra API cost in
+    default runs)."""
+    if not chat_judgements:
+        return CheckResult("chat_judge", "pass", "(LLM judge not requested; rerun with --judge-chat)", "")
+
+    grades = [int(j.get("grade") or 0) for j in chat_judgements if j.get("grade")]
+    if not grades:
+        return CheckResult("chat_judge", "warn", "Judgements requested but no grades returned", "Check judge call logs.")
+
+    avg = sum(grades) / len(grades)
+    lowest = min(grades)
+    rubric_summary = ", ".join(f"{j.get('probe','?')}={j.get('grade','?')}" for j in chat_judgements)
+
+    if lowest < 2:
+        offenders = [j for j in chat_judgements if int(j.get("grade") or 5) < 2]
+        return CheckResult(
+            "chat_judge",
+            "fail",
+            f"avg={avg:.2f}, lowest={lowest}. {len(offenders)} answer(s) graded 1 (bail/refusal/off-topic).",
+            "Compare the failing answers to the system prompt. Common cause: the prompt's no-context redirect language is producing generic answers when retrieval is thin.",
+            {"grades": grades, "judgements": chat_judgements},
+        )
+    if avg < 3.5:
+        return CheckResult(
+            "chat_judge",
+            "warn",
+            f"avg={avg:.2f} below 3.5 floor; lowest={lowest}. {rubric_summary}",
+            "Most answers are passable but not strong. Look at the lowest-graded probes for the pattern.",
+            {"grades": grades, "judgements": chat_judgements},
+        )
+    return CheckResult(
+        "chat_judge",
+        "pass",
+        f"avg={avg:.2f}, lowest={lowest}. {rubric_summary}",
+        "",
+        {"grades": grades, "judgements": chat_judgements},
+    )
+
+
 def check_chat_quality(rows: list[dict[str, Any]], db_engine: Any, run_id: str) -> CheckResult:
     """Chat-specific. Only fires when a chat-<session_id>.jsonl is present
     alongside the run JSONL — the diagnostic feeds it explicitly."""
@@ -649,6 +694,7 @@ def run_checks(
     synthesis_text: str | None = None,
     synthesis_payload: dict[str, Any] | None = None,
     cache_validation: dict[str, Any] | None = None,
+    chat_judgements: list[dict[str, Any]] | None = None,
     run_started_at: float | None = None,
 ) -> list[CheckResult]:
     """Run all checks. `run_started_at` is the diagnostic harness's wall-clock
@@ -712,6 +758,14 @@ def run_checks(
             db_engine,
             run_id,
             cache_validation=cache_validation,
+        )
+    )
+    results.append(
+        check_chat_judge(
+            rows,
+            db_engine,
+            run_id,
+            chat_judgements=chat_judgements,
         )
     )
     return results
