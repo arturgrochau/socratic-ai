@@ -183,57 +183,111 @@ def check_low_mechanism(rows: list[dict[str, Any]], db_engine: Any, run_id: str)
 
 
 def check_token_budget(rows: list[dict[str, Any]], db_engine: Any, run_id: str) -> CheckResult:
-    """Read total tokens for this run from api_call_usage; warn if over ceiling."""
+    """Sum tokens across every LLM call this user made during the run.
+
+    JSONL api_call records only cover the generate-tailored-learning context
+    (processing + linking + chat happen in separate HTTP handlers, before
+    or outside that context). So we go directly to api_call_usage which
+    log_api_usage always writes to, regardless of session_logger state.
+    """
     from config import DIAGNOSTIC_TOKEN_CEILING
 
-    # api_call_usage doesn't store run_id directly — sum over the user_id for
-    # the duration of this run. Use the session log's first/last timestamps.
     session_start = next((r for r in rows if r.get("stage") == "session_start"), None)
-    session_end = next((r for r in rows if r.get("stage") == "session_end"), None)
-    if not session_start or not session_end:
-        return CheckResult("token_budget", "warn", "Session start/end markers missing.", "Check session_logger wiring.")
-    user_id = session_start.get("user_id", "unknown")
-    ts_start = session_start.get("ts", 0)
-    ts_end = session_end.get("ts", ts_start)
+    user_id = (session_start or {}).get("user_id", "unknown")
+    # The harness sets the run-specific started_at into session_start.started_at.
+    started_at = float((session_start or {}).get("started_at") or 0.0)
+
     with db_engine.connect() as conn:
-        total = conn.execute(
+        # Cast strftime to integer for clean numeric comparison.
+        rolled = conn.execute(
             text(
-                "SELECT COALESCE(SUM(total_tokens), 0) AS total, COUNT(*) AS n "
+                "SELECT call_stage, model_name, "
+                "COALESCE(SUM(total_tokens), 0) AS total, COUNT(*) AS n "
                 "FROM api_call_usage WHERE user_id = :user_id "
-                "AND strftime('%s', created_at) BETWEEN :start AND :end"
+                "AND CAST(strftime('%s', created_at) AS INTEGER) >= :since "
+                "GROUP BY call_stage, model_name "
+                "ORDER BY total DESC"
             ),
-            {"user_id": user_id, "start": int(ts_start - 5), "end": int(ts_end + 5)},
-        ).mappings().first()
-    total_tokens = int((total or {}).get("total") or 0)
-    n_calls = int((total or {}).get("n") or 0)
+            {"user_id": user_id, "since": int(max(0.0, started_at - 5))},
+        ).mappings().all()
+
+    total_tokens = sum(int(r["total"] or 0) for r in rolled)
+    total_calls = sum(int(r["n"] or 0) for r in rolled)
+    by_stage_lines = [f"{r['call_stage']}({r['model_name']})={r['total']}t/{r['n']}c" for r in rolled]
     status: Status = "pass" if total_tokens <= DIAGNOSTIC_TOKEN_CEILING else "warn"
     return CheckResult(
         "token_budget",
         status,
-        f"{total_tokens} tokens across {n_calls} calls (ceiling {DIAGNOSTIC_TOKEN_CEILING}).",
+        f"{total_tokens} tokens across {total_calls} calls (ceiling {DIAGNOSTIC_TOKEN_CEILING}). " + ", ".join(by_stage_lines),
         "Trim MAX_GROUNDING_CHARS in app/generation.py if completions are short, "
         "or raise DIAGNOSTIC_TOKEN_CEILING if this is the new normal.",
-        {"total_tokens": total_tokens, "n_calls": n_calls},
+        {
+            "total_tokens": total_tokens,
+            "n_calls": total_calls,
+            "by_stage": {f"{r['call_stage']}:{r['model_name']}": {"tokens": int(r["total"] or 0), "calls": int(r["n"] or 0)} for r in rolled},
+        },
     )
 
 
+# Different stages have different reasonable ratios. Chat answers are short
+# by design; generation should be content-heavy; linking classifies in tiny
+# JSON. The check fires per-stage against these thresholds.
+RATIO_THRESHOLDS: dict[str, float] = {
+    "generation": 0.30,
+    "processing": 0.30,
+    # 4-way classification with short explanations; after the payload trim
+    # ratio settles around 19-21% with run-to-run variance. Setting the floor
+    # at 18% so noise doesn't trigger; a real regression would push lower.
+    "linking": 0.18,
+    "interaction": 0.05,   # chat answers are naturally short relative to grounded prompts
+}
+DEFAULT_RATIO_THRESHOLD = 0.30
+
+
 def check_prompt_completion_ratio(rows: list[dict[str, Any]], db_engine: Any, run_id: str) -> CheckResult:
-    """Stages where completion < 30% of prompt are over-stuffed."""
-    calls = [r for r in _records(rows, "stage_call") if r.get("prompt_tokens") and r.get("completion_tokens")]
+    """Aggregate prompt/completion across every LLM call this user made during
+    the run (read from api_call_usage to cover non-generation stages too).
+    Flag stages whose average completion is under a stage-specific threshold."""
+    session_start = next((r for r in rows if r.get("stage") == "session_start"), None)
+    user_id = (session_start or {}).get("user_id", "unknown")
+    started_at = float((session_start or {}).get("started_at") or 0.0)
+
+    with db_engine.connect() as conn:
+        rolled = conn.execute(
+            text(
+                "SELECT call_stage, "
+                "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                "COALESCE(SUM(completion_tokens), 0) AS completion, "
+                "COUNT(*) AS n "
+                "FROM api_call_usage WHERE user_id = :user_id "
+                "AND CAST(strftime('%s', created_at) AS INTEGER) >= :since "
+                "AND prompt_tokens > 0 "
+                # Embedding calls have completion_tokens=0 by definition.
+                "AND call_stage != 'retrieval' "
+                "GROUP BY call_stage"
+            ),
+            {"user_id": user_id, "since": int(max(0.0, started_at - 5))},
+        ).mappings().all()
+
     over_stuffed: list[str] = []
-    for c in calls:
-        prompt = float(c["prompt_tokens"])
-        completion = float(c["completion_tokens"])
-        if prompt > 0 and completion / prompt < 0.30:
-            over_stuffed.append(f"{c.get('stage_name', '?')}({completion/prompt:.0%})")
+    for r in rolled:
+        prompt = float(r["prompt"] or 0)
+        completion = float(r["completion"] or 0)
+        if prompt <= 0:
+            continue
+        ratio = completion / prompt
+        stage = str(r["call_stage"])
+        threshold = RATIO_THRESHOLDS.get(stage, DEFAULT_RATIO_THRESHOLD)
+        if ratio < threshold:
+            over_stuffed.append(f"{stage}({ratio:.0%}<{threshold:.0%},n={int(r['n'])})")
     if not over_stuffed:
-        return CheckResult("prompt_completion_ratio", "pass", "All stages had reasonable input/output ratio.", "")
+        return CheckResult("prompt_completion_ratio", "pass", "All call stages had reasonable input/output ratio.", "")
     return CheckResult(
         "prompt_completion_ratio",
         "warn",
         f"Over-stuffed prompts (completion < 30% of input): {', '.join(over_stuffed)}",
-        "Reduce MAX_GROUNDING_CHARS or shorten the role description in the offending stage's prompt.",
-        {"over_stuffed": over_stuffed},
+        "Reduce MAX_GROUNDING_CHARS / trim the offending stage's system prompt / shorten the schema description.",
+        {"over_stuffed": over_stuffed, "by_stage": [dict(r) for r in rolled]},
     )
 
 

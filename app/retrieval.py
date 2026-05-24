@@ -20,8 +20,13 @@ COLLECTION_NAME = "interaction_retrieval_concepts"
 EMBEDDING_BATCH_SIZE = 64
 QUERY_MULTIPLIER = 2
 RAW_PRIORITY_RATIO = 0.67
-MAX_CONTEXT_CHARS = 9000
-MAX_HIT_TEXT_CHARS = 380
+# Diagnostic-surfaced tune: chat interaction was using ~1.5k prompt tokens per
+# query (the biggest line item by far) and the model only produced ~110
+# completion tokens per call. Most of the prompt was retrieved context past
+# what the model actually used. Trim aggressively — answers stay grounded but
+# don't drown in tangential hits.
+MAX_CONTEXT_CHARS = 4500
+MAX_HIT_TEXT_CHARS = 280
 MIN_CONCEPT_HIT_SCORE = 0.56
 MIN_RAW_HIT_SCORE = 0.53
 

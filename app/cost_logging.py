@@ -4,6 +4,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from app.session_logger import get_active_logger
 from config import ENABLE_COST_LOGGING, db_engine
 
 
@@ -98,6 +99,20 @@ def log_api_usage(
         return
 
     prompt_tokens, completion_tokens, total_tokens = extract_usage_fields(response)
+
+    # Mirror every API call into the active session JSONL so the diagnostic
+    # harness sees the full cost picture (not just _run_structured_generation_step).
+    get_active_logger().record(
+        "api_call",
+        {
+            "call_stage": call_stage,
+            "model": model_name,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "request_count": int(request_count),
+        },
+    )
 
     with db_engine.begin() as connection:
         connection.execute(

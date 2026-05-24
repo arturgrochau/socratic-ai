@@ -219,9 +219,33 @@ def _render_report(
     stage_calls = _stage_cost_table_rows(rows)
     quality = _quality_table_rows(rows)
 
-    total_tokens = sum(int(r.get("total_tokens") or 0) for r in stage_calls)
-    total_prompt = sum(int(r.get("prompt_tokens") or 0) for r in stage_calls)
-    total_completion = sum(int(r.get("completion_tokens") or 0) for r in stage_calls)
+    # Pull complete cost from api_call_usage DB (covers processing + linking +
+    # chat + embeddings, which run outside the generate-tailored-learning
+    # session context and so don't land in the JSONL).
+    from config import db_engine as _db
+    session_start = next((r for r in rows if r.get("stage") == "session_start"), None)
+    db_user_id = (session_start or {}).get("user_id", user_id)
+    started_at = float((session_start or {}).get("started_at") or 0.0)
+    with _db.connect() as conn:
+        from sqlalchemy import text as _text
+        db_rolled = conn.execute(
+            _text(
+                "SELECT call_stage, model_name, "
+                "COALESCE(SUM(total_tokens), 0) AS total, "
+                "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                "COALESCE(SUM(completion_tokens), 0) AS completion, "
+                "COUNT(*) AS n "
+                "FROM api_call_usage WHERE user_id = :user_id "
+                "AND CAST(strftime('%s', created_at) AS INTEGER) >= :since "
+                "GROUP BY call_stage, model_name "
+                "ORDER BY total DESC"
+            ),
+            {"user_id": db_user_id, "since": int(max(0.0, started_at - 5))},
+        ).mappings().all()
+    total_tokens = sum(int(r["total"] or 0) for r in db_rolled)
+    total_prompt = sum(int(r["prompt"] or 0) for r in db_rolled)
+    total_completion = sum(int(r["completion"] or 0) for r in db_rolled)
+    total_calls = sum(int(r["n"] or 0) for r in db_rolled)
 
     lines: list[str] = []
     lines.append(f"# Diagnostic report — `{run_id}`")
@@ -255,9 +279,18 @@ def _render_report(
     # ── Cost summary ──────────────────────────────────────────────────────────
     lines.append("## Cost")
     lines.append("")
-    lines.append(f"- Total tokens (instrumented stages): **{total_tokens:,}** "
+    lines.append(f"- Total tokens (all LLM calls for this user during the run): **{total_tokens:,}** "
                  f"({total_prompt:,} prompt / {total_completion:,} completion)")
-    lines.append(f"- Stage calls: **{len(stage_calls)}**")
+    lines.append(f"- LLM calls: **{total_calls}** ({len(stage_calls)} via structured generation)")
+    if db_rolled:
+        lines.append("")
+        lines.append("| Call stage | Model | Calls | Prompt | Completion | Total |")
+        lines.append("|---|---|---|---|---|---|")
+        for r in db_rolled:
+            lines.append(
+                f"| `{r['call_stage']}` | `{r['model_name']}` | {r['n']} "
+                f"| {int(r['prompt'] or 0):,} | {int(r['completion'] or 0):,} | {int(r['total'] or 0):,} |"
+            )
     lines.append("")
 
     # ── Stage cost table ──────────────────────────────────────────────────────

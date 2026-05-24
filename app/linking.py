@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from typing import Iterable
+from typing import Any, Iterable
 
 from sqlalchemy import text
 
@@ -273,11 +273,18 @@ def compare_concept_pair_batch(
 
     for batch_start in range(0, len(pairs), batch_size):
         batch = pairs[batch_start : batch_start + batch_size]
+        # Trim payload: the model classifies relationships based on term +
+        # definition + key_ideas. The other LinkedConcept fields (concept_id,
+        # source_id, source_type, concept_index) are pipeline metadata and
+        # only add prompt tokens. Diagnostic showed linking at 16% completion
+        # ratio — the payload was the culprit.
+        def _trim(c: LinkedConcept) -> dict[str, Any]:
+            return {"term": c.term, "definition": c.definition, "key_ideas": c.key_ideas}
         batch_payload = [
             {
                 "pair_index": batch_start + i,
-                "source_concept": source.model_dump(),
-                "target_concept": target.model_dump(),
+                "source_concept": _trim(source),
+                "target_concept": _trim(target),
             }
             for i, (source, target) in enumerate(batch)
         ]
