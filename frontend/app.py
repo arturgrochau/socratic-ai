@@ -1371,8 +1371,9 @@ def _submit_chat_query(
             }
         )
         st.session_state.flash_latest_assistant = True
-
-    st.rerun()
+    # No explicit st.rerun() — st.chat_input handles re-render naturally and
+    # avoids the scroll-jump that st.rerun() caused with the old st.form path.
+    # Quick-action buttons fall through to Streamlit's natural rerun.
 
 
 def _build_intersection_chat_prefill(
@@ -1416,11 +1417,7 @@ def _render_ask_tab(has_user_id: bool) -> None:
         return
 
     st.markdown("### Socratic Chatbox")
-    st.caption("Ask follow-up questions to deepen understanding across video, documents, and generated insights.")
-
-    if st.session_state.ask_prefill.strip():
-        st.session_state.socratic_chat_text = st.session_state.ask_prefill.strip()
-        st.session_state.ask_prefill = ""
+    st.caption("Ask follow-up questions to deepen understanding across your sources and generated insights.")
 
     auto_query = st.session_state.auto_submit_query.strip()
     if auto_query:
@@ -1484,32 +1481,27 @@ def _render_ask_tab(has_user_id: bool) -> None:
                     display_query="Quiz me on this.",
                 )
 
-    st.caption("Type your question below, then click Send.")
     is_follow_up = bool(st.session_state.ask_messages)
-    input_label = "Ask follow-up" if is_follow_up else "Ask your first question"
     input_placeholder = (
-        "Ask follow-up..."
+        "Ask a follow-up..."
         if is_follow_up
-        else "Example: Explain the strongest intersection and how I could apply it in a real project."
+        else "Ask your first question — e.g. 'Explain the strongest intersection between these sources.'"
     )
-    input_height = 84 if is_follow_up else 130
 
-    with st.form(key="socratic_chat_form", clear_on_submit=True):
-        ask_query = st.text_area(
-            input_label,
-            height=input_height,
-            key="socratic_chat_text",
-            placeholder=input_placeholder,
-        )
-        submitted = st.form_submit_button("Send" if is_follow_up else "Ask")
-
-    if not submitted:
-        return
-
-    ask_query = ask_query.strip()
-    if not ask_query:
-        st.warning("Enter a question before sending.")
-        return
+    # st.chat_input submits on Enter, clears itself, and doesn't force a rerun
+    # mid-flow. Keep the prefill bridge for one-shot prefills from quick-action
+    # buttons elsewhere in the app.
+    if st.session_state.ask_prefill.strip():
+        prefilled_query = st.session_state.ask_prefill.strip()
+        st.session_state.ask_prefill = ""
+        ask_query = prefilled_query
+    else:
+        ask_query = st.chat_input(placeholder=input_placeholder, key="socratic_chat_input")
+        if not ask_query:
+            return
+        ask_query = ask_query.strip()
+        if not ask_query:
+            return
 
     if st.session_state.quiz_mode_active and st.session_state.quiz_awaiting_answer:
         grading_prompt = _build_quiz_grading_prompt(

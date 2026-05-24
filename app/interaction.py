@@ -26,6 +26,9 @@ from prompts.interaction import (
 MAX_STORED_TURNS = 20
 MAX_PROMPT_TURNS = 4
 MAX_GENERATED_CONTEXT_CHARS = 2200
+# Kept for back-compat in _is_insufficient_answer detection. Live answers no
+# longer return this string verbatim; the relaxed system prompt produces a
+# Socratic redirect instead.
 INSUFFICIENT_CONTEXT_ANSWER = "I don't have enough information in the provided materials to answer that."
 INSUFFICIENT_CONTEXT_FOLLOW_UP = (
     "Which part of your uploaded lecture or notes should we inspect next?"
@@ -689,7 +692,7 @@ def _run_unified_completion(
 
     completion = openai_client.chat.completions.create(
         model=INTERACTION_MODEL,
-        temperature=0,
+        temperature=0.3,
         messages=[
             {"role": "system", "content": UNIFIED_INTERACTION_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -750,7 +753,7 @@ def _run_summary_completion(
 
     completion = openai_client.chat.completions.create(
         model=INTERACTION_MODEL,
-        temperature=0,
+        temperature=0.3,
         messages=[
             {"role": "system", "content": UNIFIED_INTERACTION_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -818,7 +821,24 @@ def handle_user_query(
 
     has_context_signal = bool(source_summaries) or _has_meaningful_text(generated_learning_context)
 
-    if is_broad_query and has_context_signal:
+    # Route once. Broad queries skip retrieval entirely; specific queries try
+    # retrieval, and only fall back to summary when retrieval has no usable
+    # signal at all. No retry-on-insufficient-answer (it doubled the call cost
+    # for ambiguous queries with no quality gain).
+    use_summary_path = is_broad_query and has_context_signal
+    if not use_summary_path:
+        try:
+            retrieved_context = retrieve_context(
+                query=expanded_query,
+                source_ids=normalized_source_ids,
+                user_id=user_id,
+                top_k=effective_top_k,
+            )
+        except ValueError:
+            retrieved_context = None
+            use_summary_path = has_context_signal
+
+    if use_summary_path:
         model_output = _run_summary_completion(
             query=expanded_query,
             source_summaries=source_summaries,
@@ -830,64 +850,31 @@ def handle_user_query(
         )
         answer = (model_output.answer or "").strip()
         follow_up_question = (model_output.follow_up_question or "").strip()
+    elif retrieved_context is not None:
+        concept_ids = retrieved_context.concept_ids
+        model_output = _run_unified_completion(
+            query=expanded_query,
+            retrieved_context=retrieved_context,
+            recent_turns=recent_turns,
+            generated_learning_context=generated_learning_context,
+            long_form=long_form,
+            user_id=user_id,
+        )
+        answer = (model_output.answer or "").strip()
+        follow_up_question = (model_output.follow_up_question or "").strip()
     else:
-        try:
-            retrieved_context = retrieve_context(
-                query=expanded_query,
-                source_ids=normalized_source_ids,
-                user_id=user_id,
-                top_k=effective_top_k,
-            )
-        except ValueError:
-            if has_context_signal:
-                model_output = _run_summary_completion(
-                    query=expanded_query,
-                    source_summaries=source_summaries,
-                    relationship_insights=relationship_insights,
-                    recent_turns=recent_turns,
-                    generated_learning_context=generated_learning_context,
-                    long_form=long_form,
-                    user_id=user_id,
-                )
-                answer = (model_output.answer or "").strip()
-                follow_up_question = (model_output.follow_up_question or "").strip()
-            else:
-                answer = INSUFFICIENT_CONTEXT_ANSWER
-                follow_up_question = INSUFFICIENT_CONTEXT_FOLLOW_UP
-        else:
-            concept_ids = retrieved_context.concept_ids
-            model_output = _run_unified_completion(
-                query=expanded_query,
-                retrieved_context=retrieved_context,
-                recent_turns=recent_turns,
-                generated_learning_context=generated_learning_context,
-                long_form=long_form,
-                user_id=user_id,
-            )
-            answer = (model_output.answer or "").strip()
-            follow_up_question = (model_output.follow_up_question or "").strip()
+        # No retrieval, no summaries — the relaxed system prompt would have
+        # produced a Socratic redirect if it had any context; without any, we
+        # surface a short, honest pointer instead of a robotic refusal.
+        answer = (
+            "Your uploaded materials do not appear to cover this directly. "
+            "Tell me which source you want me to dig into, or rephrase the question against something specific from the lecture or document."
+        )
+        follow_up_question = "What is the most concrete passage in your materials that hints at the answer you're looking for?"
 
-            if _is_insufficient_answer(answer) and has_context_signal:
-                summary_retry = _run_summary_completion(
-                    query=expanded_query,
-                    source_summaries=source_summaries,
-                    relationship_insights=relationship_insights,
-                    recent_turns=recent_turns,
-                    generated_learning_context=generated_learning_context,
-                    long_form=long_form,
-                    user_id=user_id,
-                )
-                retried_answer = (summary_retry.answer or "").strip()
-                retried_follow_up = (summary_retry.follow_up_question or "").strip()
-                if retried_answer and not _is_insufficient_answer(retried_answer):
-                    answer = retried_answer
-                    if not follow_up_question and retried_follow_up:
-                        follow_up_question = retried_follow_up
-
-    if not answer:
-        answer = INSUFFICIENT_CONTEXT_ANSWER
-
-    if _is_insufficient_answer(answer) and has_context_signal:
+    if not answer and has_context_signal:
+        # Last-resort synthesis from summaries — only when the model returned
+        # truly empty content. Replaces the old dead-end refusal string.
         answer = _build_best_effort_answer(
             query=expanded_query,
             source_summaries=source_summaries,

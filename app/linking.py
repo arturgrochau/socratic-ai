@@ -24,6 +24,8 @@ from prompts.cross_reference import (
 
 
 MAX_TARGETS_PER_SOURCE_CONCEPT = 3
+# Session-wide ceiling; the practical per-pair budget is also scaled by source
+# count in link_source_pair() so multi-source sessions don't starve.
 MAX_COMPARISONS_PER_RUN = 15
 LINKING_BATCH_SIZE = 5
 MIN_TOPIC_TOKEN_LENGTH = 3
@@ -499,7 +501,13 @@ def link_single_pair(
     return store_relationship_edge(source_concept, target_concept, result, user_id)
 
 
-def link_source_pair(video_source_id: int, document_source_id: int, user_id: str) -> dict[str, int]:
+def link_source_pair(
+    video_source_id: int,
+    document_source_id: int,
+    user_id: str,
+    *,
+    max_comparisons: int | None = None,
+) -> dict[str, int]:
     ensure_linking_tables()
 
     video_source_type, video_payload = load_extracted_concepts(video_source_id, user_id)
@@ -517,7 +525,11 @@ def link_source_pair(video_source_id: int, document_source_id: int, user_id: str
         document_payload,
     )
 
-    candidate_pairs = build_candidate_pairs(video_concepts, document_concepts)
+    candidate_pairs = build_candidate_pairs(
+        video_concepts,
+        document_concepts,
+        max_comparisons=max_comparisons or MAX_COMPARISONS_PER_RUN,
+    )
 
     # Filter out already-cached pairs before batching
     pairs_to_compare: list[tuple[LinkedConcept, LinkedConcept]] = []

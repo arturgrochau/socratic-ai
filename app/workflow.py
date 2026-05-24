@@ -36,8 +36,17 @@ def run_processing_and_linking(
 
     linked_pairs: list[ProcessPipelineLinkResult] = []
     if normalized_video_id is not None and normalized_document_ids:
+        # Per-pair comparison budget scales with source count so multi-doc
+        # sessions don't share a tiny global pool. Still cheap — batched 5/call.
+        n_sources = 1 + len(normalized_document_ids)
+        per_pair_budget = min(20, n_sources * 8)
         for document_source_id in normalized_document_ids:
-            link_result = link_source_pair(normalized_video_id, document_source_id, user_id)
+            link_result = link_source_pair(
+                normalized_video_id,
+                document_source_id,
+                user_id,
+                max_comparisons=per_pair_budget,
+            )
             linked_pairs.append(
                 ProcessPipelineLinkResult(
                     video_source_id=normalized_video_id,

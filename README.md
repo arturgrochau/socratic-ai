@@ -2,94 +2,152 @@
 
 > *Sapere aude* — Dare to know. — Immanuel Kant
 
-Turn videos, PDFs, and lectures into a structured thinking workout — not a summary to scroll past.
+Turn your videos, PDFs, and lectures into a structured thinking workout — not a summary to scroll past.
 
 ---
 
-## Why This Exists
+## What it does, in one minute
 
-We are living through a strange inversion. For the first time in history, the bottleneck to understanding is not access to information — it is the willingness to do the cognitive work of understanding it. AI makes this worse, not better, if you use it wrong. It is trivially easy to paste a lecture into a chatbot, read the three-paragraph summary it spits back, and feel like you learned something. You didn't. You consumed output. That is not the same thing.
+Drop in a video (YouTube link or `.mp4`) and any documents (PDFs). Socratic AI runs them through a five-stage pipeline and gives you back a learning pack: a deep dive of each source, the hidden assumptions most explanations skip, the connections *between* your sources, and a Socratic chat grounded in your actual material.
 
-The Enlightenment philosophers had a name for the courage to think for yourself: *sapere aude*. Dare to know. Not dare to read a summary. Not dare to let someone else chew your food and hand it back to you. Dare to actually engage with ideas, wrestle with them, find where they break, and build your own understanding from the ground up.
+It is built to do the opposite of what most AI study tools do. It does not summarize your sources so you can stop reading them. It uses them to generate the questions that find the exact point where your understanding runs out — because that is where learning starts.
 
-Socratic AI is built on that premise. It does not answer your questions — it generates better questions. It does not explain what the source says — it forces you to figure out whether you can explain it yourself. The reflection questions are not comprehension checks. They are designed to find the exact point where your understanding runs out, because that is where learning begins.
+```
+ ┌──────────┐    ┌────────────┐    ┌────────────┐    ┌──────────┐    ┌────────┐
+ │ Ingest   │───▶│ Process    │───▶│ Generate   │───▶│ Synthesis │───▶│ Chat   │
+ │ Whisper  │    │ concepts + │    │ deep dive  │    │ across    │    │ on top │
+ │ + PDFs   │    │ summaries  │    │ + reflect  │    │ sources   │    │ of all │
+ └──────────┘    └────────────┘    └────────────┘    └──────────┘    └────────┘
+   per source       1 LLM call       ~5 LLM calls      1-2 calls     1 call /Q
+```
 
-The name is not an accident. Socrates did not lecture. He asked questions until his interlocutors discovered that they did not know what they thought they knew. That is still the most effective pedagogy ever devised, and it scales to any source material you feed it.
-
----
-
-## What It Does
-
-Upload a video (YouTube link or `.mp4`) and/or documents (PDFs). Socratic AI runs a structured pipeline:
-
-- **Ingestion** — transcribes video via Whisper, extracts text from PDFs, chunks and embeds everything into a local vector store
-- **Processing** — extracts key concepts and a source summary in a single LLM call per source
-- **Generation** — produces a full learning pack per source: deep dive, first-principles synthesis, under-the-surface assumptions, and Socratic reflection questions — all in one call, with explicit role contracts so sections never repeat each other
-- **Cross-source linking** — finds conceptual bridges and contradictions between sources (batched, efficient)
-- **Synthesis** — if you have multiple sources, generates integrated prose that contrasts, connects, and builds across them
-- **Socratic chat** — ask follow-up questions grounded in your actual material, not the model's training data
-
-The pipeline runs ~16 LLM calls for a 3-source session (down from 105 in earlier versions). It costs roughly $0.05–0.15 per full session on `gpt-4o-mini`.
+A 3-source session is ~16 primary LLM calls (plus a handful of small ones for chat and embeddings) and costs roughly **$0.05 – $0.15** on `gpt-4o-mini`. Results are cached, so reopening a session is free.
 
 ---
 
 ## Download
 
-| Platform | Link |
-|---|---|
-| **Mac** (Apple Silicon + Intel) | [→ GitHub Releases](https://github.com/arturgrochau/socratic_ai/releases/latest) |
-| **Windows** | [→ GitHub Releases](https://github.com/arturgrochau/socratic_ai/releases/latest) |
-| **Self-hosted** | See below |
+| Platform | File | Notes |
+|---|---|---|
+| 🍎 **Mac, Apple Silicon (M1/M2/M3/M4)** — *recommended for most Macs since 2020* | [`SocraticAI-mac-arm64.zip`](https://github.com/arturgrochau/socratic_ai/releases/latest) | Native arm64 build |
+| 🍎 **Mac, Intel** | [`SocraticAI-mac-intel.zip`](https://github.com/arturgrochau/socratic_ai/releases/latest) | For pre-2020 Macs |
+| 🪟 **Windows** | [`SocraticAI-windows.exe`](https://github.com/arturgrochau/socratic_ai/releases/latest) | |
+| 🐧 **Self-hosted** | See [Run from source](#run-from-source) below | |
 
-Download the binary for your platform. On first launch it will:
-1. Check for a `.env` file with your `OPENAI_API_KEY`
-2. Create a local Python environment and install dependencies (once, ~60 seconds)
-3. Start the app and open your browser automatically
+> **Which Mac do I have?** Click the Apple menu → *About This Mac*. If the **Chip** row says anything starting with "Apple", get the **arm64** build. If it says "Intel", get the **intel** build.
+
+### First launch on Mac (read this once)
+
+The app is signed with an ad-hoc signature, not an Apple Developer ID, so Gatekeeper will block the first open with **"SocraticAI cannot be opened because the developer cannot be verified"**. This is normal for indie tools. Choose either path:
+
+**Option A — one Terminal command (easiest):**
+```bash
+xattr -d com.apple.quarantine ~/Downloads/SocraticAI
+```
+Then double-click it. Done.
+
+**Option B — clickable path:**
+1. Try to open the app once and dismiss the warning.
+2. Open *System Settings* → *Privacy & Security*.
+3. Scroll down. You will see a line about SocraticAI being blocked. Click **Open Anyway**.
+
+You only have to do either of these once per download.
 
 ---
 
-## Quick Start (Self-Hosted)
+## Run from source
 
-**Requirements**: Python 3.11+, `ffmpeg` on PATH
+Requirements: Python 3.11+, `ffmpeg` on `PATH`, an OpenAI API key (or a local [Ollama](https://ollama.com) — see [Switching the brain](#switching-the-brain)).
 
 ```bash
 git clone https://github.com/arturgrochau/socratic_ai.git
 cd socratic_ai
 
-# Set your OpenAI API key
 echo "OPENAI_API_KEY=sk-..." > .env
 
-# Launch (creates venv and installs deps on first run)
-python launcher.py
+python launcher.py        # creates a venv + installs deps on first run
 ```
 
 The app opens at `http://localhost:8501`.
 
 ---
 
-## How the Pipeline Works
+## How the pipeline works
 
-**Per-source analysis** (one combined LLM call per source):
+<details>
+<summary><strong>Why this exists</strong> (click to expand the manifesto)</summary>
+
+We are living through a strange inversion. For the first time in history, the bottleneck to understanding is not access to information — it is the willingness to do the cognitive work of understanding it. AI makes this worse, not better, if you use it wrong. It is trivially easy to paste a lecture into a chatbot, read the three-paragraph summary it spits back, and feel like you learned something. You didn't. You consumed output. That is not the same thing.
+
+The Enlightenment philosophers had a name for the courage to think for yourself: *sapere aude*. Dare to know. Not dare to read a summary. Not dare to let someone else chew your food and hand it back to you. Dare to actually engage with ideas, wrestle with them, find where they break, and build your own understanding from the ground up.
+
+Socratic AI is built on that premise. It does not answer your questions — it generates better questions. It does not explain what the source says — it forces you to figure out whether you can explain it yourself. The reflection questions are not comprehension checks; they are designed to find the exact point where your understanding runs out.
+
+</details>
+
+**Per-source analysis** — one combined LLM call extracts concepts and writes the source summary. Then a sequence of small, role-contracted calls produces:
 
 | Section | What it covers |
 |---|---|
 | Summary | Core arguments and narrative arc |
 | Deep Dive | Mechanisms, tradeoffs, failure modes — how it actually works |
-| First Principles | The foundational logic in 2-3 sentences, from scratch |
+| First Principles | The foundational logic in 2–3 sentences, from scratch |
 | Under the Surface | Hidden assumptions, practitioner warnings, what most explanations skip |
 | Reflection Points | Socratic questions targeting the exact points where understanding typically breaks |
 
-**Cross-source synthesis** (when you have more than one source):
+Each section has an explicit role contract, and the pipeline runs a redundancy check before caching so they don't repeat each other.
 
-Concept pairs are compared in batches to find reinforcements, contradictions, and gaps. A final synthesis call produces integrated prose — not a side-by-side comparison table, but actual connected reasoning across your sources.
+**Cross-source synthesis** — when you have more than one source, concept pairs are compared in batches to find reinforcements, contradictions, and gaps. A final synthesis call produces integrated prose: not a side-by-side comparison table, but actual connected reasoning across your material.
 
-**Architecture**: FastAPI backend + Streamlit frontend + SQLite (session storage) + ChromaDB (vector embeddings) + OpenAI (`gpt-4o-mini` for generation, Whisper for transcription).
+**Socratic chat** — questions are answered against retrieved chunks from a local vector store (ChromaDB) over your sources. The chat is tuned to ground every claim in your material and, when your material doesn't cover something, to redirect with the single most useful Socratic question rather than a dead-end "I don't know."
+
+### Architecture
+
+```
+FastAPI (backend, port 8000)  ◀──▶  Streamlit (frontend, port 8501)
+        │
+        ├── SQLite (sessions, sources, generated sections — cached)
+        ├── ChromaDB (vector embeddings for retrieval)
+        └── LLMClient (OpenAI by default; Ollama optional)
+```
+
+---
+
+## Switching the brain
+
+The default backend is OpenAI's `gpt-4o-mini`. To run against a local model with [Ollama](https://ollama.com):
+
+```bash
+# 1. install ollama, then pull a model
+ollama pull llama3.2
+
+# 2. set provider envs in your .env (whisper still needs OpenAI for now)
+LLM_PROVIDER=ollama
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_MODEL=nomic-embed-text
+WHISPER_PROVIDER=openai     # only needed if you upload videos
+
+# 3. launch
+python launcher.py
+```
+
+Provider selection is per-role (chat, embedding, transcription), so you can mix — for example, OpenAI for transcription and embeddings, Llama locally for the rest. See [`app/models_registry.py`](app/models_registry.py) and [`app/llm_client.py`](app/llm_client.py) for the available roles and how to add another provider.
+
+Quality on a 7B local model will be visibly worse than `gpt-4o-mini` for the generation stages. It works; it just produces less crisp output. Use it for offline runs or privacy-sensitive material.
+
+---
+
+## What this is not
+
+- It is **not a summarizer.** If you wanted a TL;DR, ChatGPT does that in one prompt. This tool is for the times you actually want to learn something.
+- It is **not a tutor.** It does not have a curriculum. It works against the source material you give it.
+- It does **not replace doing the work.** The reflection questions are useless if you skim them. The whole point is the friction.
 
 ---
 
 ## Versioning
 
-Releases follow [semantic versioning](https://semver.org/). The `GENERATION_SCHEMA_VERSION` constant in `app/generation.py` controls cache invalidation — bumping it forces regeneration of all cached learning sections on the next run.
+Releases follow [semantic versioning](https://semver.org/). Cache invalidation is controlled by per-stage `*_SCHEMA_VERSION` constants in `app/generation.py` — bump them to force regeneration of any cached stage on the next run.
 
 ---
 

@@ -19,8 +19,13 @@ from prompts.concept_extraction import (
 from prompts.source_summary import SOURCE_SUMMARY_SYSTEM_PROMPT
 
 
-TRANSCRIPT_CHUNK_SIZE = 3200
-DOCUMENT_CHUNK_SIZE = 2800
+# Unified chunk size across both source types. The previous split (3200 for
+# transcripts, 2800 for documents) didn't carry information — embedding and
+# retrieval treated them identically downstream. One size means callers can
+# trust the chunk boundary and ingestion can produce reusable chunks.
+PROCESSING_CHUNK_SIZE = 2800
+TRANSCRIPT_CHUNK_SIZE = PROCESSING_CHUNK_SIZE
+DOCUMENT_CHUNK_SIZE = PROCESSING_CHUNK_SIZE
 CHUNK_OVERLAP = 250
 
 

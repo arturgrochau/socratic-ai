@@ -25,7 +25,9 @@ MAX_CHUNK_DIFF_WINDOWS = int(os.getenv("MAX_CHUNK_DIFF_WINDOWS", "1"))
 ENABLE_GENERATION_CRITIC_FALLBACK = os.getenv("ENABLE_GENERATION_CRITIC_FALLBACK", "true").lower() == "true"
 MAX_SOURCE_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_SOURCE_CRITIC_CALLS_PER_RUN", "1"))
 MAX_CROSS_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_CROSS_CRITIC_CALLS_PER_RUN", "1"))
-ENABLE_STRICT_GENERATION_GATES = os.getenv("ENABLE_STRICT_GENERATION_GATES", "false").lower() == "true"
+# Default-on so the existing redundancy gate in generation.py actually fires on
+# every run. Set ENABLE_STRICT_GENERATION_GATES=false to disable.
+ENABLE_STRICT_GENERATION_GATES = os.getenv("ENABLE_STRICT_GENERATION_GATES", "true").lower() == "true"
 USER_ID_HEADER = os.getenv("USER_ID_HEADER", "X-User-ID")
 ENABLE_COST_LOGGING = os.getenv("ENABLE_COST_LOGGING", "true").lower() == "true"
 CACHE_PROCESSED_SOURCES = os.getenv("CACHE_PROCESSED_SOURCES", "true").lower() == "true"
@@ -43,14 +45,44 @@ INGESTION_VIDEO_STEP_TIMEOUT_SECONDS = max(
     int(os.getenv("INGESTION_VIDEO_STEP_TIMEOUT_SECONDS", "240")),
 )
 
-if not OPENAI_API_KEY:
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", LLM_PROVIDER).strip().lower()
+WHISPER_PROVIDER = os.getenv("WHISPER_PROVIDER", "openai").strip().lower()
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+
+# Only OpenAI strictly requires the API key. Local providers can run without it.
+_needs_openai_key = (
+    LLM_PROVIDER == "openai"
+    or EMBEDDING_PROVIDER == "openai"
+    or WHISPER_PROVIDER == "openai"
+)
+if _needs_openai_key and not OPENAI_API_KEY:
     raise RuntimeError(
         "Missing OPENAI_API_KEY environment variable. "
-        "Set it in .env before starting the server."
+        "Set it in .env before starting the server, "
+        "or set LLM_PROVIDER=ollama (and EMBEDDING_PROVIDER=ollama, WHISPER_PROVIDER=none) "
+        "to run fully against a local Ollama daemon."
     )
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# Kept for backwards compatibility — existing modules still import openai_client
+# directly. The new abstraction lives in app.llm_client; prefer get_llm_client().
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None  # type: ignore[assignment]
 db_engine = create_engine(DATABASE_URL, future=True)
+
+
+_llm_client_cache: dict[str, object] = {}
+
+
+def get_llm_client(provider: str | None = None):
+    """Return a cached LLMClient for the requested provider (defaults to LLM_PROVIDER)."""
+    from app.llm_client import build_client
+
+    key = (provider or LLM_PROVIDER).strip().lower()
+    cached = _llm_client_cache.get(key)
+    if cached is None:
+        cached = build_client(key)
+        _llm_client_cache[key] = cached
+    return cached
 
 Path(CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
