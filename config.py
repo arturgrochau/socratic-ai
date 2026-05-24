@@ -28,6 +28,16 @@ MAX_CROSS_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_CROSS_CRITIC_CALLS_PER_RUN",
 # Default-on so the existing redundancy gate in generation.py actually fires on
 # every run. Set ENABLE_STRICT_GENERATION_GATES=false to disable.
 ENABLE_STRICT_GENERATION_GATES = os.getenv("ENABLE_STRICT_GENERATION_GATES", "true").lower() == "true"
+
+# Progressive chunking experiment (flag-gated; see plan §5). When on, the
+# per-source content pack is built in N rounds with cumulative chunk slices
+# and a carried-over claim ledger, instead of one call with distributed chunks.
+GENERATION_PROGRESSIVE_CHUNKING = os.getenv("GENERATION_PROGRESSIVE_CHUNKING", "false").lower() == "true"
+GENERATION_PROGRESSIVE_ROUNDS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_ROUNDS", "4")))
+
+# Token ceiling for the diagnostic harness. Soft assertion only — runs that
+# exceed this get a warn in the report, not a failure.
+DIAGNOSTIC_TOKEN_CEILING = int(os.getenv("DIAGNOSTIC_TOKEN_CEILING", "40000"))
 USER_ID_HEADER = os.getenv("USER_ID_HEADER", "X-User-ID")
 ENABLE_COST_LOGGING = os.getenv("ENABLE_COST_LOGGING", "true").lower() == "true"
 CACHE_PROCESSED_SOURCES = os.getenv("CACHE_PROCESSED_SOURCES", "true").lower() == "true"

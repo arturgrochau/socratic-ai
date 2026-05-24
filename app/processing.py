@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from app.cost_logging import log_api_usage
 from app.models import ConceptExtractionPayload, ProcessSourceResponse
+from app.session_logger import get_active_logger
 from config import CACHE_PROCESSED_SOURCES, PROCESSING_MODEL, db_engine, openai_client
 from prompts.combined_processing import (
     COMBINED_PROCESSING_JSON_SCHEMA,
@@ -565,6 +566,10 @@ def process_source(source_id: int, user_id: str) -> ProcessSourceResponse:
 
     if CACHE_PROCESSED_SOURCES:
         if existing_payload is not None and existing_summary is not None:
+            get_active_logger().record(
+                "processing_cache",
+                {"source_id": source_id, "source_type": source_type, "hit": True},
+            )
             return ProcessSourceResponse(
                 source_id=source_id,
                 source_type=source_type,
@@ -573,6 +578,10 @@ def process_source(source_id: int, user_id: str) -> ProcessSourceResponse:
                 extraction=existing_payload,
                 source_summary=existing_summary,
             )
+    get_active_logger().record(
+        "processing_cache",
+        {"source_id": source_id, "source_type": source_type, "hit": False},
+    )
 
     if source_type == "video":
         raw_text = load_transcript_text(source_id, user_id)

@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 from app.cost_logging import log_api_usage
 from app.json_reliability import safe_json_loads
+from app.session_logger import SessionLogger
 from app.models import (
     AskModelOutput,
     AskResponse,
@@ -919,6 +920,37 @@ def handle_user_query(
         state.turns = state.turns[-MAX_STORED_TURNS:]
 
     _save_interaction_session(state, user_id)
+
+    # Per-query telemetry — appended to a chat-specific JSONL so the diagnostic
+    # harness can score "feel": route taken, retrieval signal strength, whether
+    # the dead-end refusal pattern leaked through, answer length distribution.
+    route = "broad" if use_summary_path and is_broad_query else (
+        "summary_fallback" if use_summary_path else (
+            "grounded" if retrieved_context is not None else "no_context"
+        )
+    )
+    top_retrieval_score = 0.0
+    if retrieved_context is not None and retrieved_context.hits:
+        top_retrieval_score = round(
+            max(hit.score for hit in retrieved_context.hits), 4
+        )
+    SessionLogger(f"chat-{session_id}", user_id=user_id).record(
+        "chat_query",
+        {
+            "query_length": len(normalized_query),
+            "answer_length": len(answer),
+            "route": route,
+            "top_retrieval_score": top_retrieval_score,
+            "n_retrieval_hits": (
+                len(retrieved_context.hits) if retrieved_context else 0
+            ),
+            "had_follow_up": bool(follow_up_question),
+            "contains_refusal_pattern": _is_insufficient_answer(answer),
+            "long_form": long_form,
+            "is_deepening": _is_deepening_query(normalized_query),
+            "n_turns": len(state.turns),
+        },
+    )
 
     return AskResponse(
         session_id=state.session_id,

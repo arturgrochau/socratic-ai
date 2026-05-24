@@ -14,6 +14,7 @@ from app.models import (
     LinkedConcept,
     LinkingEdgeRecord,
 )
+from app.session_logger import get_active_logger
 from config import CACHE_PROCESSED_SOURCES, LINKING_MODEL, db_engine, openai_client
 from prompts.cross_reference import (
     CROSS_REFERENCE_BATCH_JSON_SCHEMA,
@@ -551,6 +552,18 @@ def link_source_pair(
     for (source_concept, target_concept), result in zip(pairs_to_compare, results):
         store_relationship_edge(source_concept, target_concept, result, user_id)
         stored_edges += 1
+
+    get_active_logger().record(
+        "linking_pair",
+        {
+            "video_source_id": video_source_id,
+            "document_source_id": document_source_id,
+            "candidate_pairs": len(candidate_pairs),
+            "to_compare": len(pairs_to_compare),
+            "cached": len(candidate_pairs) - len(pairs_to_compare),
+            "stored_edges": stored_edges,
+        },
+    )
 
     return {
         "video_source_id": video_source_id,

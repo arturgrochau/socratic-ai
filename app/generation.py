@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from app.cost_logging import log_api_usage, log_generation_stage_event
 from app.json_reliability import parse_json_object, safe_json_loads
+from app.session_logger import get_active_logger, session_log
 from app.linking import link_source_pair
 from app.models import (
     ApplicationScenario,
@@ -36,6 +37,8 @@ from config import (
     ENABLE_GENERATION_CRITIC_FALLBACK,
     GENERATION_CRITIC_MODEL,
     GENERATION_MODEL,
+    GENERATION_PROGRESSIVE_CHUNKING,
+    GENERATION_PROGRESSIVE_ROUNDS,
     MAX_CHUNK_DIFF_WINDOWS,
     MAX_CROSS_CRITIC_CALLS_PER_RUN,
     MAX_SOURCE_CRITIC_CALLS_PER_RUN,
@@ -425,6 +428,20 @@ def _run_structured_generation_step(
                 status="succeeded",
                 duration_ms=duration_ms,
             )
+            usage = getattr(completion, "usage", None)
+            get_active_logger().record(
+                "stage_call",
+                {
+                    "stage_name": stage_name,
+                    "attempt": attempt_number,
+                    "duration_ms": duration_ms,
+                    "model": model_name,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                    "critic": False,
+                },
+            )
             return payload
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
@@ -496,6 +513,21 @@ def _run_structured_generation_step(
                     f"fallback_model={GENERATION_CRITIC_MODEL};"
                     f"remaining_budget={critic_budget.get(critic_bucket, 0)}"
                 ),
+            )
+            usage = getattr(completion, "usage", None)
+            get_active_logger().record(
+                "stage_call",
+                {
+                    "stage_name": critic_stage_name,
+                    "attempt": critic_attempt_number,
+                    "duration_ms": duration_ms,
+                    "model": GENERATION_CRITIC_MODEL,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                    "critic": True,
+                    "remaining_budget": critic_budget.get(critic_bucket, 0),
+                },
             )
             return payload
         except Exception as critic_exc:
@@ -2148,6 +2180,19 @@ def _record_novelty_ledger_entry(
         section_text=section_text,
     )
 
+    get_active_logger().record(
+        "novelty",
+        {
+            "section_type": section_type,
+            "source_id": source_id,
+            "overlap_ratio": round(overlap_ratio, 4),
+            "overlap_sentences": overlap_count,
+            "total_sentences": total_count,
+            "expansion_applied": expansion_applied,
+            "violates_threshold": overlap_ratio > SECTION_REDUNDANCY_RATIO_THRESHOLD,
+        },
+    )
+
 
 def _record_pairwise_quality_metric(
     *,
@@ -2562,6 +2607,12 @@ def _extract_chunk_diff_claims(
     run_id: str,
 ) -> list[ClaimLedgerEntry]:
     """Stage 3: Extract novel claims from chunk windows that are NOT in the summary."""
+    # Tune applied from a diagnostic run: when grounding has only one chunk the
+    # chunk-diff prompt spends ~500+ tokens on a near-empty response (model has
+    # nothing new to compare against). Skip the stage in that case.
+    if len(grounding_chunks) <= 1:
+        return []
+
     windows = _build_chunk_windows(grounding_chunks)
     if not windows:
         return []
@@ -2973,6 +3024,117 @@ def _load_cached_source_learning_section(source_id: int, user_id: str) -> Source
     )
 
 
+def _select_chronological_slice(
+    rows: list[dict[str, Any]],
+    *,
+    end_index: int,
+    max_chars: int,
+) -> list[str]:
+    """Return formatted grounding entries from rows[0:end_index] bounded by max_chars."""
+    chunks: list[str] = []
+    consumed = 0
+    for row in rows[:max(end_index, 0)]:
+        entry = _format_grounding_entry(row)
+        if not entry:
+            continue
+        if consumed + len(entry) > max_chars and chunks:
+            break
+        if consumed + len(entry) > max_chars and not chunks:
+            entry = entry[:max_chars]
+        chunks.append(entry)
+        consumed += len(entry)
+    return chunks
+
+
+def _progressive_content_pack(
+    *,
+    summary_text: str,
+    source_type: str,
+    claim_ledger: list[ClaimLedgerEntry],
+    base_outline: str,
+    grounding_rows: list[dict[str, Any]],
+    user_id: str,
+    run_id: str,
+) -> tuple[str, list[str], str, str, list[ReflectionPoint]]:
+    """Multi-round build: round k gets chronological [0 : k*N/total] chunks
+    plus the prior round's pack as carried-over context. Last round's output
+    is the official content pack.
+
+    Experimental — gated by GENERATION_PROGRESSIVE_CHUNKING. Logs per-round
+    telemetry via the active session logger so the diagnostic can compare it
+    against the single-call baseline.
+    """
+    rounds = max(2, int(GENERATION_PROGRESSIVE_ROUNDS))
+    total_rows = len(grounding_rows)
+    logger = get_active_logger()
+
+    deep_dive_text = ""
+    key_terms: list[str] = []
+    first_principles_synthesis = ""
+    under_surface_explainer = ""
+    reflection_points: list[ReflectionPoint] = []
+
+    for round_index in range(1, rounds + 1):
+        end_index = max(1, (round_index * total_rows) // rounds)
+        slice_chunks = _select_chronological_slice(
+            grounding_rows,
+            end_index=end_index,
+            max_chars=MAX_GROUNDING_CHARS,
+        )
+
+        # Thread prior round's output into the outline so the model treats it
+        # as "what you have so far; extend, do not restart".
+        if deep_dive_text:
+            carried = (
+                f"\n\nCarried-over deep dive from prior round (do not restate; extend with new claims only):\n"
+                f"{deep_dive_text[:1800]}"
+            )
+            if under_surface_explainer:
+                carried += (
+                    f"\n\nCarried-over under-surface from prior round:\n"
+                    f"{under_surface_explainer[:1200]}"
+                )
+            outline = base_outline + carried
+        else:
+            outline = base_outline
+
+        (
+            deep_dive_text,
+            key_terms,
+            first_principles_synthesis,
+            under_surface_explainer,
+            reflection_points,
+        ) = _generate_source_content_pack(
+            summary_text=summary_text,
+            source_type=source_type,
+            claim_ledger=claim_ledger,
+            progression_outline=outline,
+            grounding_chunks=slice_chunks,
+            user_id=user_id,
+            run_id=f"{run_id}:p{round_index}",
+        )
+
+        logger.record(
+            "progressive_round",
+            {
+                "round": round_index,
+                "total_rounds": rounds,
+                "chunks_used": len(slice_chunks),
+                "deep_dive_chars": len(deep_dive_text or ""),
+                "under_surface_chars": len(under_surface_explainer or ""),
+                "reflections": len(reflection_points or []),
+            },
+        )
+
+    return (
+        deep_dive_text,
+        key_terms,
+        first_principles_synthesis,
+        under_surface_explainer,
+        reflection_points,
+    )
+
+
 def _build_source_learning_section(source_id: int, user_id: str, run_id: str) -> SourceLearningSection:
     source_type, source_name, _ = get_source_metadata(source_id, user_id)
 
@@ -3041,18 +3203,38 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
         run_id=run_id,
     )
 
-    # Single combined call: deep_dive + under_surface + reflection
-    deep_dive_text, key_terms, first_principles_synthesis, under_surface_explainer, reflection_points = (
-        _generate_source_content_pack(
+    # Single combined call by default. With GENERATION_PROGRESSIVE_CHUNKING=true
+    # we run N rounds with growing chronological slices, threading the previous
+    # round's output through progression_outline. Costs ~N× tokens; promote only
+    # if the AB diagnostic shows clear quality gain.
+    if GENERATION_PROGRESSIVE_CHUNKING and len(grounding_rows) >= GENERATION_PROGRESSIVE_ROUNDS:
+        (
+            deep_dive_text,
+            key_terms,
+            first_principles_synthesis,
+            under_surface_explainer,
+            reflection_points,
+        ) = _progressive_content_pack(
             summary_text=summary_text,
             source_type=source_type,
             claim_ledger=claim_ledger,
-            progression_outline=progression_outline,
-            grounding_chunks=grounding_chunks,
+            base_outline=progression_outline,
+            grounding_rows=grounding_rows,
             user_id=user_id,
             run_id=run_id,
         )
-    )
+    else:
+        deep_dive_text, key_terms, first_principles_synthesis, under_surface_explainer, reflection_points = (
+            _generate_source_content_pack(
+                summary_text=summary_text,
+                source_type=source_type,
+                claim_ledger=claim_ledger,
+                progression_outline=progression_outline,
+                grounding_chunks=grounding_chunks,
+                user_id=user_id,
+                run_id=run_id,
+            )
+        )
 
     # Deterministic dedup (no LLM calls)
     deep_dive_text = _truncate_to_max_words(
@@ -3121,7 +3303,15 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
                 status="succeeded",
                 details=f"cut_section={cut_label}",
             )
+            get_active_logger().record(
+                "hard_cut",
+                {"source_id": source_id, "cut_section": cut_label},
+            )
         low_mechanism_density = True
+        get_active_logger().record(
+            "low_mechanism_density",
+            {"source_id": source_id, "applied_cuts": applied_cuts},
+        )
 
     section = SourceLearningSection(
         source_id=source_id,
@@ -3762,6 +3952,24 @@ def generate_tailored_learning(
     ensure_generation_tables()
     run_id = f"gen-{uuid.uuid4().hex[:12]}"
 
+    with session_log(run_id, user_id=user_id) as session:
+        return _generate_tailored_learning_inner(
+            video_source_id=video_source_id,
+            document_source_ids=document_source_ids,
+            user_id=user_id,
+            run_id=run_id,
+            session=session,
+        )
+
+
+def _generate_tailored_learning_inner(
+    *,
+    video_source_id: int | None,
+    document_source_ids: list[int],
+    user_id: str,
+    run_id: str,
+    session: Any,
+) -> GenerateTailoredLearningResponse:
     normalized_video_id, normalized_document_ids = _normalize_ids(
         video_source_id,
         document_source_ids,
@@ -3770,6 +3978,15 @@ def generate_tailored_learning(
     if normalized_video_id is not None:
         source_ids.append(normalized_video_id)
     source_ids.extend(normalized_document_ids)
+
+    session.record(
+        "pipeline_start",
+        {
+            "video_source_id": normalized_video_id,
+            "document_source_ids": normalized_document_ids,
+            "n_sources": len(source_ids),
+        },
+    )
 
     log_generation_stage_event(
         run_id=run_id,
