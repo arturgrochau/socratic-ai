@@ -233,7 +233,11 @@ def check_token_budget(rows: list[dict[str, Any]], db_engine: Any, run_id: str) 
 # by design; generation should be content-heavy; linking classifies in tiny
 # JSON. The check fires per-stage against these thresholds.
 RATIO_THRESHOLDS: dict[str, float] = {
-    "generation": 0.30,
+    # Generation completions are bounded by the section word budgets
+    # (e.g. MAX_DEEP_DIVE_WORDS=900). With dense grounding context the ratio
+    # settles around 25-35%. Set floor at 25% — below that we're paying for
+    # tokens that don't move the answer.
+    "generation": 0.25,
     "processing": 0.30,
     # 4-way classification with short explanations; after the payload trim
     # ratio settles around 19-21% with run-to-run variance. Setting the floor
@@ -438,15 +442,99 @@ def check_retrieval_efficiency(rows: list[dict[str, Any]], db_engine: Any, run_i
     )
 
 
+def check_intersection_quality(rows: list[dict[str, Any]], db_engine: Any, run_id: str, *, synthesis_payload: dict[str, Any] | None = None) -> CheckResult:
+    """Each intersection should: have a non-duplicate title, integrated_explanation
+    > 100 chars, and contain at least one cross-source signal word (both/each/across).
+    Catches single-source paraphrases dressed up as intersections."""
+    if not synthesis_payload:
+        return CheckResult("intersection_quality", "pass", "(no synthesis to score)", "")
+    intersections = synthesis_payload.get("intersections") or []
+    if not intersections:
+        return CheckResult("intersection_quality", "pass", "(no intersections to score)", "")
+
+    titles_seen: set[str] = set()
+    weak: list[str] = []
+    duplicates: list[str] = []
+    cross_words = ("both", "each", "across", "together", "combined", "between")
+    for entry in intersections:
+        title = str(entry.get("intersection_title", "")).strip().lower()
+        explanation = str(entry.get("integrated_explanation", "")).strip()
+        if title in titles_seen:
+            duplicates.append(title)
+        titles_seen.add(title)
+        if len(explanation) < 100:
+            weak.append(f"{title}(too short)")
+        elif not any(w in explanation.lower() for w in cross_words):
+            # Most likely a single-source paraphrase if no cross-reference language.
+            weak.append(f"{title}(no cross-source language)")
+
+    issues: list[str] = []
+    if duplicates:
+        issues.append(f"duplicate titles: {duplicates}")
+    if weak:
+        issues.append(f"weak: {weak}")
+    if not issues:
+        return CheckResult(
+            "intersection_quality",
+            "pass",
+            f"{len(intersections)} intersections, all distinct and cross-referenced.",
+            "",
+        )
+    return CheckResult(
+        "intersection_quality",
+        "warn",
+        "; ".join(issues),
+        "Strengthen the synthesis_consolidator prompt: require explicit 'both sources'/'each source' "
+        "language in integrated_explanation, and ensure each intersection has a distinct title.",
+        {"weak": weak, "duplicates": duplicates},
+    )
+
+
+def check_broad_answer_length(rows: list[dict[str, Any]], db_engine: Any, run_id: str) -> CheckResult:
+    """Broad-route chat answers should have *some* substance. Threshold is low
+    (100 chars) because off-topic queries legitimately produce short answers
+    like 'the source does not cover X'. Anything under 100 chars likely
+    indicates the model bailed entirely (e.g. one-line refusal)."""
+    chat_queries = _records(rows, "chat_query")
+    if not chat_queries:
+        return CheckResult("broad_answer_length", "pass", "(no chat traffic)", "")
+    broad_thin = [
+        q for q in chat_queries
+        if q.get("route") == "broad" and int(q.get("answer_length") or 0) < 100
+    ]
+    broad_total = sum(1 for q in chat_queries if q.get("route") == "broad")
+    if not broad_thin:
+        return CheckResult(
+            "broad_answer_length",
+            "pass",
+            f"{broad_total} broad-route answers, all ≥100 chars." if broad_total else "(no broad probes)",
+            "",
+        )
+    return CheckResult(
+        "broad_answer_length",
+        "warn",
+        f"{len(broad_thin)}/{broad_total} broad-route answers under 100 chars (suspicious bail)",
+        "A broad route answer under 100 chars almost certainly means the model "
+        "produced a single-line refusal. Check that prompts/interaction.py's "
+        "no-context redirect clause is taking effect.",
+        {"thin": len(broad_thin), "total": broad_total},
+    )
+
+
 def check_synthesis_richness(rows: list[dict[str, Any]], db_engine: Any, run_id: str, *, synthesis_payload: dict[str, Any] | None = None) -> CheckResult:
     """If synthesis has < 2 intersections or < 1 application scenario, the
     consolidator may be under-utilizing its output budget."""
     if not synthesis_payload:
         return CheckResult("synthesis_richness", "pass", "(no synthesis to score)", "")
+    synthesis_text = (synthesis_payload.get("synthesis_text") or "").strip()
+    # Single-source runs don't produce a real cross-source synthesis. The
+    # `insights` field is always populated but synthesis_text is empty —
+    # skip the check then so it doesn't fire as a false positive.
+    if not synthesis_text:
+        return CheckResult("synthesis_richness", "pass", "(single-source run, no synthesis)", "")
     intersections = synthesis_payload.get("intersections") or []
     parallels = synthesis_payload.get("parallels") or []
     application_scenarios = synthesis_payload.get("application_scenarios") or []
-    synthesis_text = (synthesis_payload.get("synthesis_text") or "").strip()
 
     issues: list[str] = []
     if len(intersections) < 2:
@@ -487,6 +575,7 @@ CHECK_FUNCTIONS = [
     check_prompt_completion_ratio,
     check_chat_quality,
     check_retrieval_efficiency,
+    check_broad_answer_length,
 ]
 
 
@@ -542,6 +631,14 @@ def run_checks(
     )
     results.append(
         check_synthesis_richness(
+            rows,
+            db_engine,
+            run_id,
+            synthesis_payload=synthesis_payload,
+        )
+    )
+    results.append(
+        check_intersection_quality(
             rows,
             db_engine,
             run_id,

@@ -38,6 +38,7 @@ from config import (
     GENERATION_CRITIC_MODEL,
     GENERATION_MODEL,
     GENERATION_PROGRESSIVE_CHUNKING,
+    GENERATION_PROGRESSIVE_MIN_CHUNKS,
     GENERATION_PROGRESSIVE_ROUNDS,
     MAX_CHUNK_DIFF_WINDOWS,
     MAX_CROSS_CRITIC_CALLS_PER_RUN,
@@ -3208,7 +3209,10 @@ def _build_source_learning_section(source_id: int, user_id: str, run_id: str) ->
     # we run N rounds with growing chronological slices, threading the previous
     # round's output through progression_outline. Costs ~N× tokens; promote only
     # if the AB diagnostic shows clear quality gain.
-    if GENERATION_PROGRESSIVE_CHUNKING and len(grounding_rows) >= GENERATION_PROGRESSIVE_ROUNDS:
+    if (
+        GENERATION_PROGRESSIVE_CHUNKING
+        and len(grounding_rows) >= GENERATION_PROGRESSIVE_MIN_CHUNKS
+    ):
         (
             deep_dive_text,
             key_terms,

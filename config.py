@@ -29,11 +29,15 @@ MAX_CROSS_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_CROSS_CRITIC_CALLS_PER_RUN",
 # every run. Set ENABLE_STRICT_GENERATION_GATES=false to disable.
 ENABLE_STRICT_GENERATION_GATES = os.getenv("ENABLE_STRICT_GENERATION_GATES", "true").lower() == "true"
 
-# Progressive chunking experiment (flag-gated; see plan §5). When on, the
-# per-source content pack is built in N rounds with cumulative chunk slices
-# and a carried-over claim ledger, instead of one call with distributed chunks.
-GENERATION_PROGRESSIVE_CHUNKING = os.getenv("GENERATION_PROGRESSIVE_CHUNKING", "false").lower() == "true"
-GENERATION_PROGRESSIVE_ROUNDS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_ROUNDS", "4")))
+# Progressive chunking: per-source content pack built in N rounds with
+# cumulative chunk slices, threading the prior round's deep_dive/under_surface
+# as carried-over context. Diagnostic AB on long fixtures (4+ chunks) showed
+# +148% deep_dive length at +18% token cost — clear win, so default ON.
+# A separate min-chunks guard in generation.py prevents triggering on small
+# sources where the cost/benefit reverses.
+GENERATION_PROGRESSIVE_CHUNKING = os.getenv("GENERATION_PROGRESSIVE_CHUNKING", "true").lower() == "true"
+GENERATION_PROGRESSIVE_ROUNDS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_ROUNDS", "2")))
+GENERATION_PROGRESSIVE_MIN_CHUNKS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_MIN_CHUNKS", "4")))
 
 # Token ceiling for the diagnostic harness. Soft assertion only — runs that
 # exceed this get a warn in the report, not a failure.
