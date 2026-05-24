@@ -3409,12 +3409,14 @@ def _generate_synthesis_consolidation(
             )
         ),
         response_schema=SYNTHESIS_CONSOLIDATOR_JSON_SCHEMA,
-        required_keys=["synthesis_text", "questions"],
+        required_keys=["synthesis_text", "intersections", "application_scenarios", "questions"],
         model_name=CONSOLIDATION_MODEL,
     )
 
     synthesis_text = payload.get("synthesis_text", "").strip()
     raw_questions = payload.get("questions", [])
+    raw_intersections = payload.get("intersections", []) or []
+    raw_application_scenarios = payload.get("application_scenarios", []) or []
 
     questions = []
     for q in raw_questions:
@@ -3430,46 +3432,82 @@ def _generate_synthesis_consolidation(
             )
         )
 
+    # Build intersections from the model output. Each intersection gets one
+    # attributed_sentence per source so the downstream UI has provenance.
     all_sections = [video_section] + list(document_sections)
+    default_emphasis = []
+    for s in all_sections[:2]:
+        default_emphasis.extend(s.key_terms[:3])
     intersections: list[InsightIntersection] = []
-    for section in all_sections[:3]:
-        summary_clean = _normalize_continuous_prose(section.summary_text)
-        deep_clean = _normalize_continuous_prose(section.deep_dive_text)
-        summary_sentence = _truncate_sentence(summary_clean, limit=240)
-        deep_sentence = _truncate_sentence(deep_clean, limit=240)
-        emphasis_terms = [term for term in section.key_terms[:4] if term.strip()]
+    for entry in raw_intersections:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("intersection_title", "")).strip()
+        why = str(entry.get("why_it_matters", "")).strip()
+        integrated = str(entry.get("integrated_explanation", "")).strip()
+        if not (title and why and integrated):
+            continue
         attributed: list[AttributedSentence] = []
-        for snippet in [summary_sentence, deep_sentence]:
+        for section in all_sections[:3]:
+            snippet = _truncate_sentence(
+                _normalize_continuous_prose(section.deep_dive_text),
+                limit=200,
+            )
             if snippet:
                 attributed.append(
                     AttributedSentence(
                         text=snippet,
                         source_id=section.source_id,
                         source_type=section.source_type,
-                        emphasis_terms=emphasis_terms,
+                        emphasis_terms=[t for t in section.key_terms[:3] if t.strip()],
                     )
                 )
-        if not attributed:
-            attributed.append(
-                AttributedSentence(
-                    text=f"Focus on the core mechanism behind '{section.generated_title}'.",
-                    source_id=section.source_id,
-                    source_type=section.source_type,
-                    emphasis_terms=emphasis_terms,
-                )
-            )
         intersections.append(
             InsightIntersection(
-                intersection_title=f"Focus Area: {section.generated_title}",
-                why_it_matters=(
-                    summary_sentence
-                    or f"This source defines the core mechanism for {section.generated_title}."
-                ),
-                integrated_explanation=(
-                    deep_sentence
-                    or "Use the boundary analysis and reflection points to pressure-test understanding."
-                ),
+                intersection_title=title,
+                why_it_matters=why,
+                integrated_explanation=integrated,
                 attributed_sentences=attributed,
+            )
+        )
+
+    # Fallback to the prior post-hoc fabrication if the model returned nothing.
+    if not intersections:
+        for section in all_sections[:3]:
+            summary_sentence = _truncate_sentence(_normalize_continuous_prose(section.summary_text), limit=240)
+            deep_sentence = _truncate_sentence(_normalize_continuous_prose(section.deep_dive_text), limit=240)
+            intersections.append(
+                InsightIntersection(
+                    intersection_title=f"Focus Area: {section.generated_title}",
+                    why_it_matters=summary_sentence or f"This source defines the core mechanism for {section.generated_title}.",
+                    integrated_explanation=deep_sentence or "Use the boundary analysis and reflection points to pressure-test understanding.",
+                    attributed_sentences=[
+                        AttributedSentence(
+                            text=summary_sentence or "Core mechanism focus area.",
+                            source_id=section.source_id,
+                            source_type=section.source_type,
+                            emphasis_terms=[t for t in section.key_terms[:4] if t.strip()],
+                        )
+                    ],
+                )
+            )
+
+    application_scenarios: list[ApplicationScenario] = []
+    for entry in raw_application_scenarios:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("scenario_title", "")).strip()
+        prompt = str(entry.get("scenario_prompt", "")).strip()
+        steps = [str(step).strip() for step in (entry.get("transfer_steps") or []) if str(step).strip()]
+        pitfall = str(entry.get("common_pitfall", "")).strip()
+        if not (title and prompt and steps and pitfall):
+            continue
+        application_scenarios.append(
+            ApplicationScenario(
+                scenario_title=title,
+                scenario_prompt=prompt,
+                transfer_steps=steps[:4],
+                common_pitfall=pitfall,
             )
         )
 
@@ -3479,7 +3517,7 @@ def _generate_synthesis_consolidation(
         parallels=[],
         layman_bridge="",
         comparative_analysis="",
-        application_scenarios=[],
+        application_scenarios=application_scenarios,
         model_name=CONSOLIDATION_MODEL,
     )
 

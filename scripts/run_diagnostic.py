@@ -400,6 +400,11 @@ def main(argv: list[str] | None = None) -> int:
         "GENERATION_PROGRESSIVE_CHUNKING": "true" if mode == "progressive" else "false",
         "ENABLE_SESSION_LOG": "true",
     }
+    if mode == "progressive":
+        # The flag-gated path requires len(grounding_rows) >= ROUNDS to fire.
+        # Small fixtures may have only 2-3 grounding rows. Lower the default
+        # so the experiment is actually measurable here.
+        env_overrides["GENERATION_PROGRESSIVE_ROUNDS"] = "2"
 
     DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
     SESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -483,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         extra_jsonl_paths=extras,
         source_texts=source_texts,
         synthesis_text=synthesis_text,
+        synthesis_payload=generation_result.get("insights"),
         run_started_at=started_at,
     )
     tunes = suggest_tunes(checks, top_n=3)

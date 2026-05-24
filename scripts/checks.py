@@ -393,6 +393,89 @@ def check_synthesis_paraphrase(rows: list[dict[str, Any]], db_engine: Any, run_i
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def check_retrieval_efficiency(rows: list[dict[str, Any]], db_engine: Any, run_id: str) -> CheckResult:
+    """Retrieval cost should scale with QUERIES, not corpus size. If we see
+    way more embedding calls than chat queries it usually means we're
+    re-embedding the corpus per query — embed-at-ingestion would fix it."""
+    session_start = next((r for r in rows if r.get("stage") == "session_start"), None)
+    user_id = (session_start or {}).get("user_id", "unknown")
+    started_at = float((session_start or {}).get("started_at") or 0.0)
+
+    chat_queries = _records(rows, "chat_query")
+    if not chat_queries:
+        return CheckResult("retrieval_efficiency", "pass", "(no chat traffic to score)", "")
+
+    with db_engine.connect() as conn:
+        retrieval = conn.execute(
+            text(
+                "SELECT COALESCE(SUM(total_tokens), 0) AS total, COUNT(*) AS n "
+                "FROM api_call_usage WHERE user_id = :user_id "
+                "AND call_stage = 'retrieval' "
+                "AND CAST(strftime('%s', created_at) AS INTEGER) >= :since"
+            ),
+            {"user_id": user_id, "since": int(max(0.0, started_at - 5))},
+        ).mappings().first()
+    n_calls = int((retrieval or {}).get("n") or 0)
+    total = int((retrieval or {}).get("total") or 0)
+
+    # Reasonable ratio: ~1 call per chat query + at most 1 corpus warm-up.
+    expected_max = len(chat_queries) + 2
+    if n_calls > expected_max * 2:
+        return CheckResult(
+            "retrieval_efficiency",
+            "warn",
+            f"{n_calls} embedding calls for {len(chat_queries)} chat queries ({total} tokens). "
+            f"Likely re-embedding corpus per query.",
+            "Wire embed-at-ingestion (deferred from v1.1.0): move upsert_retrieval_embeddings "
+            "from the chat hot path (retrieval.py:414) into the ingestion completion hook.",
+            {"calls": n_calls, "queries": len(chat_queries), "tokens": total},
+        )
+    return CheckResult(
+        "retrieval_efficiency",
+        "pass",
+        f"{n_calls} embedding calls for {len(chat_queries)} chat queries ({total} tokens).",
+        "",
+    )
+
+
+def check_synthesis_richness(rows: list[dict[str, Any]], db_engine: Any, run_id: str, *, synthesis_payload: dict[str, Any] | None = None) -> CheckResult:
+    """If synthesis has < 2 intersections or < 1 application scenario, the
+    consolidator may be under-utilizing its output budget."""
+    if not synthesis_payload:
+        return CheckResult("synthesis_richness", "pass", "(no synthesis to score)", "")
+    intersections = synthesis_payload.get("intersections") or []
+    parallels = synthesis_payload.get("parallels") or []
+    application_scenarios = synthesis_payload.get("application_scenarios") or []
+    synthesis_text = (synthesis_payload.get("synthesis_text") or "").strip()
+
+    issues: list[str] = []
+    if len(intersections) < 2:
+        issues.append(f"{len(intersections)} intersections (target ≥2)")
+    if not application_scenarios:
+        issues.append("0 application scenarios (target ≥1)")
+    if synthesis_text and len(synthesis_text) < 500:
+        issues.append(f"synthesis_text only {len(synthesis_text)} chars (target ≥500)")
+
+    if not issues:
+        return CheckResult(
+            "synthesis_richness",
+            "pass",
+            f"{len(intersections)} intersections, {len(parallels)} parallels, "
+            f"{len(application_scenarios)} application scenarios.",
+            "",
+        )
+    return CheckResult(
+        "synthesis_richness",
+        "warn",
+        "; ".join(issues),
+        "Strengthen the prompts/synthesis_consolidator.py instruction to produce 3-4 "
+        "intersections and at least 2 application_scenarios. Current output is below "
+        "schema capacity.",
+        {"intersections": len(intersections), "parallels": len(parallels),
+         "application_scenarios": len(application_scenarios)},
+    )
+
+
 CHECK_FUNCTIONS = [
     check_stage_failures,
     check_retry_pressure,
@@ -403,6 +486,7 @@ CHECK_FUNCTIONS = [
     check_token_budget,
     check_prompt_completion_ratio,
     check_chat_quality,
+    check_retrieval_efficiency,
 ]
 
 
@@ -414,6 +498,7 @@ def run_checks(
     extra_jsonl_paths: list[Path] | None = None,
     source_texts: list[str] | None = None,
     synthesis_text: str | None = None,
+    synthesis_payload: dict[str, Any] | None = None,
     run_started_at: float | None = None,
 ) -> list[CheckResult]:
     """Run all checks. `run_started_at` is the diagnostic harness's wall-clock
@@ -453,6 +538,14 @@ def run_checks(
             run_id,
             source_texts=source_texts,
             synthesis_text=synthesis_text,
+        )
+    )
+    results.append(
+        check_synthesis_richness(
+            rows,
+            db_engine,
+            run_id,
+            synthesis_payload=synthesis_payload,
         )
     )
     return results
