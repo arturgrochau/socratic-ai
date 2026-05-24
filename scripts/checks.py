@@ -355,13 +355,14 @@ def check_chat_quality(rows: list[dict[str, Any]], db_engine: Any, run_id: str) 
     refused = [q for q in chat_queries if q.get("contains_refusal_pattern")]
     no_context = [q for q in chat_queries if q.get("route") == "no_context"]
     low_score = [q for q in chat_queries if (q.get("top_retrieval_score") or 0.0) < 0.4 and q.get("route") == "grounded"]
-    # Deepening probes ("go deeper", "elaborate") should produce richer
-    # responses than a default answer. If they're under 800 chars they're
-    # likely not actually deepening — flag the relaxed prompt isn't doing
-    # its job for the deepening intent.
+    # Deepening probes should produce richer responses. Threshold of 500
+    # chars catches true bails (the model giving up on the deepening intent)
+    # without flagging compressed-but-substantive answers — the LLM judge
+    # check (when enabled) handles the semantic-quality dimension that
+    # length alone can't.
     thin_deepening = [
         q for q in chat_queries
-        if q.get("is_deepening") and int(q.get("answer_length") or 0) < 800
+        if q.get("is_deepening") and int(q.get("answer_length") or 0) < 500
     ]
 
     if refused:

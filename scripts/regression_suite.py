@@ -105,7 +105,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-video", action="store_true", help="Skip the video fixture (saves Whisper API cost)")
     parser.add_argument("--only", action="append", default=[], help="Only run fixtures with these labels (repeatable)")
+    parser.add_argument("--judge-chat", action="store_true", help="Pass --judge-chat to each fixture run (adds ~5 small LLM calls per fixture)")
     args = parser.parse_args(argv)
+    if args.judge_chat:
+        for fr in SUITE:
+            fr.args.append("--judge-chat")
 
     suite = SUITE
     if args.skip_video:
