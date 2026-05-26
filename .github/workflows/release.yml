@@ -21,6 +21,7 @@ jobs:
         run: pytest tests/ -m "not e2e" --tb=short
         env:
           PYTHONPATH: .
+          OPENAI_API_KEY: sk-test-ci-placeholder
 
   build:
     needs: test
