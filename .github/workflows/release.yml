@@ -19,6 +19,8 @@ jobs:
           pip install pytest
       - name: Run unit tests
         run: pytest tests/ -m "not e2e" --tb=short
+        env:
+          PYTHONPATH: .
 
   build:
     needs: test
