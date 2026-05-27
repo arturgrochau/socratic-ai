@@ -212,8 +212,6 @@ def install_cassette(monkeypatch: Any, cassette_name: str) -> CassetteClient:
     # at import time; rebind each one.
     for mod_name in (
         "app.generation",
-        "app.processing",
-        "app.linking",
         "app.interaction",
         "app.retrieval",
         "app.ingestion",
