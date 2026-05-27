@@ -4,8 +4,6 @@ from app.cost_logging import ensure_cost_logging_tables
 from app.generation import ensure_generation_tables
 from app.ingestion import ensure_ingestion_tables
 from app.interaction import ensure_interaction_tables
-from app.linking import ensure_linking_tables
-from app.processing import ensure_processing_tables
 from config import run_startup_checks
 from routes.interaction import router as interaction_router
 from routes.upload import router as upload_router
@@ -23,8 +21,6 @@ def on_startup() -> None:
     run_startup_checks()
     ensure_cost_logging_tables()
     ensure_ingestion_tables()
-    ensure_processing_tables()
-    ensure_linking_tables()
     ensure_interaction_tables()
     ensure_generation_tables()
 

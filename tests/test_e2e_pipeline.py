@@ -68,14 +68,10 @@ def _isolated_env(monkeypatch, tmp_path):
     # Bootstrap every table the pipeline writes into.
     from app.cost_logging import ensure_cost_logging_tables
     from app.ingestion import ensure_ingestion_tables
-    from app.processing import ensure_processing_tables
-    from app.linking import ensure_linking_tables
     from app.interaction import ensure_interaction_tables
     from app.generation import ensure_generation_tables
     ensure_cost_logging_tables()
     ensure_ingestion_tables()
-    ensure_processing_tables()
-    ensure_linking_tables()
     ensure_interaction_tables()
     ensure_generation_tables()
     yield log_dir, db_path
@@ -105,10 +101,6 @@ def test_e2e_single_pdf_generation(monkeypatch, _isolated_env):
     import importlib
     import app.ingestion as ingestion
     importlib.reload(ingestion)
-    import app.processing as processing
-    importlib.reload(processing)
-    import app.linking as linking
-    importlib.reload(linking)
     import app.generation as generation
     importlib.reload(generation)
 
@@ -146,8 +138,7 @@ def test_e2e_single_pdf_generation(monkeypatch, _isolated_env):
     assert ingestion_resp.documents, "ingestion produced no document records"
     document_ids = [d.source_id for d in ingestion_resp.documents]
 
-    # Process + generate
-    processing.process_source(document_ids[0], user_id)
+    # Generate
     response = generation.generate_tailored_learning(
         video_source_id=None,
         document_source_ids=document_ids,

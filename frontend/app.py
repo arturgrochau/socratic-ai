@@ -299,8 +299,6 @@ def _normalize_continuous_text_for_display(text_value: str) -> str:
                 cleaned_lines.append("")
             continue
 
-        line = line.replace("\u2014", ", ").replace("\u2013", ", ")
-        line = re.sub(r"\s-\s", ", ", line)
         line = re.sub(r"^#{1,6}\s*", "", line)
         line = re.sub(r"^#{1,6}(?=\S)", "", line).strip()
         line = re.sub(r"^[-*]\s+", "", line)
@@ -497,15 +495,11 @@ def _build_elaboration_chat_prompt(
 
 def _compose_assistant_chat_message(
     answer_text: str,
-    follow_up_question: str,
+    follow_up_question: str = "",
     *,
-    include_follow_up: bool = True,
+    include_follow_up: bool = False,
 ) -> str:
     normalized_answer = str(answer_text or "").strip()
-    normalized_follow_up = str(follow_up_question or "").strip()
-
-    if include_follow_up and normalized_follow_up:
-        return f"{normalized_answer}\n\n**Socratic next question:** {normalized_follow_up}".strip()
     return normalized_answer or "I could not generate an answer this time. Please try rephrasing your question."
 
 
@@ -519,7 +513,7 @@ def _run_upload_process_and_generate(
         if stage_callback is not None:
             stage_callback(message)
 
-    _set_stage("Stage 1/4: Uploading files...")
+    _set_stage("Stage 1/3: Uploading files...")
 
     files: list[tuple[str, tuple[str, bytes, str]]] = []
     data: dict[str, str] = {}
@@ -574,13 +568,10 @@ def _run_upload_process_and_generate(
         "document_source_ids": document_source_ids,
     }
 
-    _set_stage("Stage 2/4: Processing sources and linking concepts...")
-    _post_json("/process", process_payload)
-
-    _set_stage("Stage 3/4: Generating tailored learning...")
+    _set_stage("Stage 2/3: Generating tailored learning...")
     generation_payload = _post_json("/generate-tailored-learning", process_payload)
 
-    _set_stage("Stage 4/4: Finalizing dashboard...")
+    _set_stage("Stage 3/3: Finalizing dashboard...")
 
     st.session_state.video_source_id = normalized_video_source_id
     st.session_state.document_source_ids = document_source_ids
@@ -1115,55 +1106,33 @@ def _render_source_learning_section(section_payload: dict) -> None:
                     if cleaned_item:
                         st.markdown(f"- {cleaned_item}")
 
-    # === SECTION 3: Key Concepts (layman + collapsible first principles) ===
+    # === SECTION 3: Key Concepts (collapsible definitions) ===
     key_term_explanations = section_payload.get("key_term_explanations", []) or []
-    first_principles_synthesis = str(section_payload.get("first_principles_synthesis", "")).strip()
 
     if normalized_terms:
         st.markdown("### Key Concepts")
 
-        with st.container(border=True):
-            if key_term_explanations:
-                # Render each term as a bullet point with layman explanation.
-                for term_entry in key_term_explanations:
-                    if not isinstance(term_entry, dict):
-                        continue
-                    term_name = str(term_entry.get("term", "")).strip()
-                    term_layman = str(term_entry.get("layman", "")).strip()
-                    if not term_name:
-                        continue
+        if key_term_explanations:
+            for term_entry in key_term_explanations:
+                if not isinstance(term_entry, dict):
+                    continue
+                term_name = str(term_entry.get("term", "")).strip()
+                term_layman = str(term_entry.get("layman", "")).strip()
+                term_technical = str(term_entry.get("technical", "")).strip()
+                if not term_name:
+                    continue
 
+                with st.expander(f"**{term_name}**"):
                     if term_layman:
-                        st.markdown(f"• **{term_name}** &mdash; {term_layman}")
-                    else:
-                        st.markdown(f"• **{term_name}**")
-
-                if first_principles_synthesis:
-                    with st.expander("Read more"):
-                        st.markdown(first_principles_synthesis)
-                else:
-                    # Fallback for old schema
-                    technical_parts = []
-                    for term_entry in key_term_explanations:
-                        if isinstance(term_entry, dict):
-                            tech = str(term_entry.get("technical", "")).strip()
-                            if tech:
-                                technical_parts.append(tech)
-                            else:
-                                term_explanation = str(term_entry.get("explanation", "")).strip()
-                                if term_explanation:
-                                    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', term_explanation) if s.strip()]
-                                    if len(sentences) > 2:
-                                        technical_parts.append(" ".join(sentences[2:]))
-                    if technical_parts:
-                        with st.expander("Read more"):
-                            st.markdown(" ".join(technical_parts))
-            else:
-                # Fallback: show key terms as badges when no detailed explanations exist.
-                formatted = " ".join(f"• **{term.strip()}**" for term in normalized_terms if term.strip())
-                if formatted:
-                    st.markdown(formatted)
-                    st.caption("Detailed definitions will be generated in the next run.")
+                        st.markdown(f"**In plain terms:** {term_layman}")
+                    if term_technical:
+                        st.markdown(f"**Technical:** {term_technical}")
+                    if not term_layman and not term_technical:
+                        st.caption("No definition available.")
+        else:
+            formatted = " ".join(f"• **{term.strip()}**" for term in normalized_terms if term.strip())
+            if formatted:
+                st.markdown(formatted)
 
     # === SECTION 4: Socratic Reflection ===
     reflection_points = section_payload.get("reflection_points", []) or []
@@ -1183,11 +1152,6 @@ def _render_ask_result() -> None:
 
     st.subheader("Answer")
     st.markdown(_normalize_continuous_text_for_display(str(st.session_state.ask_result.get("answer", "")).strip()))
-
-    follow_up_question = (st.session_state.ask_result.get("follow_up_question") or "").strip()
-    if follow_up_question:
-        st.subheader("Follow-up Question")
-        st.markdown(_normalize_continuous_text_for_display(follow_up_question))
 
 
 def _collect_emphasis_terms(
@@ -1349,14 +1313,7 @@ def _submit_chat_query(
             )
 
         answer_text = str(st.session_state.ask_result.get("answer", "")).strip()
-        follow_up_question = str(
-            st.session_state.ask_result.get("follow_up_question") or ""
-        ).strip()
-        assistant_text = _compose_assistant_chat_message(
-            answer_text,
-            follow_up_question,
-            include_follow_up=not suppress_follow_up,
-        )
+        assistant_text = _compose_assistant_chat_message(answer_text)
         st.session_state.ask_messages.append({"role": "assistant", "content": assistant_text})
         st.session_state.flash_latest_assistant = True
     except Exception as exc:

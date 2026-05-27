@@ -14,36 +14,9 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
-PROCESSING_MODEL = os.getenv("PROCESSING_MODEL", "gpt-4o-mini")
-LINKING_MODEL = os.getenv("LINKING_MODEL", "gpt-4o-mini")
 RETRIEVAL_MODEL = os.getenv("RETRIEVAL_MODEL", "text-embedding-3-small")
-INTERACTION_MODEL = os.getenv("INTERACTION_MODEL", "gpt-4o-mini")
 GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-4o-mini")
-GENERATION_CRITIC_MODEL = os.getenv("GENERATION_CRITIC_MODEL", "gpt-4o")
-CONSOLIDATION_MODEL = os.getenv("CONSOLIDATION_MODEL", "gpt-4o-mini")
-MAX_CHUNK_DIFF_WINDOWS = int(os.getenv("MAX_CHUNK_DIFF_WINDOWS", "1"))
-ENABLE_GENERATION_CRITIC_FALLBACK = os.getenv("ENABLE_GENERATION_CRITIC_FALLBACK", "true").lower() == "true"
-MAX_SOURCE_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_SOURCE_CRITIC_CALLS_PER_RUN", "1"))
-MAX_CROSS_CRITIC_CALLS_PER_RUN = int(os.getenv("MAX_CROSS_CRITIC_CALLS_PER_RUN", "1"))
-# Default-on so the existing redundancy gate in generation.py actually fires on
-# every run. Set ENABLE_STRICT_GENERATION_GATES=false to disable.
-ENABLE_STRICT_GENERATION_GATES = os.getenv("ENABLE_STRICT_GENERATION_GATES", "true").lower() == "true"
-
-# Progressive chunking: per-source content pack built in N rounds with
-# cumulative chunk slices, threading the prior round's deep_dive/under_surface
-# as carried-over context. Diagnostic AB on long fixtures (4+ chunks) showed
-# +148% deep_dive length at +18% token cost — clear win, so default ON.
-# A separate min-chunks guard in generation.py prevents triggering on small
-# sources where the cost/benefit reverses.
-GENERATION_PROGRESSIVE_CHUNKING = os.getenv("GENERATION_PROGRESSIVE_CHUNKING", "true").lower() == "true"
-GENERATION_PROGRESSIVE_ROUNDS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_ROUNDS", "2")))
-GENERATION_PROGRESSIVE_MIN_CHUNKS = max(2, int(os.getenv("GENERATION_PROGRESSIVE_MIN_CHUNKS", "4")))
-
-# Token ceiling for the diagnostic harness. Soft assertion only — runs that
-# exceed this get a warn in the report, not a failure. Set at 60k after
-# observing that multi-source-long runs (2 substantive docs + chat) legitimately
-# cost ~45k under the now-accurate telemetry.
-DIAGNOSTIC_TOKEN_CEILING = int(os.getenv("DIAGNOSTIC_TOKEN_CEILING", "60000"))
+CHAT_MODEL = os.getenv("CHAT_MODEL", os.getenv("INTERACTION_MODEL", "gpt-4o-mini"))
 USER_ID_HEADER = os.getenv("USER_ID_HEADER", "X-User-ID")
 ENABLE_COST_LOGGING = os.getenv("ENABLE_COST_LOGGING", "true").lower() == "true"
 CACHE_PROCESSED_SOURCES = os.getenv("CACHE_PROCESSED_SOURCES", "true").lower() == "true"
