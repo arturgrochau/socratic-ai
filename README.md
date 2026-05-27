@@ -12,12 +12,15 @@ Turn your videos, PDFs, and lectures into a structured thinking workout — not 
 
 | Platform | File | Notes |
 |---|---|---|
-| 🍎 **Mac — Apple Silicon (M1/M2/M3/M4)** &nbsp;⭐ *recommended for most Macs since 2020* | **[`SocraticAI-mac-arm64.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-arm64.zip)** | Native arm64 build — direct download |
-| 🍎 **Mac — Intel** | [`SocraticAI-mac-intel.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-intel.zip) | For pre-2020 Macs — direct download |
-| 🪟 **Windows** | [`SocraticAI-windows.exe` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-windows.exe) | Single-file binary — direct download |
-| 🐧 **Linux / self-hosted** | See [Run from source](#run-from-source) | |
+| Platform | Direct download | Notes |
+|---|---|---|
+| 🍎 **Mac — Apple Silicon (M1/M2/M3/M4)** &nbsp;⭐ *every Mac since 2020* | **[`SocraticAI-mac-arm64.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-arm64.zip)** | Native arm64 build |
+| 🪟 **Windows (x86_64)** | [`SocraticAI-windows.exe` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-windows.exe) | Single-file binary |
+| 🍎 Mac — Intel (pre-2020) &nbsp;·&nbsp; 🐧 Linux | See [Run from source](#run-from-source) | Two-line install with `python launcher.py` |
 
-> All download links above pull from the [latest GitHub release](https://github.com/arturgrochau/socratic_ai/releases/latest) and always resolve to the newest version.
+> Downloads always pull from the [latest GitHub release](https://github.com/arturgrochau/socratic_ai/releases/latest).
+>
+> ⚠️ *Why no packaged Intel Mac binary?* GitHub deprecated the `macos-13` hosted runners we previously used to build x86_64 binaries. The Run-from-source path takes ~2 minutes and works identically on Intel Macs.
 
 > **Which Mac do I have?** Click the Apple menu → *About This Mac*. If the **Chip** row says anything starting with "Apple", get the **arm64** build. If it says "Intel", get the **intel** build.
 

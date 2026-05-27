@@ -29,14 +29,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Apple Silicon (arm64) — most Macs since 2020
+          # Apple Silicon (arm64) — every Mac since 2020. Intel Macs are
+          # served by "run from source" because GitHub deprecated the
+          # macos-13 hosted runners that we previously used for x86_64.
           - os: macos-14
             name: mac-arm64
             arch: arm64
-          # Intel Macs (x86_64)
-          - os: macos-13
-            name: mac-intel
-            arch: x86_64
           - os: windows-latest
             name: windows
             arch: x86_64
@@ -117,12 +115,6 @@ jobs:
           name: socratic-ai-mac-arm64
           path: artifacts/mac-arm64/
 
-      - name: Download Mac Intel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: socratic-ai-mac-intel
-          path: artifacts/mac-intel/
-
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -140,9 +132,9 @@ jobs:
           body: |
             ## Downloads
 
-            - **Mac (Apple Silicon, M1/M2/M3/M4)** — `SocraticAI-mac-arm64.zip` *(recommended for most Macs since 2020)*
-            - **Mac (Intel)** — `SocraticAI-mac-intel.zip`
+            - **Mac (Apple Silicon, M1/M2/M3/M4)** — `SocraticAI-mac-arm64.zip` *(recommended for every Mac since 2020)*
             - **Windows** — `SocraticAI-windows.exe`
+            - **Intel Mac / Linux** — please [run from source](https://github.com/arturgrochau/socratic_ai#run-from-source). GitHub deprecated the macos-13 hosted runners we relied on for Intel builds; a packaged Intel binary will return once a replacement is wired in.
 
             ### First launch on Mac
 
@@ -155,5 +147,4 @@ jobs:
             or right-click the binary → **Open** → confirm in the dialog. You only have to do this once.
           files: |
             artifacts/mac-arm64/SocraticAI-mac-arm64.zip
-            artifacts/mac-intel/SocraticAI-mac-intel.zip
             artifacts/windows/SocraticAI-windows.exe
