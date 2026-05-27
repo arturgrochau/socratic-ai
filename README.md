@@ -12,10 +12,12 @@ Turn your videos, PDFs, and lectures into a structured thinking workout — not 
 
 | Platform | File | Notes |
 |---|---|---|
-| 🍎 **Mac — Apple Silicon (M1/M2/M3/M4)** &nbsp;⭐ *recommended for most Macs since 2020* | **[`SocraticAI-mac-arm64.zip`](https://github.com/arturgrochau/socratic_ai/releases/latest)** | Native arm64 build |
-| 🍎 **Mac — Intel** | [`SocraticAI-mac-intel.zip`](https://github.com/arturgrochau/socratic_ai/releases/latest) | For pre-2020 Macs |
-| 🪟 **Windows** | [`SocraticAI-windows.exe`](https://github.com/arturgrochau/socratic_ai/releases/latest) | Single-file binary |
+| 🍎 **Mac — Apple Silicon (M1/M2/M3/M4)** &nbsp;⭐ *recommended for most Macs since 2020* | **[`SocraticAI-mac-arm64.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-arm64.zip)** | Native arm64 build — direct download |
+| 🍎 **Mac — Intel** | [`SocraticAI-mac-intel.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-intel.zip) | For pre-2020 Macs — direct download |
+| 🪟 **Windows** | [`SocraticAI-windows.exe` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-windows.exe) | Single-file binary — direct download |
 | 🐧 **Linux / self-hosted** | See [Run from source](#run-from-source) | |
+
+> All download links above pull from the [latest GitHub release](https://github.com/arturgrochau/socratic_ai/releases/latest) and always resolve to the newest version.
 
 > **Which Mac do I have?** Click the Apple menu → *About This Mac*. If the **Chip** row says anything starting with "Apple", get the **arm64** build. If it says "Intel", get the **intel** build.
 
