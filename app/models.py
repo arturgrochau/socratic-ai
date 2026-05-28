@@ -109,9 +109,21 @@ class ReflectionPoint(BaseModel):
 
 
 class KeyTermExplanation(BaseModel):
+    """v2.1: single layman-tone explanation. The pre-v2.1 `layman`/`technical`
+    pair is coalesced into `explanation` when reading old cache rows."""
+
     term: str
-    layman: str
-    technical: str
+    explanation: str
+
+
+class LearningSection(BaseModel):
+    """A content-driven section in a per-source learning artifact.
+
+    The title is generated from the material (e.g. "Why behavioral logs
+    predict churn") rather than a fixed scaffold label."""
+
+    title: str
+    body: str
 
 
 class SourceLearningSection(BaseModel):
@@ -119,14 +131,17 @@ class SourceLearningSection(BaseModel):
     source_type: Literal["video", "document"]
     source_name: str
     generated_title: str
-    summary_text: str
-    deep_dive_text: str
-    key_terms: list[str]
+    # v2.1: dynamic, content-driven sections. The fixed-label fields below
+    # are kept for backward read of v2.0 cached rows.
+    sections: list[LearningSection] = Field(default_factory=list)
+    summary_text: str = ""
+    deep_dive_text: str = ""
     under_surface_explainer: str = ""
+    key_terms: list[str] = Field(default_factory=list)
     key_term_explanations: list[KeyTermExplanation] = Field(default_factory=list)
     reflection_points: list[ReflectionPoint]
     model_name: str
-    schema_version: int = 12
+    schema_version: int = 13
 
 
 class InsightIntersection(BaseModel):
@@ -147,6 +162,14 @@ class QuizQuestion(BaseModel):
     options: list[str]
     answer_index: int = Field(ge=0, le=3)
     explanation: str
+    # v2.1 additions for interactive quiz feedback.
+    # option_rationales[i] is a 1-2 sentence note: for the correct option,
+    # a justification; for wrong options, the misconception that picking
+    # that option represents.
+    option_rationales: list[str] = Field(default_factory=list)
+    # deeper_why extends the explanation for users who got it right —
+    # mechanism, edge case, or transfer to a new scenario.
+    deeper_why: str = ""
 
 
 class CombinedInsightSection(BaseModel):

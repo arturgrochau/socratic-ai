@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -669,13 +670,28 @@ def _build_source_export_markdown(section_payload: dict, *, fallback_title: str)
         lines.append(f"- Key terms: {', '.join(key_terms)}")
     lines.append("")
 
-    _append_export_markdown_section(lines, "Summary", str(section_payload.get("summary_text") or ""))
-    _append_export_markdown_section(lines, "Boundary Conditions & Failure Modes", str(section_payload.get("deep_dive_text") or ""))
-    _append_export_markdown_section(
-        lines,
-        "Hidden Assumptions & System Limits",
-        str(section_payload.get("under_surface_explainer") or ""),
-    )
+    # v2.1: prefer the content-driven `sections` list. Fall back to the
+    # fixed-label fields when reading older cached payloads.
+    learning_sections = section_payload.get("sections") or []
+    rendered_from_sections = False
+    if learning_sections:
+        for entry in learning_sections:
+            if not isinstance(entry, dict):
+                continue
+            sec_title = str(entry.get("title") or "").strip()
+            sec_body = str(entry.get("body") or "").strip()
+            if not sec_title or not sec_body:
+                continue
+            _append_export_markdown_section(lines, sec_title, sec_body)
+            rendered_from_sections = True
+    if not rendered_from_sections:
+        _append_export_markdown_section(lines, "Summary", str(section_payload.get("summary_text") or ""))
+        _append_export_markdown_section(lines, "Boundary Conditions & Failure Modes", str(section_payload.get("deep_dive_text") or ""))
+        _append_export_markdown_section(
+            lines,
+            "Hidden Assumptions & System Limits",
+            str(section_payload.get("under_surface_explainer") or ""),
+        )
 
     diagnostic_checklist = section_payload.get("diagnostic_checklist") or []
     if diagnostic_checklist:
@@ -833,6 +849,21 @@ def _build_generation_export_markdown(generation_result: dict, *, user_id: str) 
             explanation = _normalize_continuous_text_for_display(str(question_payload.get("explanation") or ""))
             if explanation:
                 lines.append(f"- Why this is correct: {explanation}")
+            # v2.1: per-option rationales + deeper "why" for users who got it right.
+            option_rationales = list(question_payload.get("option_rationales") or [])
+            if any(str(r).strip() for r in option_rationales):
+                lines.append("- What each option corresponds to:")
+                for opt_idx, rationale in enumerate(option_rationales):
+                    cleaned = _normalize_continuous_text_for_display(str(rationale))
+                    if not cleaned:
+                        continue
+                    marker = chr(65 + opt_idx)
+                    lines.append(f"  - {marker}) {cleaned}")
+            deeper_why = _normalize_continuous_text_for_display(
+                str(question_payload.get("deeper_why") or "")
+            )
+            if deeper_why:
+                lines.append(f"- Going deeper: {deeper_why}")
             reasoning_traps = _normalize_continuous_text_for_display(
                 str(question_payload.get("reasoning_traps") or question_payload.get("under_the_hood") or "")
             )
@@ -963,6 +994,95 @@ def _text_overlap_ratio(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / float(min(len(left_tokens), len(right_tokens)))
 
 
+def _quiz_state_key(question_text: str, index: int) -> str:
+    """Stable per-question session-state key for the interactive quiz."""
+    digest = hashlib.sha1(question_text.encode("utf-8")).hexdigest()[:10]
+    return f"quiz_attempt_{index}_{digest}"
+
+
+def _render_interactive_quiz(questions: list[dict]) -> None:
+    """Interactive quiz with per-option feedback (v2.1).
+
+    For each question:
+      * Show options as a radio.
+      * On Submit, reveal correctness, a per-option rationale for the
+        chosen option, the correct answer if wrong, and a collapsed "Why"
+        that includes the deeper rationale (auto-expanded if right).
+      * A Reset button clears the attempt so the user can try again.
+    """
+    with st.container(border=True):
+        for index, question_payload in enumerate(questions, start=1):
+            if not isinstance(question_payload, dict):
+                continue
+            question = str(question_payload.get("question", "")).strip()
+            options = list(question_payload.get("options", []) or [])
+            if not question or not options:
+                continue
+            try:
+                correct_idx = int(question_payload.get("answer_index", 0))
+            except (TypeError, ValueError):
+                correct_idx = 0
+            correct_idx = max(0, min(correct_idx, len(options) - 1))
+            explanation = str(question_payload.get("explanation", "")).strip()
+            rationales = list(question_payload.get("option_rationales", []) or [])
+            deeper_why = str(question_payload.get("deeper_why", "")).strip()
+
+            state_key = _quiz_state_key(question, index)
+            radio_key = f"radio_{state_key}"
+            submit_key = f"submit_{state_key}"
+            reset_key = f"reset_{state_key}"
+
+            st.markdown(f"**Q{index}. {question}**")
+
+            chosen_committed = st.session_state.get(state_key)
+            default_index = chosen_committed if isinstance(chosen_committed, int) else None
+
+            chosen = st.radio(
+                "Choose one",
+                options=list(range(len(options))),
+                format_func=lambda i, _opts=options: f"{chr(65 + i)}) {_opts[i]}",
+                key=radio_key,
+                index=default_index,
+                label_visibility="collapsed",
+            )
+
+            cols = st.columns([1, 1, 6])
+            submit = cols[0].button("Submit", key=submit_key, disabled=chosen is None)
+            reset = cols[1].button("Reset", key=reset_key, disabled=chosen_committed is None)
+
+            if reset:
+                st.session_state.pop(state_key, None)
+                chosen_committed = None
+                st.rerun()
+            if submit and chosen is not None:
+                st.session_state[state_key] = int(chosen)
+                chosen_committed = int(chosen)
+
+            if isinstance(chosen_committed, int):
+                is_correct = chosen_committed == correct_idx
+                if is_correct:
+                    st.success(f"Correct — {options[correct_idx]}")
+                else:
+                    st.error(f"Not quite. You picked: {options[chosen_committed]}")
+                    if 0 <= chosen_committed < len(rationales) and rationales[chosen_committed].strip():
+                        st.markdown(
+                            f"_That option corresponds to:_ {rationales[chosen_committed].strip()}"
+                        )
+                    st.markdown(f"**Correct answer:** {options[correct_idx]}")
+
+                with st.expander("Why", expanded=is_correct):
+                    if explanation:
+                        st.markdown(explanation)
+                    if is_correct and deeper_why:
+                        st.markdown(deeper_why)
+                    if (not is_correct
+                            and 0 <= correct_idx < len(rationales)
+                            and rationales[correct_idx].strip()):
+                        st.markdown(rationales[correct_idx].strip())
+
+            st.markdown("---")
+
+
 def _render_reflection_points(
     reflection_points: list[dict] | list[str],
     *,
@@ -984,13 +1104,17 @@ def _render_reflection_points(
         reasoning_traps = str(point.get("reasoning_traps") or point.get("under_the_hood") or "").strip()
         depth_level = str(point.get("depth_level", "")).strip()
 
-        st.markdown(f"**Q{index}. {question}**")
-        if explanation:
-            st.markdown(_format_long_prose_markdown(explanation))
-        if reasoning_traps:
-            with st.expander("Read more"):
+        label = f"Q{index}. {question}" if question else f"Q{index}"
+        if depth_level:
+            label = f"{label}  _({depth_level})_"
+        with st.expander(label, expanded=False):
+            if explanation:
+                st.markdown(_format_long_prose_markdown(explanation))
+            if reasoning_traps:
                 cleaned_reasoning_traps = _normalize_continuous_text_for_display(reasoning_traps)
                 st.markdown(_format_long_prose_markdown(cleaned_reasoning_traps, max_sentences_per_paragraph=4))
+            if not explanation and not reasoning_traps:
+                st.caption("Sit with the question. No spoiler this time.")
 
 
 def _render_source_learning_section(section_payload: dict) -> None:
@@ -1055,61 +1179,73 @@ def _render_source_learning_section(section_payload: dict) -> None:
     key_terms = section_payload.get("key_terms", []) or []
     normalized_terms = [str(term) for term in key_terms]
 
-    # === SECTION 1: Summary ===
+    # === Header ===
     st.subheader(source_label)
     if source_name and _normalize(source_name) != _normalize(generated_title):
         st.caption(source_name)
-    summary_text = _clean_block(
-        str(section_payload.get("summary_text", "")),
-        generated_title,
-        "summary",
-    )
-    if summary_text:
-        summary_text = _normalize_continuous_text_for_display(summary_text)
-        st.markdown(
-            _bold_keywords_in_text(
-                _format_long_prose_markdown(summary_text, max_sentences_per_paragraph=4),
-                normalized_terms,
+
+    # === Content-driven sections (v2.1) ===
+    # New shape: a list of {title, body} chosen by the outline call.
+    # Fall back to the v2.0 fixed-label fields when the new list is empty.
+    learning_sections = section_payload.get("sections", []) or []
+
+    if learning_sections:
+        for entry in learning_sections:
+            if not isinstance(entry, dict):
+                continue
+            sec_title = str(entry.get("title", "")).strip()
+            sec_body = str(entry.get("body", "")).strip()
+            if not sec_title or not sec_body:
+                continue
+            st.markdown(f"### {sec_title}")
+            body_norm = _normalize_continuous_text_for_display(sec_body)
+            st.markdown(
+                _bold_keywords_in_text(
+                    _format_long_prose_markdown(body_norm, max_sentences_per_paragraph=4),
+                    normalized_terms,
+                )
             )
+    else:
+        # Backward-compat path for any cached row that still has the old
+        # fixed-label fields populated.
+        summary_text = _clean_block(
+            str(section_payload.get("summary_text", "")),
+            generated_title,
+            "summary",
         )
-
-    # === SECTION 2: Deep Dive (merged boundary analysis + hidden assumptions) ===
-    deep_dive_text = _clean_block(
-        str(section_payload.get("deep_dive_text", "")),
-        generated_title,
-        "deep_dive",
-    )
-    under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
-    diagnostic_checklist = section_payload.get("diagnostic_checklist", []) or []
-
-    # Merge deep dive + under surface into one flowing section.
-    deep_dive_parts: list[str] = []
-    if deep_dive_text:
-        deep_dive_parts.append(_normalize_continuous_text_for_display(deep_dive_text))
-    if under_surface_text:
-        deep_dive_parts.append(_normalize_continuous_text_for_display(under_surface_text))
-
-    if deep_dive_parts:
-        st.markdown("### Deep Dive")
-        merged_deep = "\n\n".join(deep_dive_parts)
-        st.markdown(
-            _bold_keywords_in_text(
-                _format_long_prose_markdown(merged_deep, max_sentences_per_paragraph=4),
-                normalized_terms,
+        if summary_text:
+            summary_text = _normalize_continuous_text_for_display(summary_text)
+            st.markdown(
+                _bold_keywords_in_text(
+                    _format_long_prose_markdown(summary_text, max_sentences_per_paragraph=4),
+                    normalized_terms,
+                )
             )
+        deep_dive_text = _clean_block(
+            str(section_payload.get("deep_dive_text", "")),
+            generated_title,
+            "deep_dive",
         )
+        under_surface_text = str(section_payload.get("under_surface_explainer") or "").strip()
+        deep_dive_parts: list[str] = []
+        if deep_dive_text:
+            deep_dive_parts.append(_normalize_continuous_text_for_display(deep_dive_text))
+        if under_surface_text:
+            deep_dive_parts.append(_normalize_continuous_text_for_display(under_surface_text))
+        if deep_dive_parts:
+            st.markdown("### Deep Dive")
+            merged_deep = "\n\n".join(deep_dive_parts)
+            st.markdown(
+                _bold_keywords_in_text(
+                    _format_long_prose_markdown(merged_deep, max_sentences_per_paragraph=4),
+                    normalized_terms,
+                )
+            )
 
-        if diagnostic_checklist:
-            with st.expander("Read more"):
-                for item in diagnostic_checklist:
-                    cleaned_item = _normalize_continuous_text_for_display(str(item))
-                    if cleaned_item:
-                        st.markdown(f"- {cleaned_item}")
-
-    # === SECTION 3: Key Concepts (collapsible definitions) ===
+    # === Key Concepts (single layman-tone explanation per term, v2.1) ===
     key_term_explanations = section_payload.get("key_term_explanations", []) or []
 
-    if normalized_terms:
+    if normalized_terms or key_term_explanations:
         st.markdown("### Key Concepts")
 
         if key_term_explanations:
@@ -1117,17 +1253,21 @@ def _render_source_learning_section(section_payload: dict) -> None:
                 if not isinstance(term_entry, dict):
                     continue
                 term_name = str(term_entry.get("term", "")).strip()
-                term_layman = str(term_entry.get("layman", "")).strip()
-                term_technical = str(term_entry.get("technical", "")).strip()
                 if not term_name:
                     continue
-
+                # v2.1: single `explanation`. v2.0 had `layman`+`technical`.
+                explanation = str(term_entry.get("explanation", "")).strip()
+                if not explanation:
+                    explanation = str(term_entry.get("layman", "")).strip()
+                technical_legacy = str(term_entry.get("technical", "")).strip()
                 with st.expander(f"**{term_name}**"):
-                    if term_layman:
-                        st.markdown(f"**In plain terms:** {term_layman}")
-                    if term_technical:
-                        st.markdown(f"**Technical:** {term_technical}")
-                    if not term_layman and not term_technical:
+                    if explanation:
+                        st.markdown(explanation)
+                    if technical_legacy and not term_entry.get("explanation"):
+                        # Only render the old technical field when we are
+                        # rendering an unconverted v2.0 cache row.
+                        st.markdown(f"_Technical detail:_ {technical_legacy}")
+                    if not explanation and not technical_legacy:
                         st.caption("No definition available.")
         else:
             formatted = " ".join(f"• **{term.strip()}**" for term in normalized_terms if term.strip())
@@ -1328,9 +1468,11 @@ def _submit_chat_query(
             }
         )
         st.session_state.flash_latest_assistant = True
-    # No explicit st.rerun() — st.chat_input handles re-render naturally and
-    # avoids the scroll-jump that st.rerun() caused with the old st.form path.
-    # Quick-action buttons fall through to Streamlit's natural rerun.
+    # Explicit st.rerun() — without this, the just-appended messages are
+    # not painted until the next interaction (chat history renders before
+    # the submit handler runs in the same script pass). The minor scroll
+    # behavior is the right trade for immediate message visibility.
+    st.rerun()
 
 
 def _build_intersection_chat_prefill(
@@ -1558,31 +1700,7 @@ def _render_generation_tabs(has_user_id: bool) -> None:
         if not questions:
             st.write("No quiz questions available.")
         else:
-            with st.container(border=True):
-                for index, question_payload in enumerate(questions, start=1):
-                    st.markdown(f"**Q{index}. {question_payload.get('question', '')}**")
-                    options = question_payload.get("options", []) or []
-                    labels = ["A)", "B)", "C)", "D)"]
-                    for option_index, option_text in enumerate(options):
-                        label = labels[option_index] if option_index < len(labels) else f"{option_index+1}."
-                        st.write(f"{label} {option_text}")
-
-                    answer_index = int(question_payload.get("answer_index", 0))
-                    explanation = str(question_payload.get("explanation", "")).strip()
-                    under_the_hood = str(question_payload.get("reasoning_traps") or question_payload.get("under_the_hood") or "").strip()
-                    
-                    with st.expander("Show answer"):
-                        if options and 0 <= answer_index < len(options):
-                            st.write(f"**Correct answer:** {options[answer_index]}")
-                        
-                        full_explanation_parts = []
-                        if explanation:
-                            full_explanation_parts.append(explanation)
-                        if under_the_hood:
-                            full_explanation_parts.append(under_the_hood)
-                        
-                        if full_explanation_parts:
-                            st.markdown(" ".join(full_explanation_parts))
+            _render_interactive_quiz(questions)
 
     if selected_section == "Socratic Chatbox":
         _render_ask_tab(has_user_id)

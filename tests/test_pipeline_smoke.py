@@ -1,12 +1,17 @@
 """
-End-to-end smoke test for the generation pipeline using a mock LLM client.
+End-to-end smoke test for the v2.1 outline-first generation pipeline using
+a mock LLM client. No API key required.
 
-No API key required. Verifies that:
-  * Per-source iterative accumulation + consolidation produces a complete
-    SourceLearningSection with layman + technical key term explanations.
-  * Multi-source synthesis produces a CombinedInsightSection and a quiz.
-  * DB tables are created, sections are persisted, and reflection points
-    spanning depth_levels make it through.
+Verifies that:
+  * The pipeline runs outline → section drafts (with mini-RAG context)
+    → critic → optional refine → key concepts → reflection points for a
+    single source.
+  * Two-source synthesis populates the v2.1 quiz fields
+    (option_rationales + deeper_why) and produces a non-empty intersections
+    list.
+  * Section titles are content-driven (not the v2.0 fixed scaffolding).
+  * No banned opener appears at the start of any section body.
+  * Every KeyTermExplanation has a non-empty `explanation`.
 
 Runs in CI alongside the other unit tests (no `-m e2e` marker).
 """
@@ -39,7 +44,6 @@ class _FakeResult:
         if self.usage is None:
             self.usage = _FakeUsage()
         if self.raw is None:
-            # Make raw quack like the OpenAI completion for log_api_usage.
             self.raw = _FakeRaw(self.usage)
 
 
@@ -49,83 +53,138 @@ class _FakeRaw:
 
 
 # ---------------------------------------------------------------------------
-# Canned responses keyed by JSON schema name. None => plain accumulation step.
+# Canned responses keyed by JSON schema name. Plain-text (no schema) calls
+# return prose suitable for the section draft + refine steps.
 # ---------------------------------------------------------------------------
 
-_CONSOLIDATION_RESPONSE = {
-    "summary": (
-        "The material covers how feedback loops shape complex systems. It shows "
-        "that small perturbations can be amplified through positive feedback and "
-        "dampened through negative feedback. Stability emerges when these forces "
-        "balance over time."
-    ),
-    "deep_dive": (
-        "Feedback loops operate through delays and thresholds. When the delay is "
-        "long compared to the response time, oscillation appears. Threshold "
-        "effects produce regime shifts that look discontinuous from the outside "
-        "but emerge from continuous internal dynamics. Failure modes cluster "
-        "around mistaking correlation for causation in feedback diagrams."
-    ),
-    "key_terms": [
+_OUTLINE_RESPONSE = {
+    "sections": [
+        {
+            "title": "How feedback loops shape system behavior",
+            "scope": "Set up positive vs. negative feedback and stability.",
+            "expected_paragraphs": 3,
+        },
+        {
+            "title": "Why delays cause oscillation even in stable loops",
+            "scope": "Explain delay-driven overshoot inside a single loop.",
+            "expected_paragraphs": 3,
+        },
+        {
+            "title": "When loop topology overrides loop polarity",
+            "scope": "Move from within-loop to cross-loop dynamics.",
+            "expected_paragraphs": 3,
+        },
+    ],
+}
+
+_CRITIC_PASS = {
+    "banned_phrase_flags": [],
+    "redundancy_flags": [],
+    "scope_drift": False,
+    "tone_issues": [],
+    "needs_refinement": False,
+    "instructions": "",
+}
+
+_KEY_CONCEPTS_RESPONSE = {
+    "key_concepts": [
         {
             "term": "Positive feedback",
-            "layman": "When an effect makes its own cause stronger, like a microphone screech.",
-            "technical": "A loop where the output of a process reinforces the input, leading to exponential growth or runaway dynamics absent a limiting factor.",
+            "explanation": (
+                "A self-amplifying loop where the output of a process makes "
+                "its own cause stronger. Like a microphone next to a speaker: "
+                "the louder it gets, the louder it gets, until something else "
+                "stops it."
+            ),
         },
         {
             "term": "Negative feedback",
-            "layman": "When an effect pushes back against its own cause, like a thermostat.",
-            "technical": "A regulatory loop where the output of a process opposes the input, producing convergence toward a setpoint or equilibrium.",
+            "explanation": (
+                "A self-correcting loop that pushes back against its own "
+                "cause. A thermostat is the classic example: as the room "
+                "warms up, the heater works less."
+            ),
         },
         {
             "term": "Regime shift",
-            "layman": "When a system suddenly switches to a new mode of behavior.",
-            "technical": "A discontinuous transition between attractor basins, often triggered when a slow variable crosses a critical threshold.",
+            "explanation": (
+                "A sudden jump from one stable behavior to another, often "
+                "because a slow variable quietly crossed a threshold. The "
+                "system looks fine right up until it doesn't."
+            ),
         },
     ],
-    "under_surface": (
-        "Most explanations of feedback assume the loop structure is given. The "
-        "harder question is how loop topology itself emerges, and what conditions "
-        "cause loops to form, dissolve, or invert sign."
-    ),
+}
+
+_REFLECTION_RESPONSE = {
     "reflection_points": [
         {
             "question": "Why might a system with strong negative feedback still oscillate?",
-            "explanation": "Delay between cause and corrective action can overshoot the setpoint, producing oscillation despite the loop pulling toward equilibrium.",
+            "explanation": (
+                "Delay between cause and corrective action can push the "
+                "response past the setpoint before it has time to register, "
+                "creating overshoot. The careful thinker notices that "
+                "stability is a property of timing, not just polarity."
+            ),
             "depth_level": "intermediate",
         },
         {
-            "question": "What conditions would cause a positive feedback loop to terminate naturally?",
-            "explanation": "Exhaustion of the resource feeding the loop, saturation of the amplifying variable, or activation of a slower negative loop.",
+            "question": "What conditions cause a positive feedback loop to terminate naturally?",
+            "explanation": (
+                "Either the resource feeding the loop runs out, the amplified "
+                "variable saturates against a physical ceiling, or a slower "
+                "negative loop activates and overtakes it. Spotting which "
+                "limit is binding tells you where to intervene."
+            ),
             "depth_level": "advanced",
         },
         {
-            "question": "How would you tell positive feedback apart from a one-off correlated trend?",
-            "explanation": "Test whether the relationship persists across intervention or only appears under specific co-movements.",
+            "question": "How would you distinguish positive feedback from a correlated trend?",
+            "explanation": (
+                "Test whether the relationship survives an intervention. "
+                "Correlated trends fall apart when you perturb the system; "
+                "true feedback re-establishes itself."
+            ),
             "depth_level": "foundational",
+        },
+        {
+            "question": "Where would you expect cross-loop topology to dominate over within-loop delay?",
+            "explanation": (
+                "In systems where many loops share variables and interactions "
+                "are tight. Cascading grid failures are the canonical case — "
+                "no single loop explains the outage; the connection pattern does."
+            ),
+            "depth_level": "advanced",
         },
     ],
 }
 
 _SYNTHESIS_RESPONSE = {
     "synthesis_text": (
-        "Both sources treat feedback as the engine of system-level behavior, "
-        "but they disagree on where the interesting structure lives. The first "
-        "frames it in terms of loop polarity and delay; the second emphasizes "
-        "the topology of how loops interconnect. Together they suggest that "
-        "isolated loops are a teaching abstraction, and that real systems live "
-        "in the interaction between loops."
+        "Both sources treat feedback as the engine of system behavior, but "
+        "they disagree on where the interesting structure lives. The first "
+        "centers loop polarity and delay; the second emphasizes how loops "
+        "interconnect. Together they imply that isolated loops are a teaching "
+        "abstraction, and that real systems live in the interaction between "
+        "loops."
     ),
     "intersections": [
         {
             "title": "Delay vs. topology as the dominant explanation",
-            "why_it_matters": "Choosing the wrong frame leads to interventions that target the wrong leverage point.",
-            "integrated_explanation": "The first source treats delay as the master variable while the second treats topology as primary. The synthesis is that delay matters within a loop and topology matters across loops, and both must be analyzed for non-trivial systems.",
+            "why_it_matters": "Choosing the wrong frame leads to interventions at the wrong leverage point.",
+            "integrated_explanation": (
+                "Delay matters within a loop and topology matters across loops. "
+                "Non-trivial systems require both analyses simultaneously."
+            ),
         },
         {
             "title": "Stability is multi-scale",
-            "why_it_matters": "A system can be locally stable yet globally fragile.",
-            "integrated_explanation": "Local stability described in the first source coexists with topological vulnerabilities described in the second. Real-world stability requires examining both scales simultaneously.",
+            "why_it_matters": "Local stability can mask global fragility.",
+            "integrated_explanation": (
+                "The first source's local-stability picture coexists with the "
+                "second source's topological-vulnerability picture. Both scales "
+                "have to be examined."
+            ),
         },
     ],
     "questions": [
@@ -138,7 +197,23 @@ _SYNTHESIS_RESPONSE = {
                 "When the time horizon is very short",
             ],
             "answer_index": 0,
-            "explanation": "Topology dominates when interaction effects between loops exceed the dynamics of any single loop, which happens precisely when delays do not isolate them.",
+            "explanation": (
+                "Topology dominates when interactions between loops exceed any "
+                "single loop's dynamics — which happens precisely when delays "
+                "do not isolate them."
+            ),
+            "option_rationales": [
+                "Correctly identifies that cross-loop interactions dominate when delays do not buffer them.",
+                "Confuses dominance with absence — a dominant loop doesn't make topology irrelevant; it makes it static.",
+                "Mistakes 'no perturbations' for stability; topology shapes how perturbations propagate.",
+                "Confuses short horizons with topological simplicity; cross-loop effects show up fastest at short horizons.",
+            ],
+            "deeper_why": (
+                "Cross-loop coupling raises the dimension of the dynamical "
+                "system: a topology change that costs nothing locally can "
+                "shift global attractors. This is why network analyses often "
+                "surface fragilities that loop-by-loop reviews miss."
+            ),
         },
         {
             "question": "Which scenario most clearly requires both frames together?",
@@ -149,49 +224,57 @@ _SYNTHESIS_RESPONSE = {
                 "Estimating the half-life of a decay process",
             ],
             "answer_index": 2,
-            "explanation": "Cascading failures emerge from how loops connect, while the speed of cascade depends on within-loop delays. Both frames are essential.",
-        },
-        {
-            "question": "What is the strongest evidence the two sources are complementary?",
-            "options": [
-                "They use the same vocabulary throughout",
-                "They cite identical case studies",
-                "Their primary variables operate at different scales",
-                "They reach opposing conclusions on every question",
+            "explanation": (
+                "Cascading failures emerge from how loops connect, while the "
+                "speed of cascade depends on within-loop delays. Both frames "
+                "are essential."
+            ),
+            "option_rationales": [
+                "Treats a single-loop diagnostic as if it were multi-loop; the thermostat is precisely the case where one frame suffices.",
+                "A single-driver population has no cross-loop interaction to analyze.",
+                "Correctly identifies a problem that requires both within-loop delay analysis and cross-loop topology analysis.",
+                "Decay processes are well-described by simple rate laws — neither frame is needed.",
             ],
-            "answer_index": 2,
-            "explanation": "Operating at different scales is exactly what makes the frames composable rather than competing.",
+            "deeper_why": (
+                "In an interconnected grid the failure speed is set by the "
+                "fastest within-loop response, but the failure shape is set by "
+                "the connection topology. Interventions that ignore one or the "
+                "other tend to fix the wrong outage class."
+            ),
         },
     ],
     "application_scenarios": [
         {
             "scenario_title": "Diagnosing a recurring incident in a production system",
-            "scenario_prompt": "An on-call team sees the same outage shape every few weeks despite each fix appearing to work.",
+            "scenario_prompt": "The on-call team sees the same outage shape every few weeks despite each fix working.",
             "transfer_steps": [
                 "Map the visible loops and their delays.",
-                "Identify which loop interactions become active only at high load.",
-                "Look for a slow variable that crosses a threshold between incidents.",
+                "Identify which loop interactions activate only at high load.",
+                "Look for a slow variable crossing a threshold between incidents.",
             ],
-            "common_pitfall": "Fixing the most recent visible loop while ignoring the cross-loop interaction that drives the cycle.",
+            "common_pitfall": "Fixing the most recent visible loop while the cross-loop interaction driving the cycle stays untouched.",
         },
         {
             "scenario_title": "Designing a regulatory intervention",
             "scenario_prompt": "A policy team wants to dampen a market boom-bust cycle.",
             "transfer_steps": [
-                "Distinguish loops that operate within actors from loops that operate across actors.",
-                "Identify which delays are shortenable by transparency vs. which require structural change.",
-                "Pilot the intervention on a subset and measure for topology shifts, not just polarity shifts.",
+                "Distinguish loops within actors from loops across actors.",
+                "Identify which delays transparency can shorten.",
+                "Pilot the intervention and measure for topology shifts, not just polarity shifts.",
             ],
-            "common_pitfall": "Treating the system as one big loop when boom-bust dynamics emerge from how many smaller loops are coupled.",
+            "common_pitfall": "Treating the system as one big loop when boom-bust emerges from coupling between many smaller loops.",
         },
     ],
 }
 
 
 class _FakeClient:
-    """LLMClient stand-in. Routes by json_schema name (or lack thereof)."""
+    """LLMClient stand-in. Routes by json_schema.name; falls back to prose."""
 
     name = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
 
     def chat_json(
         self,
@@ -204,43 +287,61 @@ class _FakeClient:
         stream: bool = False,
     ) -> _FakeResult:
         if json_schema is None:
-            # Accumulation step — return plain prose.
+            # Section draft or refine. Return prose that opens with a concrete
+            # claim — never a banned phrase. We seed the body with section-
+            # specific anchor words so the mini-RAG sees realistic content.
+            self.calls.append("plain")
             return _FakeResult(
                 content=(
-                    "The system under study exhibits feedback dynamics. Small "
-                    "changes propagate through the loop and can either amplify "
-                    "or dampen depending on the polarity of the connections. "
-                    "Stability is a delicate balance of these competing forces."
+                    "Feedback loops shape system behavior by linking outputs "
+                    "back to inputs, either amplifying small changes or "
+                    "damping them.\n\n"
+                    "The polarity of the loop determines whether perturbations "
+                    "grow or decay over time. Delay between cause and "
+                    "corrective response is what turns a stable loop into an "
+                    "oscillating one."
                 )
             )
         schema_name = json_schema.get("name", "")
-        if schema_name == "source_consolidation":
-            return _FakeResult(content=json.dumps(_CONSOLIDATION_RESPONSE))
+        self.calls.append(schema_name)
+        if schema_name == "source_outline":
+            return _FakeResult(content=json.dumps(_OUTLINE_RESPONSE))
+        if schema_name == "section_critique":
+            return _FakeResult(content=json.dumps(_CRITIC_PASS))
+        if schema_name == "key_concepts":
+            return _FakeResult(content=json.dumps(_KEY_CONCEPTS_RESPONSE))
+        if schema_name == "reflection_points":
+            return _FakeResult(content=json.dumps(_REFLECTION_RESPONSE))
         if schema_name == "cross_source_synthesis":
             return _FakeResult(content=json.dumps(_SYNTHESIS_RESPONSE))
         raise AssertionError(f"Unexpected schema name in smoke test: {schema_name!r}")
 
     def embed(self, *, model: str, inputs: list[str]) -> list[list[float]]:
-        # Not used by the generation pipeline; included for protocol completeness.
-        return [[0.0] * 8 for _ in inputs]
+        # Deterministic length-aware embedding so the mini-RAG has something
+        # meaningful to compare. Not used for retrieval correctness here.
+        out: list[list[float]] = []
+        for text in inputs:
+            length = max(len(text), 1)
+            out.append([
+                (length % 7) / 10.0,
+                (length % 11) / 10.0,
+                (length % 13) / 10.0,
+            ])
+        return out
 
 
 class PipelineSmokeTests(unittest.TestCase):
-    """Generation pipeline runs end-to-end with a mocked LLM."""
+    """v2.1 outline-first pipeline end-to-end with a mocked LLM."""
 
     def _setup_isolated_env(self, tmpdir: str) -> tuple[Any, Any]:
-        """Point config at a temp DB and reload the relevant modules."""
         import os
 
         os.environ["DATABASE_URL"] = f"sqlite:///{tmpdir}/smoke.db"
         os.environ["SESSION_LOG_DIR"] = f"{tmpdir}/sessions"
         os.environ["ENABLE_SESSION_LOG"] = "true"
         os.environ["CACHE_PROCESSED_SOURCES"] = "false"
-        # Avoid the import-time OpenAI key check if not set.
         os.environ.setdefault("OPENAI_API_KEY", "sk-test-smoke")
 
-        # Reload modules so they pick up the new env. Order matters:
-        # config first (rebuilds db_engine), then anything that imported it.
         import config
         importlib.reload(config)
 
@@ -291,7 +392,6 @@ class PipelineSmokeTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             config_mod, gen_mod = self._setup_isolated_env(tmpdir)
 
-            # Bootstrap tables.
             from app.cost_logging import ensure_cost_logging_tables
             from app.ingestion import ensure_ingestion_tables
             ensure_cost_logging_tables()
@@ -322,23 +422,40 @@ class PipelineSmokeTests(unittest.TestCase):
 
             self.assertEqual(len(response.documents), 1)
             doc = response.documents[0]
-            self.assertTrue(doc.summary_text.strip(), "summary empty")
-            self.assertTrue(doc.deep_dive_text.strip(), "deep_dive empty")
-            self.assertTrue(doc.under_surface_explainer.strip(), "under_surface empty")
+
+            # Content-driven sections (v2.1).
+            self.assertGreaterEqual(len(doc.sections), 3, "expected outline-driven sections")
+            generic = {"summary", "deep dive", "overview", "conclusion"}
+            non_generic_titles = [s.title for s in doc.sections if s.title.lower() not in generic]
+            self.assertTrue(
+                non_generic_titles,
+                f"At least one section title should be content-driven; got {[s.title for s in doc.sections]}",
+            )
+
+            # No banned opener at the start of any section body.
+            from prompts.banned_phrases import BANNED_OPENERS
+            for s in doc.sections:
+                first = s.body.lstrip().lower()
+                for phrase in BANNED_OPENERS:
+                    self.assertFalse(
+                        first.startswith(phrase.lower()),
+                        f"Banned opener {phrase!r} leaked into section '{s.title}'",
+                    )
+
+            # Key term explanations: single-field, all non-empty.
             self.assertGreaterEqual(len(doc.key_term_explanations), 3)
             for kte in doc.key_term_explanations:
                 self.assertTrue(kte.term.strip(), "key term name missing")
-                self.assertTrue(kte.layman.strip(), "key term layman explanation missing")
-                self.assertTrue(kte.technical.strip(), "key term technical definition missing")
-            self.assertGreaterEqual(len(doc.reflection_points), 3)
+                self.assertTrue(kte.explanation.strip(), "key term explanation missing")
+
+            # Reflection points span depth levels.
             depths = {p.depth_level for p in doc.reflection_points}
-            # Reflection points should span at least 2 distinct depth levels.
             self.assertGreaterEqual(
                 len(depths), 2,
                 f"Expected varied reflection depths; got {depths}",
             )
 
-            # Single-source path: no synthesis, but empty insights/quiz objects exist.
+            # Single-source path: no synthesis content.
             self.assertEqual(response.insights.synthesis_text, "")
             self.assertEqual(response.quiz.questions, [])
 
@@ -384,28 +501,24 @@ class PipelineSmokeTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(response.documents), 2)
-            self.assertTrue(
-                response.insights.synthesis_text.strip(),
-                "synthesis_text empty in multi-source run",
-            )
-            self.assertGreaterEqual(
-                len(response.insights.intersections), 1,
-                "expected at least one intersection",
-            )
-            self.assertGreaterEqual(
-                len(response.insights.application_scenarios), 1,
-                "expected at least one application scenario",
-            )
-            self.assertGreaterEqual(
-                len(response.quiz.questions), 1,
-                "expected at least one quiz question",
-            )
-            # Quiz answer indices should not all be identical (sanity check).
+            self.assertTrue(response.insights.synthesis_text.strip())
+            self.assertGreaterEqual(len(response.insights.intersections), 1)
+            self.assertGreaterEqual(len(response.insights.application_scenarios), 1)
+
+            # v2.1 quiz fields: option_rationales (4 entries) + deeper_why.
+            self.assertGreaterEqual(len(response.quiz.questions), 2)
+            for q in response.quiz.questions:
+                self.assertEqual(
+                    len(q.option_rationales), 4,
+                    f"Each question must carry 4 option_rationales; got {len(q.option_rationales)}",
+                )
+                for rat in q.option_rationales:
+                    self.assertTrue(rat.strip(), "option_rationale must be non-empty")
+                self.assertTrue(q.deeper_why.strip(), "deeper_why must be non-empty")
+
+            # Quiz answers should not all collapse to the same index.
             answer_indices = {q.answer_index for q in response.quiz.questions}
-            self.assertGreater(
-                len(answer_indices), 1,
-                "quiz answers all point at the same index",
-            )
+            self.assertGreater(len(answer_indices), 1)
 
             # Session JSONL was written.
             log_dir = Path(tmpdir) / "sessions"

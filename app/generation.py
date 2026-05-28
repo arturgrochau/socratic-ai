@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from app.cost_logging import log_api_usage, log_generation_stage_event
 from app.json_reliability import parse_json_object, safe_json_loads
+from app.mini_rag import MiniRag
 from app.session_logger import get_active_logger, session_log
 from app.models import (
     ApplicationScenario,
@@ -17,6 +18,7 @@ from app.models import (
     GenerateTailoredLearningResponse,
     InsightIntersection,
     KeyTermExplanation,
+    LearningSection,
     QuizQuestion,
     ReflectionPoint,
     SourceLearningSection,
@@ -24,19 +26,28 @@ from app.models import (
 from config import (
     CACHE_PROCESSED_SOURCES,
     GENERATION_MODEL,
+    RETRIEVAL_MODEL,
     db_engine,
     get_llm_client,
 )
 from prompts import (
-    ACCUMULATION_SYSTEM_PROMPT,
-    CONSOLIDATION_JSON_SCHEMA,
-    CONSOLIDATION_SYSTEM_PROMPT,
+    CRITIC_JSON_SCHEMA,
+    CRITIC_SYSTEM_PROMPT,
+    KEY_CONCEPTS_JSON_SCHEMA,
+    KEY_CONCEPTS_SYSTEM_PROMPT,
+    OUTLINE_JSON_SCHEMA,
+    OUTLINE_SYSTEM_PROMPT,
+    REFINE_SYSTEM_PROMPT,
+    REFLECTION_JSON_SCHEMA,
+    REFLECTION_SYSTEM_PROMPT,
+    SECTION_SYSTEM_PROMPT,
     SYNTHESIS_JSON_SCHEMA,
     SYNTHESIS_SYSTEM_PROMPT,
 )
+from prompts.banned_phrases import BANNED_OPENERS
 
 
-GENERATION_SCHEMA_VERSION = 12
+GENERATION_SCHEMA_VERSION = 13
 GENERATION_MAX_STAGE_ATTEMPTS = 3
 
 
@@ -207,6 +218,10 @@ def ensure_generation_tables() -> None:
             "source_name": "TEXT DEFAULT ''",
             "under_surface_text": "TEXT DEFAULT ''",
             "key_term_explanations_json": "TEXT DEFAULT '[]'",
+            # v2.1: content-driven sections list. JSON-encoded
+            # list of {title, body}. Old fields above are no longer written
+            # but are kept so cached v2.0 rows can still be read.
+            "sections_json": "TEXT DEFAULT '[]'",
         }
         for col, col_type in migrations.items():
             if col not in source_columns:
@@ -300,7 +315,10 @@ def _derive_title(filename: str, source_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Iterative accumulation core
+# Iterative accumulation core (kept for backwards-compat smoke tests and
+# in case any caller still references _group_chunks_into_windows).
+# v2.1 generation uses outline-first below; this helper is no longer
+# called by the new pipeline but is exported for tests.
 # ---------------------------------------------------------------------------
 
 
@@ -316,66 +334,264 @@ def _group_chunks_into_windows(chunks: list[str], window_size: int = 0) -> list[
     return windows
 
 
-def _run_accumulation_loop(
-    windows: list[str],
+# ---------------------------------------------------------------------------
+# v2.1 outline-first generation
+# ---------------------------------------------------------------------------
+
+
+_GENERIC_TITLES_LOWER = {
+    "summary", "overview", "introduction", "conclusion", "deep dive",
+    "boundary conditions", "boundary conditions & failure modes",
+    "hidden assumptions", "under the surface", "reflection",
+    "reflection points",
+}
+
+
+def _generate_outline(
     source_name: str,
+    chunks: list[str],
     *,
     run_id: str,
     user_id: str,
+) -> list[dict[str, Any]]:
+    # Cap context for the outline call. The outline only needs enough material
+    # to pick titles; full chunks go into individual section drafts.
+    sample = "\n\n---\n\n".join(chunks[:12])
+    user_prompt = (
+        f"Source: {source_name}\n\n"
+        f"=== Source material ===\n{sample}\n\n"
+        "Design the table of contents. 4-6 content-driven section titles."
+    )
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"outline:{source_name}",
+        user_id=user_id,
+        system_prompt=OUTLINE_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_schema=OUTLINE_JSON_SCHEMA,
+        required_keys=["sections"],
+    )
+    items = payload.get("sections", []) or []
+    # Defensive: drop any entry whose title is a generic scaffold label.
+    cleaned: list[dict[str, Any]] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title", "")).strip()
+        if not title or title.lower() in _GENERIC_TITLES_LOWER:
+            continue
+        scope = str(entry.get("scope", "")).strip()
+        try:
+            expected = int(entry.get("expected_paragraphs") or 3)
+        except (TypeError, ValueError):
+            expected = 3
+        cleaned.append({"title": title, "scope": scope, "expected_paragraphs": expected})
+    if not cleaned:
+        # Last-resort fallback so the pipeline doesn't dead-end. One section
+        # over the full source — better than crashing.
+        cleaned = [{
+            "title": f"How {source_name} works",
+            "scope": "Cover the core mechanism and its key implications.",
+            "expected_paragraphs": 4,
+        }]
+    return cleaned
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    return [p.strip() for p in text.split("\n\n") if p.strip()]
+
+
+def _render_prior_anchors(
+    prior_titles: list[str],
+    similar_hits: list[Any],
 ) -> str:
-    accumulated_text = ""
-    for idx, window in enumerate(windows):
-        if accumulated_text:
-            user_prompt = (
-                f"Source: {source_name}\n\n"
-                f"=== Accumulated analysis so far ===\n{accumulated_text}\n\n"
-                f"=== New material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
-                "Continue the analysis. Do NOT repeat anything already in the accumulated "
-                "analysis. Extend with new details, constraints, or edge cases from this material."
-            )
-        else:
-            user_prompt = (
-                f"Source: {source_name}\n\n"
-                f"=== Material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
-                "Begin the educational analysis of this material."
-            )
-
-        new_text = _run_plain_generation_step(
-            run_id=run_id,
-            stage_name=f"accumulation:{source_name}:{idx + 1}",
-            user_id=user_id,
-            system_prompt=ACCUMULATION_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-        )
-        if accumulated_text:
-            accumulated_text += "\n\n" + new_text
-        else:
-            accumulated_text = new_text
-
-    return accumulated_text
+    if not prior_titles and not similar_hits:
+        return "[No prior sections]"
+    lines: list[str] = []
+    if prior_titles:
+        lines.append("Already-covered section titles (do not re-cover their topics):")
+        for t in prior_titles:
+            lines.append(f"  - {t}")
+    if similar_hits:
+        lines.append("")
+        lines.append("Closest prior paragraphs (do not restate these points):")
+        for h in similar_hits:
+            snippet = h.text.strip().replace("\n", " ")
+            if len(snippet) > 220:
+                snippet = snippet[:217].rstrip() + "..."
+            lines.append(f'  - (from "{h.title}") {snippet}')
+    return "\n".join(lines)
 
 
-def _consolidate_accumulated_text(
-    accumulated_text: str,
-    source_name: str,
+def _draft_section(
     *,
+    section_idx: int,
+    title: str,
+    scope: str,
+    expected_paragraphs: int,
+    prior_titles: list[str],
+    similar_hits: list[Any],
+    source_name: str,
+    source_chunks: list[str],
+    run_id: str,
+    user_id: str,
+) -> str:
+    material = "\n\n---\n\n".join(source_chunks)
+    if len(material) > 14000:
+        material = material[:14000].rstrip() + "..."
+
+    user_prompt = (
+        f"Source: {source_name}\n\n"
+        f"=== Section assignment ===\n"
+        f"Title: {title}\n"
+        f"Scope: {scope or '(no explicit scope provided)'}\n"
+        f"Target paragraphs: {expected_paragraphs}\n\n"
+        f"=== Prior section anchors ===\n{_render_prior_anchors(prior_titles, similar_hits)}\n\n"
+        f"=== Source material ===\n{material}\n\n"
+        "Write the body of this section now."
+    )
+    return _run_plain_generation_step(
+        run_id=run_id,
+        stage_name=f"section_draft:{section_idx}:{title}",
+        user_id=user_id,
+        system_prompt=SECTION_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+
+
+def _critique_section(
+    *,
+    section_idx: int,
+    title: str,
+    scope: str,
+    body: str,
+    prior_titles: list[str],
+    similar_hits: list[Any],
     run_id: str,
     user_id: str,
 ) -> dict[str, Any]:
     user_prompt = (
-        f"Source: {source_name}\n\n"
-        f"=== Complete accumulated analysis ===\n{accumulated_text}\n\n"
-        "Organize this analysis into the required JSON structure."
+        f"=== Section ===\n"
+        f"Title: {title}\n"
+        f"Scope: {scope or '(no explicit scope)'}\n\n"
+        f"=== Draft body ===\n{body}\n\n"
+        f"=== Prior anchors ===\n{_render_prior_anchors(prior_titles, similar_hits)}\n\n"
+        "Produce the critique JSON."
     )
     return _run_structured_generation_step(
         run_id=run_id,
-        stage_name=f"consolidation:{source_name}",
+        stage_name=f"section_critic:{section_idx}:{title}",
         user_id=user_id,
-        system_prompt=CONSOLIDATION_SYSTEM_PROMPT,
+        system_prompt=CRITIC_SYSTEM_PROMPT,
         user_prompt=user_prompt,
-        response_schema=CONSOLIDATION_JSON_SCHEMA,
-        required_keys=["summary", "deep_dive", "key_terms", "under_surface", "reflection_points"],
+        response_schema=CRITIC_JSON_SCHEMA,
+        required_keys=["needs_refinement", "instructions"],
     )
+
+
+def _refine_section(
+    *,
+    section_idx: int,
+    title: str,
+    body: str,
+    instructions: str,
+    run_id: str,
+    user_id: str,
+) -> str:
+    user_prompt = (
+        f"=== Section ===\nTitle: {title}\n\n"
+        f"=== Draft body ===\n{body}\n\n"
+        f"=== Critique instructions ===\n{instructions}\n\n"
+        "Rewrite the section body applying the critique. Plain prose only."
+    )
+    return _run_plain_generation_step(
+        run_id=run_id,
+        stage_name=f"section_refine:{section_idx}:{title}",
+        user_id=user_id,
+        system_prompt=REFINE_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+
+
+def _has_banned_opener(text: str) -> bool:
+    """Lightweight local check that survives the critic if it misses one."""
+    lowered = text.lstrip().lower()
+    for phrase in BANNED_OPENERS:
+        if lowered.startswith(phrase.lower()):
+            return True
+        # Catch mid-paragraph openers too — check every paragraph start.
+        for para in _split_paragraphs(text):
+            if para.lower().startswith(phrase.lower()):
+                return True
+    return False
+
+
+def _generate_key_concepts(
+    *,
+    sections: list[LearningSection],
+    source_name: str,
+    run_id: str,
+    user_id: str,
+) -> list[KeyTermExplanation]:
+    body = "\n\n".join(f"## {s.title}\n{s.body}" for s in sections)
+    if len(body) > 14000:
+        body = body[:14000].rstrip() + "..."
+    user_prompt = (
+        f"Source: {source_name}\n\n"
+        f"=== Completed sections ===\n{body}\n\n"
+        "Extract 6-10 key terms with single layman-tone explanations."
+    )
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"key_concepts:{source_name}",
+        user_id=user_id,
+        system_prompt=KEY_CONCEPTS_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_schema=KEY_CONCEPTS_JSON_SCHEMA,
+        required_keys=["key_concepts"],
+    )
+    out: list[KeyTermExplanation] = []
+    for entry in payload.get("key_concepts", []):
+        if not isinstance(entry, dict):
+            continue
+        term = str(entry.get("term", "")).strip()
+        explanation = str(entry.get("explanation", "")).strip()
+        if term and explanation:
+            out.append(KeyTermExplanation(term=term, explanation=explanation))
+    return out
+
+
+def _generate_reflection_points(
+    *,
+    sections: list[LearningSection],
+    source_name: str,
+    run_id: str,
+    user_id: str,
+) -> list[ReflectionPoint]:
+    body = "\n\n".join(f"## {s.title}\n{s.body}" for s in sections)
+    if len(body) > 14000:
+        body = body[:14000].rstrip() + "..."
+    user_prompt = (
+        f"Source: {source_name}\n\n"
+        f"=== Completed sections ===\n{body}\n\n"
+        "Write 4-6 Socratic reflection points across depth levels."
+    )
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name=f"reflections:{source_name}",
+        user_id=user_id,
+        system_prompt=REFLECTION_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_schema=REFLECTION_JSON_SCHEMA,
+        required_keys=["reflection_points"],
+    )
+    out: list[ReflectionPoint] = []
+    for entry in payload.get("reflection_points", []):
+        try:
+            out.append(ReflectionPoint.model_validate(entry))
+        except Exception:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -404,46 +620,106 @@ def _build_source_learning_section(
     if not chunks:
         raise ValueError(f"Source {source_id} has no text chunks.")
 
-    windows = _group_chunks_into_windows(chunks)
-    accumulated = _run_accumulation_loop(
-        windows, source_name, run_id=run_id, user_id=user_id,
-    )
-    structured = _consolidate_accumulated_text(
-        accumulated, source_name, run_id=run_id, user_id=user_id,
-    )
+    # 1. Outline
+    outline = _generate_outline(source_name, chunks, run_id=run_id, user_id=user_id)
 
-    key_terms_raw = structured.get("key_terms", [])
-    key_terms: list[str] = []
-    key_term_explanations: list[KeyTermExplanation] = []
-    for entry in key_terms_raw:
-        if isinstance(entry, dict):
-            term = str(entry.get("term", "")).strip()
-            if term:
-                key_terms.append(term)
-                key_term_explanations.append(KeyTermExplanation(
-                    term=term,
-                    layman=str(entry.get("layman", "")).strip(),
-                    technical=str(entry.get("technical", "")).strip(),
-                ))
-        elif isinstance(entry, str) and entry.strip():
-            key_terms.append(entry.strip())
+    # 2. Per-section draft + critic + (refine)
+    client = get_llm_client()
+    mini_rag = MiniRag(client=client, model=RETRIEVAL_MODEL)
+    learning_sections: list[LearningSection] = []
+    prior_titles: list[str] = []
 
-    reflection_points: list[ReflectionPoint] = []
-    for rp in structured.get("reflection_points", []):
+    for idx, item in enumerate(outline):
+        title = item["title"]
+        scope = item["scope"]
+        expected = item["expected_paragraphs"]
+
+        # Query mini-RAG using the title+scope so we surface prior paragraphs
+        # most likely to overlap with this section's intended content.
+        similar_hits = mini_rag.find_similar(f"{title}. {scope}", top_k=3)
+
+        draft = _draft_section(
+            section_idx=idx,
+            title=title,
+            scope=scope,
+            expected_paragraphs=expected,
+            prior_titles=prior_titles,
+            similar_hits=similar_hits,
+            source_name=source_name,
+            source_chunks=chunks,
+            run_id=run_id,
+            user_id=user_id,
+        )
+
+        critique = _critique_section(
+            section_idx=idx,
+            title=title,
+            scope=scope,
+            body=draft,
+            prior_titles=prior_titles,
+            similar_hits=similar_hits,
+            run_id=run_id,
+            user_id=user_id,
+        )
+
+        needs_refine = bool(critique.get("needs_refinement")) or _has_banned_opener(draft)
+        final_body = draft
+        if needs_refine:
+            instructions = str(critique.get("instructions") or "").strip()
+            if not instructions:
+                instructions = (
+                    "Replace any opener that starts with a stock LLM phrase. "
+                    "Open with concrete claims grounded in the source."
+                )
+            final_body = _refine_section(
+                section_idx=idx,
+                title=title,
+                body=draft,
+                instructions=instructions,
+                run_id=run_id,
+                user_id=user_id,
+            )
+
+        learning_sections.append(LearningSection(title=title, body=final_body.strip()))
+        prior_titles.append(title)
         try:
-            reflection_points.append(ReflectionPoint.model_validate(rp))
+            mini_rag.add_paragraphs(
+                section_idx=idx,
+                title=title,
+                paragraphs=_split_paragraphs(final_body),
+            )
         except Exception:
-            continue
+            # Embedding outage shouldn't abort the run; we just lose
+            # anti-redundancy guarantees for subsequent sections.
+            pass
+
+    # 3. Key concepts (single layman explanation per term)
+    key_term_explanations = _generate_key_concepts(
+        sections=learning_sections,
+        source_name=source_name,
+        run_id=run_id,
+        user_id=user_id,
+    )
+    key_terms = [k.term for k in key_term_explanations]
+
+    # 4. Reflection points
+    reflection_points = _generate_reflection_points(
+        sections=learning_sections,
+        source_name=source_name,
+        run_id=run_id,
+        user_id=user_id,
+    )
 
     section = SourceLearningSection(
         source_id=source_id,
         source_type=source_type,
         source_name=source_name,
         generated_title=source_name,
-        summary_text=str(structured.get("summary", "")).strip(),
-        deep_dive_text=str(structured.get("deep_dive", "")).strip(),
+        sections=learning_sections,
+        summary_text="",  # legacy fields kept empty under v13
+        deep_dive_text="",
+        under_surface_explainer="",
         key_terms=key_terms,
-        under_surface_explainer=str(structured.get("under_surface", "")).strip(),
         key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
         model_name=GENERATION_MODEL,
@@ -542,12 +818,14 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     user_id, source_id, source_type, source_name,
                     generated_title, summary_text, reflection_points_json,
                     deep_dive_text, key_terms_json, under_surface_text,
-                    key_term_explanations_json, schema_version, model_name
+                    key_term_explanations_json, sections_json,
+                    schema_version, model_name
                 ) VALUES (
                     :user_id, :source_id, :source_type, :source_name,
                     :generated_title, :summary_text, :reflection_points_json,
                     :deep_dive_text, :key_terms_json, :under_surface_text,
-                    :key_term_explanations_json, :schema_version, :model_name
+                    :key_term_explanations_json, :sections_json,
+                    :schema_version, :model_name
                 )
                 ON CONFLICT(user_id, source_id) DO UPDATE SET
                     source_type = excluded.source_type,
@@ -559,6 +837,7 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                     key_terms_json = excluded.key_terms_json,
                     under_surface_text = excluded.under_surface_text,
                     key_term_explanations_json = excluded.key_term_explanations_json,
+                    sections_json = excluded.sections_json,
                     schema_version = excluded.schema_version,
                     model_name = excluded.model_name,
                     updated_at = CURRENT_TIMESTAMP
@@ -579,6 +858,9 @@ def _store_source_learning_section(section: SourceLearningSection, user_id: str)
                 "key_term_explanations_json": json.dumps(
                     [e.model_dump() for e in section.key_term_explanations], ensure_ascii=True,
                 ),
+                "sections_json": json.dumps(
+                    [s.model_dump() for s in section.sections], ensure_ascii=True,
+                ),
                 "schema_version": section.schema_version,
                 "model_name": section.model_name,
             },
@@ -594,7 +876,8 @@ def _load_cached_source_learning_section(
                 SELECT source_id, source_type, source_name, generated_title,
                        summary_text, reflection_points_json, deep_dive_text,
                        key_terms_json, under_surface_text,
-                       key_term_explanations_json, model_name, schema_version
+                       key_term_explanations_json, sections_json,
+                       model_name, schema_version
                 FROM source_learning_sections
                 WHERE user_id = :user_id AND source_id = :source_id
                 LIMIT 1
@@ -604,6 +887,8 @@ def _load_cached_source_learning_section(
 
     if row is None:
         return None
+    # v2.1 only honors v13 cached rows. Older rows regenerate. Acceptable —
+    # the schema bump is the explicit invalidation signal.
     if int(row.get("schema_version") or 1) != GENERATION_SCHEMA_VERSION:
         return None
 
@@ -628,16 +913,38 @@ def _load_cached_source_learning_section(
     key_term_explanations_raw = safe_json_loads(row.get("key_term_explanations_json"), default=[])
     key_term_explanations: list[KeyTermExplanation] = []
     for entry in key_term_explanations_raw:
+        if not isinstance(entry, dict):
+            continue
+        term = str(entry.get("term", "")).strip()
+        if not term:
+            continue
+        # v2.0 had `layman` + `technical` — coalesce into the new single
+        # `explanation` field so old rows still hydrate.
+        explanation = str(entry.get("explanation") or entry.get("layman") or "").strip()
+        if not explanation:
+            tech = str(entry.get("technical") or "").strip()
+            explanation = tech
+        if not explanation:
+            continue
         try:
-            if isinstance(entry, dict) and "explanation" in entry and "layman" not in entry:
-                entry["layman"] = entry.pop("explanation")
-                entry["technical"] = ""
-            key_term_explanations.append(KeyTermExplanation.model_validate(entry))
+            key_term_explanations.append(
+                KeyTermExplanation(term=term, explanation=explanation)
+            )
         except Exception:
             continue
 
-    summary = str(row.get("summary_text") or "").strip()
-    if not summary or not key_terms:
+    sections_raw = safe_json_loads(row.get("sections_json"), default=[])
+    learning_sections: list[LearningSection] = []
+    for entry in sections_raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            learning_sections.append(LearningSection.model_validate(entry))
+        except Exception:
+            continue
+
+    # v2.1 requires sections_json AND at least one key concept.
+    if not learning_sections or not key_term_explanations:
         return None
 
     return SourceLearningSection(
@@ -645,10 +952,11 @@ def _load_cached_source_learning_section(
         source_type=str(row["source_type"]),
         source_name=str(row["source_name"] or row["generated_title"] or "Source").strip(),
         generated_title=str(row["generated_title"]),
-        summary_text=summary,
-        deep_dive_text=str(row["deep_dive_text"] or "").strip(),
+        sections=learning_sections,
+        summary_text="",
+        deep_dive_text="",
+        under_surface_explainer="",
         key_terms=key_terms,
-        under_surface_explainer=str(row["under_surface_text"] or "").strip(),
         key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
         model_name=str(row["model_name"]),
