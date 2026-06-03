@@ -29,7 +29,26 @@ async def test_skip_video_requires_document(user) -> None:
     user.find("Skip video →").click()
     await user.should_see("Step 2 of 2")
     # With no video, a document is mandatory until one is uploaded.
-    await user.should_see("Add at least one document to continue.")
+    await user.should_see("Upload a document above to enable Generate.")
+
+
+async def test_document_upload_lands_and_enables_generate(user) -> None:
+    # Regression guard for the NiceGUI 3.x upload-event API: a real upload must
+    # register and flip Generate from disabled to enabled.
+    from nicegui import ui
+    from nicegui.elements.upload_files import SmallFileUpload
+
+    await user.open("/")
+    await user.should_see("Skip video →")
+    user.find("Skip video →").click()
+    await user.should_see("Step 2 of 2")
+
+    upload_el = next(iter(user.find(ui.upload).elements))
+    await upload_el.handle_uploads(
+        [SmallFileUpload(name="notes.pdf", content_type="application/pdf", _data=b"hello world")]
+    )
+    await user.should_see("notes.pdf")          # saved row appears
+    await user.should_see("Estimated time")     # Generate is now enabled (hint flips)
 
 
 @pytest.mark.nicegui_main_file("tests/_ui_quiz_probe.py")

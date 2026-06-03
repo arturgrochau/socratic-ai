@@ -34,11 +34,13 @@ def render_main_body() -> None:
     body()
 
 
-def _pack_upload(event: Any) -> dict[str, Any]:
+async def _pack_file(file: Any) -> dict[str, Any]:
+    # NiceGUI 3.x: the event carries a FileUpload with .name / .content_type and
+    # an async read(). (The old e.name / e.content sync API no longer exists.)
     return {
-        "name": event.name,
-        "mime_type": getattr(event, "type", None) or "application/octet-stream",
-        "data": event.content.read(),
+        "name": file.name,
+        "mime_type": getattr(file, "content_type", None) or "application/octet-stream",
+        "data": await file.read(),
     }
 
 
@@ -71,11 +73,11 @@ def _step_video(st: dict[str, Any], body: Any) -> None:
         # Uploader / input live OUTSIDE the refreshable controls section so an
         # in-flight upload is never destroyed by a refresh.
         if st["video_mode"] == "Upload video":
-            def on_video_upload(e: Any) -> None:
-                if not fmt.is_supported_video_name(e.name):
+            async def on_video_upload(e: Any) -> None:
+                if not fmt.is_supported_video_name(e.file.name):
                     ui.notify("Unsupported video. Use mp4, mov, m4v, avi, mkv, webm.", type="warning")
                     return
-                st["video_upload"] = _pack_upload(e)
+                st["video_upload"] = await _pack_file(e.file)
                 st["video_url"] = ""
                 e.sender.reset()
                 controls.refresh()
@@ -134,16 +136,21 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
     ).classes("text-sm text-gray-500")
 
     with ui.card().classes("w-full gap-2"):
-        def on_doc_upload(e: Any) -> None:
-            ok, invalid = fmt.are_supported_document_names([e.name])
-            if not ok:
-                ui.notify(f"Unsupported: {', '.join(invalid)}. Use pdf, txt, md.", type="warning")
-                return
-            st["document_uploads"] = st["document_uploads"] + [_pack_upload(e)]
+        async def on_docs_upload(e: Any) -> None:
+            # on_multi_upload fires once with all selected files (no per-file race).
+            added: list[dict[str, Any]] = []
+            for file in e.files:
+                ok, invalid = fmt.are_supported_document_names([file.name])
+                if not ok:
+                    ui.notify(f"Skipped {', '.join(invalid)} (use pdf, txt, md).", type="warning")
+                    continue
+                added.append(await _pack_file(file))
+            if added:
+                st["document_uploads"] = st["document_uploads"] + added
             e.sender.reset()
             panel.refresh()
 
-        ui.upload(on_upload=on_doc_upload, auto_upload=True, multiple=True).props(
+        ui.upload(on_multi_upload=on_docs_upload, auto_upload=True, multiple=True).props(
             'accept=".pdf,.txt,.md" flat bordered'
         ).classes("w-full")
 
@@ -170,7 +177,7 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
                     gen.disable()
 
             if not can_generate:
-                ui.label("Add at least one document to continue.").classes("text-xs text-amber-700")
+                ui.label("Upload a document above to enable Generate.").classes("text-xs text-gray-500")
             elif has_video and not has_docs:
                 ui.label(
                     "Documents are optional — generate with just the video, or add some."
