@@ -91,19 +91,29 @@ SECTION CONTRACTS (each field draws only from the listed unit types):
 {_PER_SOURCE_CONTRACTS}
 
 GLOBAL RULES:
-1. A claim appears in at most one section. Never restate across fields. Later
+1. BE SELECTIVE. Most educational value comes from a few important ideas, not
+   from covering everything. Within each section keep only the points that
+   genuinely matter and cut the rest. Shorter and sharper beats longer.
+2. A claim appears in at most one section. Never restate across fields. Later
    sections build on earlier ones; they do not recap them.
-2. Compress. Every sentence must add information not already present. No bridge
-   prose ("this highlights the importance of", "in practice", "overall").
-3. key_terms: extract real domain terms (not meta-words like "tradeoff"). For
-   each: layman (one plain sentence, analogy only if the term is abstract) and
-   technical (one precise sentence). At most two sentences total per term.
-4. reflection_points: each explanation names the specific reasoning trap (the
-   wrong answer a smart person gives) and the correct path. Vary the cognitive
-   operation across questions (causal, counterfactual, failure analysis,
-   tradeoff, methodological critique). depth_level in foundational/intermediate/
-   advanced, at least two advanced.
-5. Continuous prose in text fields. No markdown. No bullet lists. No em dashes.
+3. BE DIRECT. State the concrete observation in plain words. No abstract labels
+   standing in for the actual point, no bridge prose ("this highlights the
+   importance of", "in practice", "overall"), no warm-up sentences.
+4. Distinguish fact from inference: state what the source says plainly; when you
+   draw a conclusion the source does not state, mark it as your inference.
+5. key_terms: only concepts the source actually teaches. For each: layman (one
+   plain sentence, analogy only if abstract) and technical (one precise
+   sentence). At most two sentences total per term.
+6. reflection_points: each explanation names the specific reasoning trap (the
+   wrong answer a smart person gives) and the correct path. Questions are
+   concrete and specific to this source; do NOT reuse template stems like "What
+   if X changed?" or "What assumptions underlie X?". Vary the cognitive operation
+   (causal, counterfactual, failure analysis, tradeoff, methodological critique).
+   depth_level in foundational/intermediate/advanced, at least two advanced.
+7. Never write ledger ids (like u4), "source <number>", or "(evidence: ...)" in
+   any text field; that scaffolding is for your reasoning only. Refer to the
+   material as "the source".
+8. Continuous prose in text fields. No markdown. No bullet lists. No em dashes.
 
 Return ONLY valid JSON matching the schema."""
 
@@ -171,28 +181,43 @@ SECTION CONTRACTS:
 {_CROSS_SOURCE_CONTRACTS}
 
 GLOBAL RULES:
-1. Synthesis means COMPARISON, not summary. Do not summarize each source in
-   sequence. Isolate convergences, contradictions, methodological differences,
-   shared assumptions, and unresolved gaps.
-2. Every intersection MUST cite supporting claims from at least two different
+1. LEAD WITH HIERARCHY. key_takeaways: the 1-3 most important things the learner
+   should leave with, most important first, each one sentence. These are the
+   headline; everything else is detail.
+2. BE SELECTIVE AND DIRECT. Synthesis means COMPARISON, not summary, and only the
+   comparisons that genuinely matter. Open synthesis_text with the single most
+   important relationship, stated concretely. Do NOT begin by restating that the
+   sources are similar or different, and do NOT follow the template
+   "they agree -> they differ -> limitations -> conclusion". State observations
+   in plain words, not abstract labels. Cut anything that is not among the few
+   most significant points.
+3. Every intersection MUST cite supporting claims from at least two different
    sources via attributed_sentences (each with the verbatim text and its
    source_id). An intersection without cross-source grounding is invalid; omit
    it rather than fabricate.
-3. Do not invent topics absent from the ledger. If the sources share little,
-   say so plainly and produce fewer items.
-4. questions: write exactly four options each and set answer_index to the
-   correct one, varying which index is correct across questions. Questions must
-   be HARDBALL: each tests a cross-source mechanism or its application, never
-   single-source recall or recognition of the summary. The three wrong options
-   must each be a PLAUSIBLE misconception a strong student would actually pick
-   (a real confusion grounded in the ledger), not filler or obviously-wrong
-   noise. Provide option_explanations with exactly one entry per option,
-   index-aligned to options: for the correct option, explain why it is right and
-   name the mechanism; for each wrong option, name the specific misconception it
-   represents and state what the concept ACTUALLY is (e.g. "No, X is actually
-   about ..."). The top-level explanation gives the overall correct reasoning.
-   No "Option A" labels anywhere.
-5. Continuous prose in text fields. No markdown. No em dashes.
+4. Distinguish fact from inference: a synthesized connection is YOUR inference,
+   not something either source states. Word it as such ("together these imply")
+   rather than asserting it as a source fact.
+5. Refer to each source by its name from the SOURCE LEGEND in the user message.
+   Never write "source <number>", ledger ids (u4), or "(evidence: ...)" in any
+   text field.
+6. Do not invent topics absent from the ledger. If the sources share little,
+   say so in one sentence and produce fewer items.
+7. questions: write exactly four options each and set answer_index to the
+   correct one, varying which index is correct across questions. Each question
+   must test whether the learner understood the SPECIFIC comparison you just
+   presented (a key takeaway or an intersection) by making them resolve a tension
+   between the sources or apply the combined insight. Reject any question that is
+   answerable from general domain knowledge without the synthesis, and any with a
+   single obviously-correct option. The three wrong options must each be a
+   PLAUSIBLE position a strong student would actually pick (a real confusion
+   grounded in the material), not filler. Provide option_explanations with exactly
+   one entry per option, index-aligned to options: for the correct option, explain
+   why it is right and name the mechanism; for each wrong option, name the specific
+   misconception it represents and state what the concept ACTUALLY is (e.g. "No, X
+   is actually about ..."). The top-level explanation gives the overall correct
+   reasoning. No "Option A" labels anywhere.
+8. Continuous prose in text fields. No markdown. No em dashes.
 
 Return ONLY valid JSON matching the schema."""
 
@@ -203,6 +228,7 @@ SYNTHESIS_JSON_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "key_takeaways": {"type": "array", "items": {"type": "string"}},
             "synthesis_text": {"type": "string"},
             "intersections": {
                 "type": "array",
@@ -279,6 +305,7 @@ SYNTHESIS_JSON_SCHEMA = {
             },
         },
         "required": [
+            "key_takeaways",
             "synthesis_text",
             "intersections",
             "questions",

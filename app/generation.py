@@ -56,7 +56,7 @@ from prompts.sections import (
 )
 
 
-GENERATION_SCHEMA_VERSION = 14
+GENERATION_SCHEMA_VERSION = 15
 LEDGER_SCHEMA_VERSION = 1
 GENERATION_MAX_STAGE_ATTEMPTS = 3
 
@@ -592,12 +592,21 @@ def _generate_synthesis(
     merged = _merge_source_ledgers(source_sections, user_id=user_id)
     rendered = render_units(merged)
 
+    # Source legend: refer to sources by name in prose, never by raw id number.
+    legend_lines: list[str] = []
+    for section in source_sections:
+        prefix = "Video" if section.source_type == "video" else "Document"
+        legend_lines.append(f"  source {section.source_id} = {prefix}: {section.generated_title}")
+    legend = "\n".join(legend_lines) or "  (no named sources)"
+
     def _run(extra_violations: list[str] | None) -> dict[str, Any]:
         user_prompt = (
             "Synthesize ACROSS the sources using only the following knowledge ledger. "
-            "Each unit carries its source id. Every intersection must cite claims from at "
-            "least two different source ids via attributed_sentences. Do not introduce "
-            "topics absent from the ledger.\n\n"
+            "Every intersection must cite claims from at least two different sources via "
+            "attributed_sentences. Do not introduce topics absent from the ledger.\n\n"
+            "=== SOURCE LEGEND (refer to each source by this name in your prose; never "
+            "write 'source <number>' or unit ids) ===\n"
+            f"{legend}\n\n"
             f"=== Merged knowledge ledger (id | type | source) ===\n{rendered}"
         )
         if extra_violations:
@@ -613,7 +622,8 @@ def _generate_synthesis(
             user_prompt=user_prompt,
             response_schema=SYNTHESIS_JSON_SCHEMA,
             required_keys=[
-                "synthesis_text", "intersections", "questions", "application_scenarios",
+                "key_takeaways", "synthesis_text", "intersections",
+                "questions", "application_scenarios",
             ],
         )
 
@@ -640,7 +650,12 @@ def _generate_synthesis(
         except Exception:
             continue
 
+    key_takeaways = [
+        str(t).strip() for t in (payload.get("key_takeaways") or []) if str(t).strip()
+    ][:3]
+
     insights = CombinedInsightSection(
+        key_takeaways=key_takeaways,
         synthesis_text=str(payload.get("synthesis_text", "")).strip(),
         intersections=intersections,
         application_scenarios=application_scenarios,

@@ -34,50 +34,63 @@ PER_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
         id="core_thesis",
         title="Core Thesis",
         field="summary",
-        role="State the single load-bearing claim of the source and why it matters.",
+        role="State the one load-bearing claim in the first sentence, then say why it matters.",
         consumes=("foundational",),
-        forbids="No mechanism walk-throughs, no term definitions, no examples.",
-        budget="One tight paragraph, at most 4 sentences.",
+        forbids="No mechanism walk-throughs, no term definitions, no examples, no warm-up sentence.",
+        budget="At most 3 sentences. The first sentence is the claim itself.",
         audit=("budget_paragraph",),
     ),
     SectionSpec(
         id="mechanisms",
         title="Mechanisms & Relationships",
         field="deep_dive",
-        role="Explain ONLY how things work: causal steps, dependencies, dynamics.",
+        role=(
+            "Select only the 2-4 most important or most surprising mechanisms and explain how each "
+            "works. Lead with the least obvious one."
+        ),
         consumes=("mechanism",),
-        forbids="Do not restate the thesis. Do not define terms (that is the glossary). No filler transitions.",
-        budget="As many paragraphs as the mechanisms require, each making one new point. No padding.",
+        forbids=(
+            "Do NOT paraphrase or list every mechanism in the source; pick the few that carry the "
+            "most weight. Do not restate the thesis. Do not define terms. No filler transitions."
+        ),
+        budget="2-4 short paragraphs, one mechanism each. Omit the rest rather than pad.",
         audit=("novelty",),
     ),
     SectionSpec(
         id="open_questions",
         title="Open Questions & Limitations",
         field="under_surface",
-        role="Surface boundary conditions, failure modes, hidden assumptions, and unresolved gaps.",
+        role="Name the 1-3 genuinely unresolved tensions, failure modes, or hidden assumptions, concretely.",
         consumes=("boundary", "open_question", "assumption"),
-        forbids="Do not repeat mechanism explanations. Do not reassure or summarize.",
-        budget="1-2 paragraphs.",
+        forbids="Do not repeat mechanism explanations. Do not reassure or summarize. No generic caveats.",
+        budget="1 short paragraph, the few that actually matter.",
         audit=("budget_paragraph", "novelty"),
     ),
     SectionSpec(
         id="glossary",
-        title="Glossary",
+        title="Key Concepts",
         field="key_terms",
-        role="Compress key domain terms into quick-reference anchors.",
+        role="Define only the concepts the source actually teaches or explains.",
         consumes=(),
-        forbids="Do not re-explain concepts already covered. No analogy unless the term is genuinely abstract.",
-        budget="6-12 actual domain terms. At most 2 short sentences total per term.",
+        forbids=(
+            "Skip terms merely mentioned in passing or assumed-known; include a term only if the "
+            "source explains it. No analogy unless the term is genuinely abstract."
+        ),
+        budget="3-8 taught concepts. At most 2 short sentences total per term.",
         audit=("glossary_budget",),
     ),
     SectionSpec(
         id="retrieval_practice",
         title="Retrieval Practice",
         field="reflection_points",
-        role="Pose questions that force transfer, failure analysis, or counterfactual reasoning.",
+        role="Pose concrete, content-specific questions that force transfer or resolve a real tension in this source.",
         consumes=("mechanism", "tradeoff", "open_question"),
-        forbids="No questions whose answer is stated verbatim in the source. No generic 'think carefully' prompts.",
-        budget="4-6 questions spanning at least 3 distinct cognitive operations.",
+        forbids=(
+            "No questions whose answer is stated verbatim. No generic 'think carefully' prompts. "
+            "Do NOT reuse template stems like 'What if X changed?', 'What assumptions underlie X?', "
+            "or 'What would happen if X weren't done?'; name the actual mechanism or decision."
+        ),
+        budget="3-5 questions spanning at least 3 distinct cognitive operations.",
         audit=("diversity",),
     ),
 )
@@ -89,16 +102,18 @@ CROSS_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
         title="Comparative Tradeoffs",
         field="synthesis_text+intersections",
         role=(
-            "Compare and contrast the sources along explicit dimensions: convergences, "
-            "contradictions, methodological differences, shared assumptions, unresolved gaps."
+            "Open with the single most important relationship between the sources, stated directly. "
+            "Then give only the few comparisons that genuinely matter (a real contradiction, a "
+            "methodological difference that changes conclusions, a shared blind spot)."
         ),
         consumes=("tradeoff", "assumption", "mechanism", "foundational"),
         forbids=(
-            "Do NOT use the template 'they agree, there is tension, they are complementary, "
-            "adaptability matters'. Every comparative item must cite ledger unit ids from at "
-            "least two different sources. Do not fabricate connections."
+            "No preamble restating that the sources are similar or different. Do NOT follow the "
+            "template 'they agree -> they differ -> limitations -> conclusion'. State concrete "
+            "observations, not abstract labels. Every intersection must be grounded in claims from "
+            "at least two different sources. Do not fabricate connections, do not pad to fill space."
         ),
-        budget="3-5 paragraphs of genuine comparison; 2-4 grounded intersections.",
+        budget="2-3 tight paragraphs; only the 2-3 most significant grounded intersections.",
         audit=("grounding",),
     ),
     SectionSpec(
@@ -108,17 +123,25 @@ CROSS_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
         role="Translate the combined understanding into concrete, do-this transfer scenarios.",
         consumes=("mechanism", "tradeoff", "boundary"),
         forbids="No restating the comparison. Each scenario needs specific steps and a real pitfall.",
-        budget="2-3 scenarios.",
+        budget="2 scenarios, the most useful ones.",
         audit=(),
     ),
     SectionSpec(
         id="cross_retrieval_practice",
         title="Retrieval Practice",
         field="questions",
-        role="Quiz the intersection of sources with transfer/reasoning questions.",
+        role=(
+            "Each question tests whether the learner understood the SPECIFIC comparison just "
+            "presented (the key takeaways and intersections) by making them resolve a tension "
+            "between the sources or apply the combined insight."
+        ),
         consumes=("mechanism", "tradeoff", "open_question"),
-        forbids="No single-source recall. No recognition-of-summary questions. Vary the answer index.",
-        budget="3-5 four-option questions.",
+        forbids=(
+            "No single-source recall. No questions answerable from general domain knowledge without "
+            "the synthesis. No recognition-of-summary. No single obviously-correct option; the "
+            "distractors are plausible positions. Vary the answer index."
+        ),
+        budget="3-4 four-option questions, each tied to a stated takeaway or intersection.",
         audit=("diversity",),
     ),
 )

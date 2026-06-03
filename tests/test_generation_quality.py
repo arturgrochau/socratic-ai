@@ -51,5 +51,31 @@ class DeriveTitleTests(unittest.TestCase):
         self.assertEqual(result, "Untitled Video")
 
 
+class StripSourceArtifactsTests(unittest.TestCase):
+    def test_strips_source_numbers(self) -> None:
+        from frontend.format import strip_source_artifacts
+
+        out = strip_source_artifacts("As source 2 shows, and source 8 disagrees.")
+        self.assertNotIn("source 2", out)
+        self.assertNotIn("source 8", out)
+
+    def test_strips_ledger_ids_and_evidence(self) -> None:
+        from frontend.format import strip_source_artifacts
+
+        out = strip_source_artifacts(
+            'The loop is unstable [u4 | mechanism | source 2] (evidence: "delay causes overshoot").'
+        )
+        self.assertNotIn("u4", out)
+        self.assertNotIn("evidence:", out)
+        self.assertNotIn("source 2", out)
+        self.assertIn("The loop is unstable", out)
+
+    def test_keeps_plain_prose(self) -> None:
+        from frontend.format import strip_source_artifacts
+
+        text = "Feedback delay drives oscillation."
+        self.assertEqual(strip_source_artifacts(text), text)
+
+
 if __name__ == "__main__":
     unittest.main()

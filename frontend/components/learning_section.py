@@ -15,22 +15,26 @@ def render_source_learning_section(section: dict[str, Any]) -> None:
     prefix = "Video" if source_type == "video" else "Document" if source_type == "document" else "Source"
     source_name = str(section.get("source_name") or "").strip()
 
+    def _clean(value: str) -> str:
+        return fmt.normalize_continuous_text_for_display(fmt.strip_source_artifacts(value))
+
     with ui.column().classes("w-full gap-3"):
         ui.label(f"{prefix}: {generated_title}").classes("text-xl font-semibold")
+        ui.label("Pulled from this source.").classes("text-xs text-gray-400 -mt-2")
         if source_name and source_name.lower() != generated_title.lower():
-            ui.label(source_name).classes("text-sm text-gray-500 -mt-2")
+            ui.label(source_name).classes("text-sm text-gray-500")
 
         # Summary
-        summary = fmt.normalize_continuous_text_for_display(str(section.get("summary_text", "")))
+        summary = _clean(str(section.get("summary_text", "")))
         if summary:
             ui.markdown(fmt.format_long_prose_markdown(summary, max_sentences_per_paragraph=4))
 
         # Deep dive (merge deep_dive + under-surface, matching the old UI)
         deep_parts: list[str] = []
-        deep_dive = fmt.normalize_continuous_text_for_display(str(section.get("deep_dive_text", "")))
+        deep_dive = _clean(str(section.get("deep_dive_text", "")))
         if deep_dive:
             deep_parts.append(deep_dive)
-        under_surface = fmt.normalize_continuous_text_for_display(str(section.get("under_surface_explainer", "")))
+        under_surface = _clean(str(section.get("under_surface_explainer", "")))
         if under_surface:
             deep_parts.append(under_surface)
         if deep_parts:
@@ -104,12 +108,27 @@ def render_cross_source(
     on_discuss: Callable[[str], None],
 ) -> None:
     ui.label("Cross-Source Synthesis").classes("text-xl font-semibold")
-    synthesis_text = fmt.normalize_continuous_text_for_display(str(insights.get("synthesis_text", "")))
+    ui.label("Synthesized across your sources (AI inference, not a quote).").classes(
+        "text-xs text-gray-400 -mt-2"
+    )
+
+    # Hierarchy: the 1-3 headline takeaways first.
+    takeaways = [str(t).strip() for t in (insights.get("key_takeaways") or []) if str(t).strip()]
+    if takeaways:
+        with ui.card().classes("w-full bg-blue-1"):
+            ui.label("Key takeaways").classes("text-sm font-semibold text-primary")
+            for i, t in enumerate(takeaways[:3], start=1):
+                ui.markdown(f"**{i}.** {fmt.strip_source_artifacts(t)}")
+
+    synthesis_text = fmt.normalize_continuous_text_for_display(
+        fmt.strip_source_artifacts(str(insights.get("synthesis_text", "")))
+    )
     if synthesis_text:
         ui.markdown(fmt.format_long_prose_markdown(synthesis_text, max_sentences_per_paragraph=4))
 
     ui.label("Quiz").classes("text-lg font-semibold mt-3")
-    ui.label("Pick an answer to lock it in — no retries. Wrong picks explain the trap.").classes(
-        "text-sm text-gray-500"
-    )
+    ui.label(
+        "Study aid built from the synthesis. Pick an answer to lock it in — no retries; "
+        "wrong picks explain the trap."
+    ).classes("text-sm text-gray-500")
     render_quiz(quiz, on_discuss=on_discuss)

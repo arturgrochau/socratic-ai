@@ -11,6 +11,24 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 
+_LEDGER_ID_RE = re.compile(r"\[u\d+[^\]]*\]")              # "[u4 | mechanism | source 2]"
+_EVIDENCE_RE = re.compile(r"\(evidence:[^)]*\)", re.IGNORECASE)
+_SOURCE_NUM_RE = re.compile(r"\(?\b[Ss]ource\s*#?\s*\d+\)?")  # "source 8", "(source 2)", "source #3"
+
+
+def strip_source_artifacts(text_value: str) -> str:
+    """Remove leaked ledger scaffolding from display prose: unit-id brackets,
+    "(evidence: ...)" notes, and raw "source <n>" tokens. Safety net over the
+    prompt rule that forbids the model from emitting them."""
+    t = str(text_value or "")
+    t = _LEDGER_ID_RE.sub("", t)
+    t = _EVIDENCE_RE.sub("", t)
+    t = _SOURCE_NUM_RE.sub("", t)
+    t = re.sub(r"\s+([.,;:])", r"\1", t)   # tidy space before punctuation
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
 SUPPORTED_YOUTUBE_HOSTS = {
@@ -467,7 +485,16 @@ def build_generation_export_markdown(generation_result: dict, *, user_id: str) -
         lines.append("# Cross-Source Synthesis")
         lines.append("")
 
-    synthesis_text = normalize_continuous_text_for_display(str(insights_payload.get("synthesis_text") or ""))
+    takeaways = [str(t).strip() for t in (insights_payload.get("key_takeaways") or []) if str(t).strip()]
+    if takeaways:
+        lines.append("## Key Takeaways")
+        for i, t in enumerate(takeaways[:3], start=1):
+            lines.append(f"{i}. {strip_source_artifacts(t)}")
+        lines.append("")
+
+    synthesis_text = normalize_continuous_text_for_display(
+        strip_source_artifacts(str(insights_payload.get("synthesis_text") or ""))
+    )
     if synthesis_text or intersections:
         lines.append("## Comparative Tradeoffs")
         lines.append("")

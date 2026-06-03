@@ -160,11 +160,13 @@ class QuizQuestion(BaseModel):
 
 
 class CombinedInsightSection(BaseModel):
+    # The 1-3 ranked headline takeaways (most important first) — the hierarchy anchor.
+    key_takeaways: list[str] = Field(default_factory=list)
     synthesis_text: str
     intersections: list[InsightIntersection] = Field(default_factory=list)
     application_scenarios: list[ApplicationScenario] = Field(default_factory=list)
     model_name: str
-    schema_version: int = 6
+    schema_version: int = 7
 
 
 class CombinedQuizSection(BaseModel):

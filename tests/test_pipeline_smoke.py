@@ -108,6 +108,10 @@ _CONSOLIDATION_RESPONSE = {
 }
 
 _SYNTHESIS_RESPONSE = {
+    "key_takeaways": [
+        "Isolated feedback loops are a teaching abstraction; real behavior lives in their interaction.",
+        "Delay explains within-loop stability while topology explains system-level behavior.",
+    ],
     "synthesis_text": (
         "Both sources treat feedback as the engine of system-level behavior, "
         "but they disagree on where the interesting structure lives. The first "
@@ -445,6 +449,11 @@ class PipelineSmokeTests(unittest.TestCase):
             self.assertGreaterEqual(
                 len(response.quiz.questions), 1,
                 "expected at least one quiz question",
+            )
+            # Hierarchy: 1-3 ranked headline takeaways.
+            self.assertTrue(
+                1 <= len(response.insights.key_takeaways) <= 3,
+                f"expected 1-3 key takeaways, got {len(response.insights.key_takeaways)}",
             )
             # Each quiz question carries one teaching rationale per option so the
             # interactive UI can correct the specific misconception a wrong pick made.
