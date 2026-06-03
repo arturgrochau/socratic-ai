@@ -5,7 +5,8 @@ from typing import Any
 from sqlalchemy import text
 
 from app.models import RetrievedContext, RetrievalHit
-from config import RETRIEVAL_MODEL, chroma_client, db_engine, get_llm_client
+import config
+from config import chroma_client, db_engine, get_llm_client
 
 
 COLLECTION_NAME = "interaction_retrieval_concepts"
@@ -34,8 +35,8 @@ def _get_collection() -> Any:
 def _embed_texts(texts: list[str], user_id: str) -> list[list[float]]:
     if not texts:
         return []
-    client = get_llm_client("openai")
-    embeddings = client.embed(model=RETRIEVAL_MODEL, inputs=texts)
+    client = get_llm_client(config.embedding_provider())
+    embeddings = client.embed(model=config.retrieval_model(), inputs=texts)
     return embeddings
 
 

@@ -13,8 +13,15 @@ from app.models import (
     InteractionTurnRecord,
 )
 from app.retrieval import build_context_text, retrieve_context
-from config import CHAT_MODEL, db_engine, get_llm_client
-from prompts import CHAT_JSON_SCHEMA, CHAT_SYSTEM_PROMPT
+import config
+from config import db_engine, get_aux_client, get_aux_model, get_llm_client
+from prompts import (
+    CHAT_JSON_SCHEMA,
+    DEPTH_CLASSIFIER_JSON_SCHEMA,
+    DEPTH_CLASSIFIER_SYSTEM_PROMPT,
+    build_chat_system_prompt,
+    chat_context_scale,
+)
 
 
 MAX_STORED_TURNS = 20
@@ -133,7 +140,9 @@ def _save_interaction_session(state: InteractionSessionState, user_id: str) -> N
 # ---------------------------------------------------------------------------
 
 
-def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str:
+def _load_generated_learning_context(
+    source_ids: list[int], user_id: str, max_chars: int = MAX_GENERATED_CONTEXT_CHARS,
+) -> str:
     if not source_ids:
         return ""
 
@@ -203,7 +212,44 @@ def _load_generated_learning_context(source_ids: list[int], user_id: str) -> str
     full_context = "\n\n".join(p for p in ["\n\n".join(source_blocks), combined_block] if p).strip()
     if not full_context:
         return ""
-    return _truncate_text(full_context, MAX_GENERATED_CONTEXT_CHARS)
+    return _truncate_text(full_context, max_chars)
+
+
+# ---------------------------------------------------------------------------
+# Depth-tier classification (cheap aux pass)
+# ---------------------------------------------------------------------------
+
+
+_VALID_TIERS = ("lookup", "explain", "analyze", "deepen")
+
+
+def _classify_depth(
+    query: str,
+    recent_turns: list[InteractionTurnRecord],
+    user_id: str,
+) -> str:
+    """Map a query to a length tier so the answer scope matches the question scope."""
+    recent_json = [turn.model_dump() for turn in recent_turns[-2:]]
+    user_prompt = (
+        f"Recent turns:\n{json.dumps(recent_json, ensure_ascii=True)}\n\n"
+        f"New question:\n{query}"
+    )
+    try:
+        result = get_aux_client().chat_json(
+            model=get_aux_model(),
+            system=DEPTH_CLASSIFIER_SYSTEM_PROMPT,
+            user=user_prompt,
+            json_schema=DEPTH_CLASSIFIER_JSON_SCHEMA,
+            temperature=0.0,
+        )
+        log_api_usage(
+            response=result.raw, user_id=user_id,
+            call_stage="interaction", model_name=get_aux_model(),
+        )
+        tier = str(safe_json_loads(result.content, default={}).get("tier", "")).strip()
+    except Exception:
+        tier = ""
+    return tier if tier in _VALID_TIERS else "explain"
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +263,7 @@ def _run_chat_completion(
     generated_context: str,
     recent_turns: list[InteractionTurnRecord],
     user_id: str,
+    tier: str,
 ) -> AskModelOutput:
     recent_turns_json = [turn.model_dump() for turn in recent_turns]
     client = get_llm_client()
@@ -229,8 +276,8 @@ def _run_chat_completion(
     )
 
     result = client.chat_json(
-        model=CHAT_MODEL,
-        system=CHAT_SYSTEM_PROMPT,
+        model=config.chat_model(),
+        system=build_chat_system_prompt(tier),
         user=user_prompt,
         json_schema=CHAT_JSON_SCHEMA,
         temperature=0.3,
@@ -239,7 +286,7 @@ def _run_chat_completion(
         response=result.raw,
         user_id=user_id,
         call_stage="interaction",
-        model_name=CHAT_MODEL,
+        model_name=config.chat_model(),
     )
 
     content = result.content
@@ -283,7 +330,14 @@ def handle_user_query(
         raise ValueError("session_id source_ids do not match the existing session context.")
 
     recent_turns = state.turns[-MAX_PROMPT_TURNS:]
-    generated_context = _load_generated_learning_context(normalized_source_ids, user_id)
+
+    tier = _classify_depth(normalized_query, recent_turns, user_id)
+    scale = chat_context_scale(tier)
+    generated_context = _load_generated_learning_context(
+        normalized_source_ids, user_id,
+        max_chars=max(400, int(MAX_GENERATED_CONTEXT_CHARS * scale)),
+    )
+    scaled_top_k = max(2, int(round(min(top_k, 8) * scale)))
 
     retrieved_context = None
     try:
@@ -291,7 +345,7 @@ def handle_user_query(
             query=normalized_query,
             source_ids=normalized_source_ids,
             user_id=user_id,
-            top_k=min(top_k, 8),
+            top_k=scaled_top_k,
         )
     except ValueError:
         pass
@@ -307,6 +361,7 @@ def handle_user_query(
         generated_context=generated_context,
         recent_turns=recent_turns,
         user_id=user_id,
+        tier=tier,
     )
 
     answer = (model_output.answer or "").strip()
@@ -325,5 +380,5 @@ def handle_user_query(
     return AskResponse(
         session_id=state.session_id,
         answer=answer,
-        model_name=CHAT_MODEL,
+        model_name=config.chat_model(),
     )

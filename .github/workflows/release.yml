@@ -1,159 +1,28 @@
-name: Build & Release
+name: CI
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: ["**"]
+    tags: ["v*.*.*"]
+  pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
       - name: Run unit tests
-        run: pytest tests/ -m "not e2e" --tb=short
+        run: uv run pytest tests/ -m "not e2e" --tb=short
         env:
           PYTHONPATH: .
           OPENAI_API_KEY: sk-test-ci-placeholder
-
-  build:
-    needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Apple Silicon (arm64) — most Macs since 2020
-          - os: macos-14
-            name: mac-arm64
-            arch: arm64
-          # Intel Macs (x86_64)
-          - os: macos-13
-            name: mac-intel
-            arch: x86_64
-          - os: windows-latest
-            name: windows
-            arch: x86_64
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install PyInstaller
-        run: pip install pyinstaller
-
-      - name: Build launcher binary (Mac/Linux)
-        if: runner.os != 'Windows'
-        run: |
-          pyinstaller --onefile \
-            --name "SocraticAI" \
-            --target-arch ${{ matrix.arch }} \
-            --add-data "requirements.txt:." \
-            --add-data "frontend:frontend" \
-            --add-data "app:app" \
-            --add-data "prompts:prompts" \
-            --add-data "routes:routes" \
-            --add-data "main.py:." \
-            --add-data "config.py:." \
-            launcher.py
-
-      - name: Ad-hoc codesign (Mac)
-        if: runner.os == 'macOS'
-        run: |
-          codesign --force --deep --sign - dist/SocraticAI
-          codesign -dvv dist/SocraticAI
-
-      - name: Package Mac binary with ditto (preserves xattrs)
-        if: runner.os == 'macOS'
-        run: |
-          ditto -c -k --keepParent dist/SocraticAI dist/SocraticAI-${{ matrix.name }}.zip
-
-      - name: Build launcher binary (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          pyinstaller --onefile `
-            --name "SocraticAI" `
-            --add-data "requirements.txt;." `
-            --add-data "frontend;frontend" `
-            --add-data "app;app" `
-            --add-data "prompts;prompts" `
-            --add-data "routes;routes" `
-            --add-data "main.py;." `
-            --add-data "config.py;." `
-            launcher.py
-        shell: powershell
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: socratic-ai-${{ matrix.name }}
-          path: |
-            dist/SocraticAI-${{ matrix.name }}.zip
-            dist/SocraticAI.exe
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download Mac arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: socratic-ai-mac-arm64
-          path: artifacts/mac-arm64/
-
-      - name: Download Mac Intel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: socratic-ai-mac-intel
-          path: artifacts/mac-intel/
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: socratic-ai-windows
-          path: artifacts/windows/
-
-      - name: Rename Windows binary for clarity
-        run: |
-          mv artifacts/windows/SocraticAI.exe artifacts/windows/SocraticAI-windows.exe
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          body: |
-            ## Downloads
-
-            - **Mac (Apple Silicon, M1/M2/M3/M4)** — `SocraticAI-mac-arm64.zip` *(recommended for most Macs since 2020)*
-            - **Mac (Intel)** — `SocraticAI-mac-intel.zip`
-            - **Windows** — `SocraticAI-windows.exe`
-
-            ### First launch on Mac
-
-            macOS Gatekeeper will block the app on first open ("cannot be opened because it is from an unidentified developer"). Either:
-
-            ```bash
-            xattr -d com.apple.quarantine ~/Downloads/SocraticAI
-            ```
-
-            or right-click the binary → **Open** → confirm in the dialog. You only have to do this once.
-          files: |
-            artifacts/mac-arm64/SocraticAI-mac-arm64.zip
-            artifacts/mac-intel/SocraticAI-mac-intel.zip
-            artifacts/windows/SocraticAI-windows.exe

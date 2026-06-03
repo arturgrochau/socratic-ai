@@ -1,0 +1,46 @@
+"""In-process smoke test of the NiceGUI pages.
+
+Uses NiceGUI's `user` fixture (loaded via -p nicegui.testing.user_plugin) to
+build each page through the real connected-render path — this catches runtime
+errors in the wizard / dashboard / chat / settings builders that a plain HTTP
+GET (which only returns the shell) would miss. main.py is the page source.
+"""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("OPENAI_API_KEY", "sk-test-ui-smoke")
+os.environ.setdefault("SOCRATIC_CONFIG_DIR", "/tmp/socratic-ui-smoke-cfg")
+
+import pytest
+
+pytestmark = pytest.mark.asyncio
+
+
+async def test_index_renders_sources(user) -> None:
+    await user.open("/")
+    await user.should_see("Add your sources")
+    await user.should_see("Generate Socratic learning")
+
+
+@pytest.mark.nicegui_main_file("tests/_ui_quiz_probe.py")
+async def test_quiz_lock_and_correction(user) -> None:
+    await user.open("/quizprobe")
+    await user.should_see("ZZQUESTION about coupling?")
+    await user.should_see("alphaOPT")
+    # Pick the wrong option (alpha). First pick locks the question.
+    user.find("alphaOPT").click()
+    # The chosen-wrong correction and the correct-answer rationale both appear.
+    await user.should_see("TRAPALPHA")
+    await user.should_see("RIGHTBETA")
+    # Single question answered => the handoff button is offered.
+    await user.should_see("Discuss in Socratic chat")
+
+
+async def test_settings_page_renders(user) -> None:
+    # The settings form fields load from the API over HTTP, which the in-process
+    # User simulation can't reach — so we only assert the page builder runs and
+    # paints its header/intro (the endpoint itself is covered in test_settings_api).
+    await user.open("/settings")
+    await user.should_see("Settings")
+    await user.should_see("local Ollama model")

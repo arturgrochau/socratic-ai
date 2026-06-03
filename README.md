@@ -6,37 +6,30 @@ Turn your videos, PDFs, and lectures into a structured thinking workout — not 
 
 ---
 
-## 📥 Download
+## Quick start
 
-**Get the latest release for your machine. No build required.**
+Socratic AI runs as a single local app (one process, one port). Install once with
+[`uv`](https://docs.astral.sh/uv/) — it handles Python and dependencies for you.
 
-| Platform | File | Notes |
-|---|---|---|
-| 🍎 **Mac — Apple Silicon (M1/M2/M3/M4)** &nbsp;⭐ *recommended for most Macs since 2020* | **[`SocraticAI-mac-arm64.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-arm64.zip)** | Native arm64 build — direct download |
-| 🍎 **Mac — Intel** | [`SocraticAI-mac-intel.zip` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-mac-intel.zip) | For pre-2020 Macs — direct download |
-| 🪟 **Windows** | [`SocraticAI-windows.exe` ⬇](https://github.com/arturgrochau/socratic_ai/releases/latest/download/SocraticAI-windows.exe) | Single-file binary — direct download |
-| 🐧 **Linux / self-hosted** | See [Run from source](#run-from-source) | |
-
-> All download links above pull from the [latest GitHub release](https://github.com/arturgrochau/socratic_ai/releases/latest) and always resolve to the newest version.
-
-> **Which Mac do I have?** Click the Apple menu → *About This Mac*. If the **Chip** row says anything starting with "Apple", get the **arm64** build. If it says "Intel", get the **intel** build.
-
-### First launch on Mac (read this once)
-
-The app is signed with an ad-hoc signature, not an Apple Developer ID, so Gatekeeper will block the first open with **"SocraticAI cannot be opened because the developer cannot be verified"**. This is normal for indie tools. Choose either path:
-
-**Option A — one Terminal command (easiest):**
 ```bash
-xattr -d com.apple.quarantine ~/Downloads/SocraticAI
+# 1. Get uv (macOS/Linux). On Windows see https://docs.astral.sh/uv/getting-started/
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone and configure
+git clone https://github.com/arturgrochau/socratic_ai.git
+cd socratic_ai
+echo "OPENAI_API_KEY=sk-..." > .env      # or run fully local with Ollama — see below
+
+# 3. Run
+uv run socratic-ai
 ```
-Then double-click it. Done.
 
-**Option B — clickable path:**
-1. Try to open the app once and dismiss the warning.
-2. Open *System Settings* → *Privacy & Security*.
-3. Scroll down. You will see a line about SocraticAI being blocked. Click **Open Anyway**.
+The app opens at **http://localhost:8000** and your browser launches automatically.
+You also need `ffmpeg` on your `PATH` if you ingest videos (`brew install ffmpeg`,
+`apt install ffmpeg`, or `choco install ffmpeg`).
 
-You only have to do either of these once per download.
+> No API key? Open the **⚙ Settings** page in the app and point it at a local
+> [Ollama](https://ollama.com) model instead — see [Switching the brain](#switching-the-brain).
 
 ---
 
@@ -58,31 +51,39 @@ It is built to do the opposite of what most AI study tools do. It does not summa
 
 A 2-source session is ~11 LLM calls (all on `gpt-4o-mini`) and costs roughly **~$0.01** per run. Results are cached, so reopening a session is free.
 
+### What's new in v2.1
+
+- **One process, one port** — the UI is now built with [NiceGUI](https://nicegui.io) and mounted directly on the FastAPI backend. No more separate Streamlit server; everything serves from `http://localhost:8000`.
+- **In-app Settings panel** — switch between the OpenAI API and a local Ollama model, change models, and set your key from a ⚙ page in the app. Applies at runtime, no restart, no `.env` editing. Saved to your user config dir. Point generation (or the cheap auxiliary passes) at a small/local model for faster, offline runs.
+- **One-screen source input** — add a video and/or documents on a single screen with live, removable lists; Generate unlocks as soon as you have one source.
+- **Interactive, hardball quiz** — click to answer (locks on first pick): right turns green, wrong turns red with a correction tied to *that* misconception, then a button hands you into the Socratic chat seeded with what you missed.
+- **Leaner generation** — section audits run as one pass per arc (instead of one call per section) and ledger windows are larger, cutting LLM calls per run with no change to the accumulation design.
+- **uv-based install** — `uv run socratic-ai` replaces the old PyInstaller binaries and the venv-bootstrapping launcher.
+
 ### What's new in v2.0
 
 - **Iterative accumulation pipeline** — each LLM call sees the full accumulated analysis so far and is told not to repeat. Replaces the old novelty-ledger / claim-extraction / progressive-chunking machinery with one simple loop.
 - **Layman + technical key term definitions** — every key concept now ships with both a plain-English explanation and a precise technical definition, collapsible in the UI.
 - **Cleaner chat** — answers are grounded and direct. No more dangling "Socratic next question" tacked onto every reply.
 - **~10× cheaper, ~4× less code** — generation pipeline dropped from ~4,200 lines to ~880 lines. No more `gpt-4o` critic fallback.
-- **Dual-arch Mac builds** — separate native binaries for Apple Silicon and Intel Macs.
 - **Pluggable LLM backend** — swap between OpenAI and Ollama per-role (chat, embedding, transcription). Mix providers freely.
 
 ---
 
 ## Run from source
 
-Requirements: Python 3.11+, `ffmpeg` on `PATH`, an OpenAI API key (or a local [Ollama](https://ollama.com) — see [Switching the brain](#switching-the-brain)).
+See [Quick start](#quick-start) above — `uv run socratic-ai` is the supported path
+(it resolves Python 3.11+ and all dependencies from `pyproject.toml`/`uv.lock`).
+
+Prefer a manual virtualenv? It still works:
 
 ```bash
-git clone https://github.com/arturgrochau/socratic_ai.git
-cd socratic_ai
-
-echo "OPENAI_API_KEY=sk-..." > .env
-
-python launcher.py        # creates a venv + installs deps on first run
+python3 -m venv .venv && . .venv/bin/activate
+pip install .
+python run.py             # serves the app at http://localhost:8000
 ```
 
-The app opens at `http://localhost:8501`.
+For development with auto-reload: `uvicorn main:app --reload`.
 
 ---
 
@@ -120,34 +121,35 @@ Socratic AI is built on that premise. It does not answer your questions — it g
 ### Architecture
 
 ```
-FastAPI (backend, port 8000)  ◀──▶  Streamlit (frontend, port 8501)
+FastAPI + NiceGUI  (one uvicorn process, port 8000)
         │
-        ├── SQLite (sessions, sources, generated sections — cached)
-        ├── ChromaDB (vector embeddings for retrieval)
-        └── LLMClient (OpenAI by default; Ollama optional)
+        ├── NiceGUI UI       (mounted on the same app via ui.run_with)
+        ├── REST API         (/upload, /generate-tailored-learning, /ask, /settings)
+        ├── SQLite           (sessions, sources, generated sections — cached)
+        ├── ChromaDB         (vector embeddings for retrieval)
+        └── LLMClient        (OpenAI by default; Ollama optional, switchable in Settings)
 ```
 
 ---
 
 ## Switching the brain
 
-The default backend is OpenAI's `gpt-4o-mini`. To run against a local model with [Ollama](https://ollama.com):
+The default backend is OpenAI's `gpt-4o-mini`. The easiest way to switch is the
+**⚙ Settings** page in the app: pick `ollama` as the provider, set the model names
+and Ollama host, hit **Test Ollama**, then **Apply**. Changes take effect immediately
+(the cached LLM clients are rebuilt) and persist to your user config dir — no restart.
 
 ```bash
-# 1. install ollama, then pull a model
+# install ollama and pull a model first
 ollama pull llama3.2
-
-# 2. set provider envs in your .env (whisper still needs OpenAI for now)
-LLM_PROVIDER=ollama
-EMBEDDING_PROVIDER=ollama
-EMBEDDING_MODEL=nomic-embed-text
-WHISPER_PROVIDER=openai     # only needed if you upload videos
-
-# 3. launch
-python launcher.py
 ```
 
-Provider selection is per-role (chat, embedding, transcription), so you can mix — for example, OpenAI for transcription and embeddings, Llama locally for the rest. See [`app/llm_client.py`](app/llm_client.py) for the available roles and how to add another provider.
+You can also set the same choices via environment variables in `.env` as a bootstrap
+default (`LLM_PROVIDER`, `EMBEDDING_PROVIDER`, `WHISPER_PROVIDER`, `OLLAMA_HOST`,
+`GENERATION_MODEL`, `CHAT_MODEL`, `RETRIEVAL_MODEL` — see `.env.example`). Provider
+selection is per-role, so you can mix — e.g. OpenAI for transcription and embeddings,
+Llama locally for the rest. Whisper transcription still requires OpenAI. See
+[`app/llm_client.py`](app/llm_client.py) for the available roles and how to add a provider.
 
 Quality on a 7B local model will be visibly worse than `gpt-4o-mini` for the generation stages. It works; it just produces less crisp output. Use it for offline runs or privacy-sensitive material.
 

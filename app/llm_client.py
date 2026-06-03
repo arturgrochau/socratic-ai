@@ -220,10 +220,18 @@ class OllamaClient:
         )
 
 
-def build_client(provider: str) -> LLMClient:
+def build_client(provider: str, *, settings: Any = None) -> LLMClient:
+    """Construct an LLMClient for a provider.
+
+    When `settings` is supplied (a config.Settings), the API key / host come
+    from it so runtime changes via the Settings panel take effect. Falls back
+    to environment variables otherwise (keeps tests and direct callers working).
+    """
     provider = (provider or "openai").strip().lower()
+    api_key = getattr(settings, "openai_api_key", None)
+    host = getattr(settings, "ollama_host", None)
     if provider == "openai":
-        return OpenAIClient()
+        return OpenAIClient(api_key=api_key)
     if provider == "ollama":
-        return OllamaClient()
+        return OllamaClient(host=host)
     raise ValueError(f"Unknown LLM provider: {provider!r} (set LLM_PROVIDER=openai|ollama)")

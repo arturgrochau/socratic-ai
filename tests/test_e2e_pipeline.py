@@ -58,6 +58,7 @@ def _isolated_env(monkeypatch, tmp_path):
         "app.linking",
         "app.retrieval",
         "app.interaction",
+        "app.ledger",
         "app.generation",
     ):
         try:

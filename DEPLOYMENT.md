@@ -6,19 +6,24 @@ Set these variables in your deployment platform:
 - `OPENAI_API_KEY` (required)
 - `DATABASE_URL` (default: `sqlite:///./app.db`)
 - `CHROMA_PERSIST_DIR` (default: `./chroma_data`)
-- `PROCESSING_MODEL` (default: `gpt-4o-mini`)
-- `LINKING_MODEL` (default: `gpt-4o-mini`)
+- `GENERATION_MODEL` (default: `gpt-4o-mini`)
+- `CHAT_MODEL` (default: `gpt-4o-mini`)
 - `RETRIEVAL_MODEL` (default: `text-embedding-3-small`)
-- `INTERACTION_MODEL` (default: `gpt-4o-mini`)
+- `LLM_PROVIDER` / `EMBEDDING_PROVIDER` / `WHISPER_PROVIDER` (`openai` or `ollama`)
+- `OLLAMA_HOST` (default: `http://localhost:11434`)
 - `USER_ID_HEADER` (default: `X-User-ID`)
 - `ENABLE_COST_LOGGING` (`true` or `false`)
 - `CACHE_PROCESSED_SOURCES` (`true` or `false`)
 - `DEPLOY_ENV` (default: `production`)
 
+> These env vars are bootstrap defaults. At runtime, provider/model/key settings
+> can also be changed from the in-app **Settings** page (persisted to the user
+> config dir). See `.env.example` for the full list.
+
 ## Runtime Dependencies
 
 - `ffmpeg` must be present at runtime (already installed in the Dockerfile).
-- `yt-dlp` is installed from `requirements.txt` and is required for YouTube URL ingestion.
+- `yt-dlp` is installed as a project dependency (`pyproject.toml`) and is required for YouTube URL ingestion.
 - YouTube mode downloads one media source and then reuses the same Whisper pipeline used for uploaded videos.
 
 ## Local Docker Run
@@ -37,33 +42,17 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
-## Local One-Command Dev Run (API + Streamlit)
+## Local One-Command Run (API + UI, one process)
 
 From the repository root:
 
 ```bash
-./socratic-ai
+uv run socratic-ai
 ```
 
-This starts:
-
-- API at `http://127.0.0.1:8000`
-- Streamlit at `http://127.0.0.1:8501`
-
-Use `Ctrl+C` once to stop both together.
-
-Optional flags:
-
-```bash
-./socratic-ai --no-open
-./socratic-ai --no-reload
-```
-
-Alias launcher is also available:
-
-```bash
-./socratic_ai
-```
+This starts the unified app (FastAPI API + NiceGUI UI) at `http://127.0.0.1:8000`
+and opens your browser. Set `SOCRATIC_OPEN_BROWSER=false` to skip the browser, or
+`PORT` to change the port. Use `Ctrl+C` to stop.
 
 ## Render
 

@@ -121,11 +121,19 @@ _SYNTHESIS_RESPONSE = {
             "title": "Delay vs. topology as the dominant explanation",
             "why_it_matters": "Choosing the wrong frame leads to interventions that target the wrong leverage point.",
             "integrated_explanation": "The first source treats delay as the master variable while the second treats topology as primary. The synthesis is that delay matters within a loop and topology matters across loops, and both must be analyzed for non-trivial systems.",
+            "attributed_sentences": [
+                {"text": "Within a loop, response time determines stability.", "source_id": 1},
+                {"text": "Cross-loop interactions dominate large-system behavior.", "source_id": 2},
+            ],
         },
         {
             "title": "Stability is multi-scale",
             "why_it_matters": "A system can be locally stable yet globally fragile.",
             "integrated_explanation": "Local stability described in the first source coexists with topological vulnerabilities described in the second. Real-world stability requires examining both scales simultaneously.",
+            "attributed_sentences": [
+                {"text": "Damping is achieved through negative feedback.", "source_id": 1},
+                {"text": "Cascade failures arise from coupling structure.", "source_id": 2},
+            ],
         },
     ],
     "questions": [
@@ -139,6 +147,12 @@ _SYNTHESIS_RESPONSE = {
             ],
             "answer_index": 0,
             "explanation": "Topology dominates when interaction effects between loops exceed the dynamics of any single loop, which happens precisely when delays do not isolate them.",
+            "option_explanations": [
+                "Correct: when delays are small the loops are not isolated, so their coupling structure drives behavior.",
+                "No, a single dominant loop is the case where polarity, not topology, governs the dynamics.",
+                "No, perturbations are about inputs; topology is about how loops connect regardless of perturbation.",
+                "No, a short horizon hides dynamics rather than revealing which structure dominates.",
+            ],
         },
         {
             "question": "Which scenario most clearly requires both frames together?",
@@ -150,6 +164,12 @@ _SYNTHESIS_RESPONSE = {
             ],
             "answer_index": 2,
             "explanation": "Cascading failures emerge from how loops connect, while the speed of cascade depends on within-loop delays. Both frames are essential.",
+            "option_explanations": [
+                "No, a thermostat that never overshoots needs neither frame; it is already stable.",
+                "No, a single growth driver is a one-loop problem and needs only polarity.",
+                "Correct: cascade structure needs topology while cascade speed needs within-loop delay.",
+                "No, a half-life is a single decay process with no loop coupling at all.",
+            ],
         },
         {
             "question": "What is the strongest evidence the two sources are complementary?",
@@ -161,6 +181,12 @@ _SYNTHESIS_RESPONSE = {
             ],
             "answer_index": 2,
             "explanation": "Operating at different scales is exactly what makes the frames composable rather than competing.",
+            "option_explanations": [
+                "No, shared vocabulary is surface overlap, not evidence the frames combine.",
+                "No, identical case studies would make the sources redundant, not complementary.",
+                "Correct: different scales mean each frame covers what the other cannot.",
+                "No, opposing on everything would make them contradictory, not complementary.",
+            ],
         },
     ],
     "application_scenarios": [
@@ -188,6 +214,27 @@ _SYNTHESIS_RESPONSE = {
 }
 
 
+_LEDGER_RESPONSE = {
+    "units": [
+        {
+            "type": "foundational",
+            "claim": "Feedback loops are the engine of system-level behavior.",
+            "evidence": "Feedback loops are the building blocks of system behavior.",
+        },
+        {
+            "type": "mechanism",
+            "claim": "Loop polarity and delay together determine whether a loop amplifies or stabilizes.",
+            "evidence": "Delays in feedback produce oscillations.",
+        },
+        {
+            "type": "boundary",
+            "claim": "Thresholds can trigger discontinuous regime shifts.",
+            "evidence": "Thresholds can trigger regime shifts in complex systems.",
+        },
+    ],
+}
+
+
 class _FakeClient:
     """LLMClient stand-in. Routes by json_schema name (or lack thereof)."""
 
@@ -203,17 +250,12 @@ class _FakeClient:
         temperature: float = 0.0,
         stream: bool = False,
     ) -> _FakeResult:
-        if json_schema is None:
-            # Accumulation step — return plain prose.
-            return _FakeResult(
-                content=(
-                    "The system under study exhibits feedback dynamics. Small "
-                    "changes propagate through the loop and can either amplify "
-                    "or dampen depending on the polarity of the connections. "
-                    "Stability is a delicate balance of these competing forces."
-                )
-            )
-        schema_name = json_schema.get("name", "")
+        schema_name = json_schema.get("name", "") if json_schema else ""
+        if schema_name == "ledger_extraction":
+            return _FakeResult(content=json.dumps(_LEDGER_RESPONSE))
+        if schema_name == "section_audit":
+            # Always pass: keep the pipeline single-pass in the smoke test.
+            return _FakeResult(content=json.dumps({"ok": True, "violations": []}))
         if schema_name == "source_consolidation":
             return _FakeResult(content=json.dumps(_CONSOLIDATION_RESPONSE))
         if schema_name == "cross_source_synthesis":
@@ -252,6 +294,8 @@ class PipelineSmokeTests(unittest.TestCase):
         importlib.reload(models_mod)
         from app import ingestion as ingestion_mod
         importlib.reload(ingestion_mod)
+        from app import ledger as ledger_mod
+        importlib.reload(ledger_mod)
         from app import generation as generation_mod
         importlib.reload(generation_mod)
 
@@ -313,7 +357,8 @@ class PipelineSmokeTests(unittest.TestCase):
 
             fake_client = _FakeClient()
             with mock.patch.object(config_mod, "get_llm_client", return_value=fake_client), \
-                 mock.patch.object(gen_mod, "get_llm_client", return_value=fake_client):
+                 mock.patch.object(gen_mod, "get_llm_client", return_value=fake_client), \
+                 mock.patch.object(gen_mod, "get_aux_client", return_value=fake_client):
                 response = gen_mod.generate_tailored_learning(
                     video_source_id=None,
                     document_source_ids=[source_id],
@@ -376,7 +421,8 @@ class PipelineSmokeTests(unittest.TestCase):
 
             fake_client = _FakeClient()
             with mock.patch.object(config_mod, "get_llm_client", return_value=fake_client), \
-                 mock.patch.object(gen_mod, "get_llm_client", return_value=fake_client):
+                 mock.patch.object(gen_mod, "get_llm_client", return_value=fake_client), \
+                 mock.patch.object(gen_mod, "get_aux_client", return_value=fake_client):
                 response = gen_mod.generate_tailored_learning(
                     video_source_id=None,
                     document_source_ids=[id_a, id_b],
@@ -400,6 +446,30 @@ class PipelineSmokeTests(unittest.TestCase):
                 len(response.quiz.questions), 1,
                 "expected at least one quiz question",
             )
+            # Each quiz question carries one teaching rationale per option so the
+            # interactive UI can correct the specific misconception a wrong pick made.
+            for q in response.quiz.questions:
+                self.assertEqual(
+                    len(q.option_explanations), len(q.options),
+                    f"question '{q.question}' must have one option_explanation per option",
+                )
+            # Anti-fabrication: every intersection must be grounded in >=2 sources.
+            for intersection in response.insights.intersections:
+                source_ids = {s.source_id for s in intersection.attributed_sentences}
+                self.assertGreaterEqual(
+                    len(source_ids), 2,
+                    f"intersection '{intersection.title}' not grounded in >=2 sources",
+                )
+
+            # Glossary budget: each term stays within ~2 sentences total.
+            for doc in response.documents:
+                for kte in doc.key_term_explanations:
+                    sentence_count = (kte.layman + " " + kte.technical).count(".")
+                    self.assertLessEqual(
+                        sentence_count, 2,
+                        f"glossary term '{kte.term}' exceeds the 2-sentence budget",
+                    )
+
             # Quiz answer indices should not all be identical (sanity check).
             answer_indices = {q.answer_index for q in response.quiz.questions}
             self.assertGreater(

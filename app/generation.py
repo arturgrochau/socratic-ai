@@ -10,6 +10,16 @@ from sqlalchemy import text
 from app.cost_logging import log_api_usage, log_generation_stage_event
 from app.json_reliability import parse_json_object, safe_json_loads
 from app.session_logger import get_active_logger, session_log
+from app.ledger import (
+    KnowledgeUnit,
+    append_units,
+    ensure_ledger_table,
+    load_ledger,
+    next_unit_id,
+    parse_units,
+    render_units,
+    store_ledger,
+)
 from app.models import (
     ApplicationScenario,
     CombinedInsightSection,
@@ -21,22 +31,33 @@ from app.models import (
     ReflectionPoint,
     SourceLearningSection,
 )
+import config
 from config import (
     CACHE_PROCESSED_SOURCES,
-    GENERATION_MODEL,
     db_engine,
+    get_aux_client,
+    get_aux_model,
     get_llm_client,
 )
 from prompts import (
-    ACCUMULATION_SYSTEM_PROMPT,
+    AUDIT_JSON_SCHEMA,
+    AUDIT_SYSTEM_PROMPT,
     CONSOLIDATION_JSON_SCHEMA,
     CONSOLIDATION_SYSTEM_PROMPT,
+    LEDGER_EXTRACTION_JSON_SCHEMA,
+    LEDGER_EXTRACTION_SYSTEM_PROMPT,
     SYNTHESIS_JSON_SCHEMA,
     SYNTHESIS_SYSTEM_PROMPT,
 )
+from prompts.sections import (
+    CROSS_SOURCE_SECTIONS,
+    PER_SOURCE_SECTIONS,
+    SectionSpec,
+)
 
 
-GENERATION_SCHEMA_VERSION = 12
+GENERATION_SCHEMA_VERSION = 14
+LEDGER_SCHEMA_VERSION = 1
 GENERATION_MAX_STAGE_ATTEMPTS = 3
 
 
@@ -73,10 +94,13 @@ def _run_structured_generation_step(
     system_prompt: str,
     response_schema: dict[str, Any],
     required_keys: list[str] | None = None,
-    model_name: str = GENERATION_MODEL,
+    model_name: str | None = None,
+    use_aux: bool = False,
 ) -> dict[str, Any]:
     last_error_detail = "Retry budget exhausted."
-    client = get_llm_client()
+    client = get_aux_client() if use_aux else get_llm_client()
+    if model_name is None:
+        model_name = get_aux_model() if use_aux else config.generation_model()
 
     for attempt_number in range(1, GENERATION_MAX_STAGE_ATTEMPTS + 1):
         started = time.perf_counter()
@@ -131,44 +155,6 @@ def _run_structured_generation_step(
         run_id=run_id, stage_name=stage_name,
         attempt_number=GENERATION_MAX_STAGE_ATTEMPTS, reason=last_error_detail,
     )
-
-
-def _run_plain_generation_step(
-    *,
-    run_id: str,
-    stage_name: str,
-    user_id: str,
-    user_prompt: str,
-    system_prompt: str,
-    model_name: str = GENERATION_MODEL,
-) -> str:
-    client = get_llm_client()
-    started = time.perf_counter()
-    log_generation_stage_event(
-        run_id=run_id, user_id=user_id, stage_name=stage_name,
-        attempt_number=1, status="started",
-    )
-    result = client.chat_json(
-        model=model_name, system=system_prompt, user=user_prompt,
-        temperature=0.0,
-    )
-    log_api_usage(
-        response=result.raw, user_id=user_id,
-        call_stage="generation", model_name=model_name,
-    )
-    duration_ms = int((time.perf_counter() - started) * 1000)
-    log_generation_stage_event(
-        run_id=run_id, user_id=user_id, stage_name=stage_name,
-        attempt_number=1, status="succeeded", duration_ms=duration_ms,
-    )
-    get_active_logger().record("stage_call", {
-        "stage_name": stage_name, "duration_ms": duration_ms,
-        "model": model_name,
-        "prompt_tokens": result.usage.prompt_tokens,
-        "completion_tokens": result.usage.completion_tokens,
-        "total_tokens": result.usage.total_tokens,
-    })
-    return result.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +244,8 @@ def ensure_generation_tables() -> None:
             ON combined_learning_sections (user_id, video_source_id)
         """))
 
+    ensure_ledger_table()
+
 
 # ---------------------------------------------------------------------------
 # Chunk loading helpers
@@ -308,7 +296,10 @@ def _group_chunks_into_windows(chunks: list[str], window_size: int = 0) -> list[
     if not chunks:
         return []
     if window_size <= 0:
-        window_size = 2 if len(chunks) <= 6 else 3
+        # Larger windows = fewer ledger-extraction calls. The accumulation design
+        # still holds (each window sees the full prior ledger), so this trades a
+        # little per-call context for a meaningful call-count reduction.
+        window_size = 3 if len(chunks) <= 10 else 4
     windows: list[str] = []
     for i in range(0, len(chunks), window_size):
         window_chunks = chunks[i : i + window_size]
@@ -316,57 +307,59 @@ def _group_chunks_into_windows(chunks: list[str], window_size: int = 0) -> list[
     return windows
 
 
-def _run_accumulation_loop(
+def _extract_source_ledger(
     windows: list[str],
+    source_id: int,
     source_name: str,
     *,
     run_id: str,
     user_id: str,
-) -> str:
-    accumulated_text = ""
+) -> list[KnowledgeUnit]:
+    """Iterate windows, emitting deduped typed KnowledgeUnits into a ledger."""
+    ledger: list[KnowledgeUnit] = []
     for idx, window in enumerate(windows):
-        if accumulated_text:
-            user_prompt = (
-                f"Source: {source_name}\n\n"
-                f"=== Accumulated analysis so far ===\n{accumulated_text}\n\n"
-                f"=== New material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
-                "Continue the analysis. Do NOT repeat anything already in the accumulated "
-                "analysis. Extend with new details, constraints, or edge cases from this material."
-            )
-        else:
-            user_prompt = (
-                f"Source: {source_name}\n\n"
-                f"=== Material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
-                "Begin the educational analysis of this material."
-            )
-
-        new_text = _run_plain_generation_step(
-            run_id=run_id,
-            stage_name=f"accumulation:{source_name}:{idx + 1}",
-            user_id=user_id,
-            system_prompt=ACCUMULATION_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
+        prior = render_units(ledger) if ledger else "(empty - this is the first material)"
+        user_prompt = (
+            f"Source: {source_name}\n\n"
+            f"=== Ledger built from earlier material (do NOT restate these) ===\n{prior}\n\n"
+            f"=== New material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
+            "Extract only genuinely new knowledge units from the new material."
         )
-        if accumulated_text:
-            accumulated_text += "\n\n" + new_text
-        else:
-            accumulated_text = new_text
+        payload = _run_structured_generation_step(
+            run_id=run_id,
+            stage_name=f"ledger:{source_name}:{idx + 1}",
+            user_id=user_id,
+            system_prompt=LEDGER_EXTRACTION_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            response_schema=LEDGER_EXTRACTION_JSON_SCHEMA,
+            required_keys=["units"],
+            use_aux=True,
+        )
+        new_units = parse_units(payload.get("units", []), source_id, next_unit_id(ledger))
+        append_units(ledger, new_units)
+    return ledger
 
-    return accumulated_text
 
-
-def _consolidate_accumulated_text(
-    accumulated_text: str,
+def _consolidate_ledger(
+    ledger: list[KnowledgeUnit],
     source_name: str,
     *,
     run_id: str,
     user_id: str,
+    extra_violations: list[str] | None = None,
 ) -> dict[str, Any]:
+    rendered = render_units(ledger)
     user_prompt = (
         f"Source: {source_name}\n\n"
-        f"=== Complete accumulated analysis ===\n{accumulated_text}\n\n"
-        "Organize this analysis into the required JSON structure."
+        f"=== Knowledge ledger (id | type | source) ===\n{rendered}\n\n"
+        "Organize these units into the required JSON structure, following each "
+        "section contract. Reference the claims; do not restate them across fields."
     )
+    if extra_violations:
+        user_prompt += (
+            "\n\nA prior draft was rejected for these contract violations. Fix them:\n- "
+            + "\n- ".join(extra_violations)
+        )
     return _run_structured_generation_step(
         run_id=run_id,
         stage_name=f"consolidation:{source_name}",
@@ -376,6 +369,85 @@ def _consolidate_accumulated_text(
         response_schema=CONSOLIDATION_JSON_SCHEMA,
         required_keys=["summary", "deep_dive", "key_terms", "under_surface", "reflection_points"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Generic section audit (cheap aux passes, one re-gen on violation)
+# ---------------------------------------------------------------------------
+
+
+def _render_field_for_audit(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, list):
+        return str(value)
+    parts: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+        elif "term" in item:
+            parts.append(f"{item.get('term')}: {item.get('layman', '')} {item.get('technical', '')}")
+        elif "question" in item:
+            parts.append(
+                f"Q: {item.get('question')} | {item.get('explanation', '')} "
+                f"[{item.get('depth_level', '')}]"
+            )
+        else:
+            parts.append(json.dumps(item, ensure_ascii=True))
+    return "\n".join(parts)
+
+
+def _audit_arc(
+    specs: tuple[SectionSpec, ...],
+    structured: dict[str, Any],
+    *,
+    run_id: str,
+    user_id: str,
+) -> list[str]:
+    """Audit the whole arc in ONE aux call.
+
+    Sections are rendered in arc order with their contracts so the auditor can
+    check each against its own rules and against earlier sections for
+    restatement. Sections with no audit rules or empty content are skipped.
+    Replaces the former per-section loop (one call per section)."""
+    blocks: list[str] = []
+    for spec in specs:
+        if not spec.audit:
+            continue
+        field = spec.field.split("+")[0]
+        content = _render_field_for_audit(structured.get(field, ""))
+        if not content.strip():
+            continue
+        blocks.append(
+            f"### SECTION: {spec.title}\n"
+            f"ROLE: {spec.role}\n"
+            f"NON-OVERLAP RULE: {spec.forbids}\n"
+            f"LENGTH BUDGET: {spec.budget}\n"
+            f"CONTENT:\n{content}"
+        )
+
+    if not blocks:
+        return []
+
+    user_prompt = (
+        "Audit the following sections against their contracts. They are listed "
+        "in arc order, so each section's 'prior' material is everything above "
+        "it. Report only clear violations, each prefixed with its section title.\n\n"
+        + "\n\n".join(blocks)
+    )
+    payload = _run_structured_generation_step(
+        run_id=run_id,
+        stage_name="audit:arc",
+        user_id=user_id,
+        system_prompt=AUDIT_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_schema=AUDIT_JSON_SCHEMA,
+        required_keys=["ok", "violations"],
+        use_aux=True,
+    )
+    if payload.get("ok"):
+        return []
+    return [str(v).strip() for v in payload.get("violations", []) if str(v).strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -404,13 +476,30 @@ def _build_source_learning_section(
     if not chunks:
         raise ValueError(f"Source {source_id} has no text chunks.")
 
-    windows = _group_chunks_into_windows(chunks)
-    accumulated = _run_accumulation_loop(
-        windows, source_name, run_id=run_id, user_id=user_id,
+    ledger = load_ledger(
+        user_id=user_id, source_id=source_id, schema_version=LEDGER_SCHEMA_VERSION,
     )
-    structured = _consolidate_accumulated_text(
-        accumulated, source_name, run_id=run_id, user_id=user_id,
+    if ledger is None:
+        windows = _group_chunks_into_windows(chunks)
+        ledger = _extract_source_ledger(
+            windows, source_id, source_name, run_id=run_id, user_id=user_id,
+        )
+        store_ledger(
+            user_id=user_id, source_id=source_id, units=ledger,
+            schema_version=LEDGER_SCHEMA_VERSION,
+        )
+
+    structured = _consolidate_ledger(
+        ledger, source_name, run_id=run_id, user_id=user_id,
     )
+    violations = _audit_arc(
+        PER_SOURCE_SECTIONS, structured, run_id=run_id, user_id=user_id,
+    )
+    if violations:
+        structured = _consolidate_ledger(
+            ledger, source_name, run_id=run_id, user_id=user_id,
+            extra_violations=violations,
+        )
 
     key_terms_raw = structured.get("key_terms", [])
     key_terms: list[str] = []
@@ -446,7 +535,7 @@ def _build_source_learning_section(
         under_surface_explainer=str(structured.get("under_surface", "")).strip(),
         key_term_explanations=key_term_explanations,
         reflection_points=reflection_points,
-        model_name=GENERATION_MODEL,
+        model_name=config.generation_model(),
         schema_version=GENERATION_SCHEMA_VERSION,
     )
     _store_source_learning_section(section, user_id)
@@ -458,43 +547,84 @@ def _build_source_learning_section(
 # ---------------------------------------------------------------------------
 
 
+def _merge_source_ledgers(
+    source_sections: list[SourceLearningSection],
+    *,
+    user_id: str,
+) -> list[KnowledgeUnit]:
+    """Concatenate per-source ledgers with globally unique ids (no cross-source dedup,
+    so genuine convergences between sources remain visible to synthesis)."""
+    merged: list[KnowledgeUnit] = []
+    counter = 1
+    for section in source_sections:
+        units = load_ledger(
+            user_id=user_id, source_id=section.source_id,
+            schema_version=LEDGER_SCHEMA_VERSION,
+        ) or []
+        for unit in units:
+            merged.append(unit.model_copy(update={"id": f"u{counter}"}))
+            counter += 1
+    return merged
+
+
+def _ground_intersections(
+    raw_intersections: list[Any],
+) -> list[InsightIntersection]:
+    """Keep only intersections grounded in >=2 distinct source ids (anti-fabrication)."""
+    grounded: list[InsightIntersection] = []
+    for entry in raw_intersections:
+        try:
+            intersection = InsightIntersection.model_validate(entry)
+        except Exception:
+            continue
+        source_ids = {s.source_id for s in intersection.attributed_sentences}
+        if len(source_ids) >= 2:
+            grounded.append(intersection)
+    return grounded
+
+
 def _generate_synthesis(
     source_sections: list[SourceLearningSection],
     *,
     run_id: str,
     user_id: str,
 ) -> tuple[CombinedInsightSection, CombinedQuizSection]:
-    source_summaries: list[str] = []
-    for section in source_sections:
-        block = (
-            f"--- Source: {section.source_name} ({section.source_type}) ---\n"
-            f"Summary:\n{section.summary_text}\n\n"
-            f"Deep Dive:\n{section.deep_dive_text}\n\n"
-            f"Under the Surface:\n{section.under_surface_explainer}"
+    merged = _merge_source_ledgers(source_sections, user_id=user_id)
+    rendered = render_units(merged)
+
+    def _run(extra_violations: list[str] | None) -> dict[str, Any]:
+        user_prompt = (
+            "Synthesize ACROSS the sources using only the following knowledge ledger. "
+            "Each unit carries its source id. Every intersection must cite claims from at "
+            "least two different source ids via attributed_sentences. Do not introduce "
+            "topics absent from the ledger.\n\n"
+            f"=== Merged knowledge ledger (id | type | source) ===\n{rendered}"
         )
-        source_summaries.append(block)
+        if extra_violations:
+            user_prompt += (
+                "\n\nA prior draft was rejected for these contract violations. Fix them:\n- "
+                + "\n- ".join(extra_violations)
+            )
+        return _run_structured_generation_step(
+            run_id=run_id,
+            stage_name="synthesis",
+            user_id=user_id,
+            system_prompt=SYNTHESIS_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            response_schema=SYNTHESIS_JSON_SCHEMA,
+            required_keys=[
+                "synthesis_text", "intersections", "questions", "application_scenarios",
+            ],
+        )
 
-    user_prompt = (
-        "Synthesize the following source analyses into a cross-source learning artifact.\n\n"
-        + "\n\n".join(source_summaries)
+    payload = _run(None)
+    violations = _audit_arc(
+        CROSS_SOURCE_SECTIONS, payload, run_id=run_id, user_id=user_id,
     )
+    if violations:
+        payload = _run(violations)
 
-    payload = _run_structured_generation_step(
-        run_id=run_id,
-        stage_name="synthesis",
-        user_id=user_id,
-        system_prompt=SYNTHESIS_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        response_schema=SYNTHESIS_JSON_SCHEMA,
-        required_keys=["synthesis_text", "intersections", "questions", "application_scenarios"],
-    )
-
-    intersections: list[InsightIntersection] = []
-    for entry in payload.get("intersections", []):
-        try:
-            intersections.append(InsightIntersection.model_validate(entry))
-        except Exception:
-            continue
+    intersections = _ground_intersections(payload.get("intersections", []))
 
     questions: list[QuizQuestion] = []
     for entry in payload.get("questions", []):
@@ -514,12 +644,12 @@ def _generate_synthesis(
         synthesis_text=str(payload.get("synthesis_text", "")).strip(),
         intersections=intersections,
         application_scenarios=application_scenarios,
-        model_name=GENERATION_MODEL,
+        model_name=config.generation_model(),
         schema_version=GENERATION_SCHEMA_VERSION,
     )
     quiz = CombinedQuizSection(
         questions=questions,
-        model_name=GENERATION_MODEL,
+        model_name=config.generation_model(),
         schema_version=GENERATION_SCHEMA_VERSION,
     )
     return insights, quiz
@@ -704,7 +834,7 @@ def _store_combined_learning_sections(
                 ),
                 "quiz_json": json.dumps(quiz.model_dump(), ensure_ascii=True),
                 "schema_version": GENERATION_SCHEMA_VERSION,
-                "model_name": GENERATION_MODEL,
+                "model_name": config.generation_model(),
             },
         )
 
@@ -862,11 +992,11 @@ def generate_tailored_learning(
                 synthesis_text="",
                 intersections=[],
                 application_scenarios=[],
-                model_name=GENERATION_MODEL,
+                model_name=config.generation_model(),
             )
             quiz_section = CombinedQuizSection(
                 questions=[],
-                model_name=GENERATION_MODEL,
+                model_name=config.generation_model(),
             )
 
         return GenerateTailoredLearningResponse(

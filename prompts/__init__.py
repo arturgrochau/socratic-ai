@@ -1,66 +1,109 @@
 """All prompt constants and JSON schemas for the Socratic AI pipeline.
 
-Four stages: accumulation, consolidation, synthesis, chat.
+Stages: ledger extraction, consolidation, synthesis, section audit, chat
+(+ chat depth classification). Per-source and cross-source section roles, budgets,
+and non-overlap rules are declared once in prompts.sections and injected here.
 """
 from __future__ import annotations
 
-ACCUMULATION_SYSTEM_PROMPT = """\
-You are producing a deep educational analysis of source material. Your goal \
-is to build a thorough, mechanism-level understanding that goes beyond surface \
-summaries.
+from prompts.sections import (
+    CROSS_SOURCE_SECTIONS,
+    PER_SOURCE_SECTIONS,
+    render_contracts,
+)
+
+
+_PER_SOURCE_CONTRACTS = render_contracts(PER_SOURCE_SECTIONS)
+_CROSS_SOURCE_CONTRACTS = render_contracts(CROSS_SOURCE_SECTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Ledger extraction (per window)
+# ---------------------------------------------------------------------------
+
+LEDGER_EXTRACTION_SYSTEM_PROMPT = """\
+You extract atomic knowledge units from source material into a structured ledger.
+
+A knowledge unit is ONE self-contained claim. Classify each by type:
+  - foundational: the core thesis or a central finding.
+  - mechanism: how something works, a causal step, a dependency.
+  - tradeoff: a gain weighed against a loss, a comparison of options.
+  - assumption: a hidden premise the material rests on.
+  - boundary: a condition under which something stops working; a limit.
+  - example: a concrete number, case, or scenario from the source.
+  - open_question: an unresolved gap, a failure mode, an unanswered question.
 
 RULES:
-1. NEVER repeat content already in the accumulated analysis. If a concept was \
-covered, do not restate it. Instead, extend it with new details, constraints, \
-or edge cases from the current material.
-2. Focus on these dimensions (in order of priority):
-   - Causal mechanisms: HOW does it work, step by step?
-   - Tradeoffs: What do you gain and what do you lose?
-   - Failure modes: When and how does it break down?
-   - Hidden assumptions: What must be true for this to hold?
-   - Boundary conditions: Where does it stop working?
-   - Concrete examples: Numbers, scenarios, specific cases from the source.
-3. Write in clear, educational prose. No markdown formatting. No bullet lists. \
-No headers. No bold or italic markers.
-4. Do NOT use em dashes or spaced hyphens. Use commas, periods, or parentheses \
-instead.
-5. Do NOT speculate beyond what the source material supports. If the source is \
-thin on a dimension, say so briefly and move on.
-6. Each paragraph should make exactly one substantive point with supporting \
-evidence from the source.
-7. Aim for 2-4 paragraphs per section of source material, depending on density.
+1. You are given the ledger built from earlier material. Do NOT emit a unit that
+   restates a claim already in it. Only emit genuinely new claims from the new
+   material. If the new material adds nothing, return an empty list.
+2. Each claim is at most two sentences, specific, and self-contained.
+3. evidence: a short verbatim phrase from the source that anchors the claim. Do
+   not invent evidence; if none fits, use an empty string.
+4. Do NOT speculate beyond the source. Do not use em dashes.
+5. Prefer fewer, higher-signal units over many shallow restatements.
 
-You are building a cumulative document. Think of yourself as a careful analyst \
-adding new pages to a growing report."""
+Return ONLY valid JSON matching the schema."""
 
-CONSOLIDATION_SYSTEM_PROMPT = """\
-You are structuring a completed educational analysis into a well-organized \
-learning artifact. The accumulated analysis text has already been written. \
-Your job is to organize it, NOT to rewrite it from scratch.
+LEDGER_EXTRACTION_JSON_SCHEMA = {
+    "name": "ledger_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "units": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": [
+                                "foundational", "mechanism", "tradeoff",
+                                "assumption", "boundary", "example", "open_question",
+                            ],
+                        },
+                        "claim": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["type", "claim", "evidence"],
+                },
+            },
+        },
+        "required": ["units"],
+    },
+}
 
-RULES:
-1. summary: 2-3 paragraphs capturing the core mechanism and its significance. \
-This is the "what and why it matters" section.
-2. deep_dive: The main analytical body. Take the best mechanism-level content \
-from the accumulated analysis. 4-8 paragraphs covering how it works, tradeoffs, \
-constraints, and failure modes. Do NOT repeat the summary. Do NOT define terms \
-here (that belongs in key_terms).
-3. key_terms: Extract 6-12 actual domain terms from the analysis (not \
-meta-terms like "tradeoff" or "constraint"). For each term provide:
-   - layman: A one-sentence explanation a non-expert would understand. Use \
-analogies if helpful.
-   - technical: A precise one-sentence definition for someone in the field.
-4. under_surface: 1-2 paragraphs on hidden assumptions and expert-level \
-insights that novices miss. What implicit premises does this material rest on? \
-What do practitioners know that the text does not say explicitly?
-5. reflection_points: 4-6 Socratic questions that test genuine understanding:
-   - At least 2 must be "advanced" level requiring synthesis of multiple concepts.
-   - Each explanation must identify the specific reasoning trap (the wrong \
-answer a smart person would give) and the correct reasoning path.
-   - Do NOT ask questions whose answer is directly stated in the text. Ask \
-questions that require applying the concepts to new situations.
-6. Write in continuous prose. No markdown. No em dashes. No bullet lists in \
-prose sections.
+
+# ---------------------------------------------------------------------------
+# Stage 2: Consolidation (per source) — consumes the typed ledger
+# ---------------------------------------------------------------------------
+
+CONSOLIDATION_SYSTEM_PROMPT = f"""\
+You organize a typed knowledge ledger into a learning artifact with a strict
+cognitive arc. The ledger gives you atomic claims, each tagged with an id, a
+type, a source, and supporting evidence. Your job is to ORGANIZE and COMPRESS,
+not to re-explain.
+
+SECTION CONTRACTS (each field draws only from the listed unit types):
+{_PER_SOURCE_CONTRACTS}
+
+GLOBAL RULES:
+1. A claim appears in at most one section. Never restate across fields. Later
+   sections build on earlier ones; they do not recap them.
+2. Compress. Every sentence must add information not already present. No bridge
+   prose ("this highlights the importance of", "in practice", "overall").
+3. key_terms: extract real domain terms (not meta-words like "tradeoff"). For
+   each: layman (one plain sentence, analogy only if the term is abstract) and
+   technical (one precise sentence). At most two sentences total per term.
+4. reflection_points: each explanation names the specific reasoning trap (the
+   wrong answer a smart person gives) and the correct path. Vary the cognitive
+   operation across questions (causal, counterfactual, failure analysis,
+   tradeoff, methodological critique). depth_level in foundational/intermediate/
+   advanced, at least two advanced.
+5. Continuous prose in text fields. No markdown. No bullet lists. No em dashes.
 
 Return ONLY valid JSON matching the schema."""
 
@@ -114,30 +157,42 @@ CONSOLIDATION_JSON_SCHEMA = {
     },
 }
 
-SYNTHESIS_SYSTEM_PROMPT = """\
-You are synthesizing educational analyses from multiple sources into a cohesive \
-cross-source learning artifact.
 
-RULES:
-1. synthesis_text: 3-5 paragraphs weaving the sources together. Do NOT \
-summarize each source sequentially. Instead, identify shared mechanisms, \
-tensions, and complementary insights. Write as if explaining to someone who \
-has read both sources and wants to understand how they connect.
-2. intersections: 2-4 genuine cross-source connections where sources reinforce, \
-contradict, or extend each other. Each must reference both sources explicitly. \
-Do NOT fabricate connections that are not supported by the material.
-3. questions: 3-5 quiz questions testing cross-source understanding:
-   - Each question must have exactly 4 options.
-   - Vary the answer_index across questions (do NOT put the correct answer at \
-the same index every time).
-   - Questions should test the intersection of sources, not facts from a single \
-source.
-   - Explanations should naturally explain the reasoning without using \
-"Distractor" or "Option A" labels.
-4. application_scenarios: 2-3 concrete real-world scenarios where the combined \
-understanding from all sources applies. Include specific transfer steps and a \
-common pitfall for each.
-5. No markdown. No em dashes. Continuous prose in text sections.
+# ---------------------------------------------------------------------------
+# Stage 3: Synthesis (cross-source) — consumes the merged ledger
+# ---------------------------------------------------------------------------
+
+SYNTHESIS_SYSTEM_PROMPT = f"""\
+You synthesize a merged, cross-source knowledge ledger into a comparative
+artifact. Each ledger unit carries its source id, so you can ground every
+comparison in specific claims.
+
+SECTION CONTRACTS:
+{_CROSS_SOURCE_CONTRACTS}
+
+GLOBAL RULES:
+1. Synthesis means COMPARISON, not summary. Do not summarize each source in
+   sequence. Isolate convergences, contradictions, methodological differences,
+   shared assumptions, and unresolved gaps.
+2. Every intersection MUST cite supporting claims from at least two different
+   sources via attributed_sentences (each with the verbatim text and its
+   source_id). An intersection without cross-source grounding is invalid; omit
+   it rather than fabricate.
+3. Do not invent topics absent from the ledger. If the sources share little,
+   say so plainly and produce fewer items.
+4. questions: write exactly four options each and set answer_index to the
+   correct one, varying which index is correct across questions. Questions must
+   be HARDBALL: each tests a cross-source mechanism or its application, never
+   single-source recall or recognition of the summary. The three wrong options
+   must each be a PLAUSIBLE misconception a strong student would actually pick
+   (a real confusion grounded in the ledger), not filler or obviously-wrong
+   noise. Provide option_explanations with exactly one entry per option,
+   index-aligned to options: for the correct option, explain why it is right and
+   name the mechanism; for each wrong option, name the specific misconception it
+   represents and state what the concept ACTUALLY is (e.g. "No, X is actually
+   about ..."). The top-level explanation gives the overall correct reasoning.
+   No "Option A" labels anywhere.
+5. Continuous prose in text fields. No markdown. No em dashes.
 
 Return ONLY valid JSON matching the schema."""
 
@@ -158,11 +213,24 @@ SYNTHESIS_JSON_SCHEMA = {
                         "title": {"type": "string"},
                         "why_it_matters": {"type": "string"},
                         "integrated_explanation": {"type": "string"},
+                        "attributed_sentences": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "text": {"type": "string"},
+                                    "source_id": {"type": "integer"},
+                                },
+                                "required": ["text", "source_id"],
+                            },
+                        },
                     },
                     "required": [
                         "title",
                         "why_it_matters",
                         "integrated_explanation",
+                        "attributed_sentences",
                     ],
                 },
             },
@@ -173,18 +241,20 @@ SYNTHESIS_JSON_SCHEMA = {
                     "additionalProperties": False,
                     "properties": {
                         "question": {"type": "string"},
-                        "options": {
+                        "options": {"type": "array", "items": {"type": "string"}},
+                        "answer_index": {"type": "integer"},
+                        "explanation": {"type": "string"},
+                        "option_explanations": {
                             "type": "array",
                             "items": {"type": "string"},
                         },
-                        "answer_index": {"type": "integer"},
-                        "explanation": {"type": "string"},
                     },
                     "required": [
                         "question",
                         "options",
                         "answer_index",
                         "explanation",
+                        "option_explanations",
                     ],
                 },
             },
@@ -196,10 +266,7 @@ SYNTHESIS_JSON_SCHEMA = {
                     "properties": {
                         "scenario_title": {"type": "string"},
                         "scenario_prompt": {"type": "string"},
-                        "transfer_steps": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
+                        "transfer_steps": {"type": "array", "items": {"type": "string"}},
                         "common_pitfall": {"type": "string"},
                     },
                     "required": [
@@ -220,24 +287,102 @@ SYNTHESIS_JSON_SCHEMA = {
     },
 }
 
-CHAT_SYSTEM_PROMPT = """\
-You are a study partner helping the user understand their uploaded educational \
-materials.
+
+# ---------------------------------------------------------------------------
+# Stage 4: Section audit (cheap, runs on the aux model)
+# ---------------------------------------------------------------------------
+
+AUDIT_SYSTEM_PROMPT = """\
+You are a strict editor checking one or more generated sections against their
+contracts and the knowledge ledger. Each section block lists its role, its
+non-overlap rule, its length budget, and its content. Sections are given in arc
+order, so earlier sections are the "prior" material that later sections must not
+restate. Prefix every violation you report with the offending section's title.
+
+Flag a violation ONLY when it clearly breaks a rule:
+  - restatement: the section repeats a claim already shown in an earlier section.
+  - off_contract: the section does something its role forbids.
+  - over_budget: the section clearly exceeds its length budget.
+  - ungrounded: a comparative item lacks support from two different sources.
+  - low_diversity: questions mostly test the same shallow operation or recall.
+
+Be conservative: if the section is acceptable, return ok=true and no violations.
+Do NOT rewrite the section. Just report.
+
+Return ONLY valid JSON matching the schema."""
+
+AUDIT_JSON_SCHEMA = {
+    "name": "section_audit",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ok": {"type": "boolean"},
+            "violations": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["ok", "violations"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: Chat (depth classification + budget-aware answering)
+# ---------------------------------------------------------------------------
+
+# Tier -> (one-line budget instruction, context scale 0..1)
+CHAT_DEPTH_BUDGETS: dict[str, tuple[str, float]] = {
+    "lookup": ("Answer in at most two sentences. State the fact and stop.", 0.34),
+    "explain": ("Answer in one short paragraph (3-5 sentences).", 0.6),
+    "analyze": ("Answer in at most three paragraphs of genuine analysis.", 1.0),
+    "deepen": (
+        "The user wants more depth on the prior answer. Add genuinely new "
+        "dimensions (hidden assumptions, failure modes, edge cases) in at most "
+        "three paragraphs. Do NOT paraphrase what you already said.",
+        1.0,
+    ),
+}
+
+DEPTH_CLASSIFIER_SYSTEM_PROMPT = """\
+Classify the scope of a study question so the answer length matches the question.
+
+Tiers:
+  - lookup: a definition or single fact. Tiny answer.
+  - explain: "how/why" about one concept. Short answer.
+  - analyze: comparison, synthesis, tradeoff, or multi-part reasoning. Fuller answer.
+  - deepen: the user asks to go deeper or elaborate on the previous answer.
+
+Use the recent turns to detect deepen requests. Return ONLY valid JSON."""
+
+DEPTH_CLASSIFIER_JSON_SCHEMA = {
+    "name": "chat_depth",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "tier": {
+                "type": "string",
+                "enum": ["lookup", "explain", "analyze", "deepen"],
+            },
+        },
+        "required": ["tier"],
+    },
+}
+
+CHAT_SYSTEM_PROMPT_TEMPLATE = """\
+You are a study partner helping the user understand their uploaded materials.
 
 RULES:
 1. Answer the question directly in the first sentence. No preamble.
-2. Ground every claim in the provided context. If the materials do not cover \
-the question, say so in one clause and pivot to the closest relevant theme.
-3. Be specific. Name mechanisms, constraints, and tradeoffs. Use domain terms \
-from the materials.
-4. For deepening requests ("go deeper", "elaborate"), add genuinely new \
-dimensions: hidden assumptions, failure modes, edge cases. Do NOT paraphrase \
-your previous answer.
-5. If you draw a connection beyond what the sources state, prefix that sentence \
-with "Inferred extension:".
-6. No markdown headings or bullet lists. Continuous prose. No em dashes.
-7. Keep answers concise by default. Expand to multiple paragraphs only for \
-explicitly deep questions.
+2. Ground every claim in the provided context. If the materials do not cover the
+   question, say so in one clause and pivot to the closest relevant theme.
+3. Be specific. Name mechanisms, constraints, and tradeoffs. Use domain terms
+   from the materials.
+4. If you draw a connection beyond what the sources state, prefix that sentence
+   with "Inferred extension:".
+5. No markdown headings or bullet lists. Continuous prose. No em dashes.
+6. LENGTH: {budget} Match answer size to question size. Do not pad.
 
 Return ONLY valid JSON matching the schema."""
 
@@ -253,3 +398,13 @@ CHAT_JSON_SCHEMA = {
         "required": ["answer"],
     },
 }
+
+
+def build_chat_system_prompt(tier: str) -> str:
+    budget, _ = CHAT_DEPTH_BUDGETS.get(tier, CHAT_DEPTH_BUDGETS["explain"])
+    return CHAT_SYSTEM_PROMPT_TEMPLATE.format(budget=budget)
+
+
+def chat_context_scale(tier: str) -> float:
+    _, scale = CHAT_DEPTH_BUDGETS.get(tier, CHAT_DEPTH_BUDGETS["explain"])
+    return scale

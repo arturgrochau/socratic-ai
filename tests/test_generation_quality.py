@@ -9,17 +9,19 @@ class GroupChunksIntoWindowsTests(unittest.TestCase):
     def test_empty_chunks(self) -> None:
         self.assertEqual(_group_chunks_into_windows([]), [])
 
-    def test_small_set_uses_window_2(self) -> None:
+    def test_small_set_uses_window_3(self) -> None:
+        # Heuristic: <=10 chunks group into windows of 3 (fewer ledger calls).
         chunks = ["a", "b", "c", "d"]
         windows = _group_chunks_into_windows(chunks)
         self.assertEqual(len(windows), 2)
         self.assertIn("a", windows[0])
         self.assertIn("b", windows[0])
-        self.assertIn("c", windows[1])
+        self.assertIn("c", windows[0])
         self.assertIn("d", windows[1])
 
-    def test_large_set_uses_window_3(self) -> None:
-        chunks = [str(i) for i in range(9)]
+    def test_large_set_uses_window_4(self) -> None:
+        # >10 chunks group into windows of 4.
+        chunks = [str(i) for i in range(12)]
         windows = _group_chunks_into_windows(chunks)
         self.assertEqual(len(windows), 3)
 

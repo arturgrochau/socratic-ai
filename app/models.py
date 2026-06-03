@@ -129,10 +129,16 @@ class SourceLearningSection(BaseModel):
     schema_version: int = 12
 
 
+class AttributedSentence(BaseModel):
+    text: str
+    source_id: int
+
+
 class InsightIntersection(BaseModel):
     title: str
     why_it_matters: str
     integrated_explanation: str
+    attributed_sentences: list[AttributedSentence] = Field(default_factory=list)
 
 
 class ApplicationScenario(BaseModel):
@@ -147,6 +153,10 @@ class QuizQuestion(BaseModel):
     options: list[str]
     answer_index: int = Field(ge=0, le=3)
     explanation: str
+    # One teaching rationale per option, index-aligned to `options`: why the
+    # correct one is right, and for each distractor the misconception it encodes
+    # and what the concept actually is. Empty for legacy cached payloads.
+    option_explanations: list[str] = Field(default_factory=list)
 
 
 class CombinedInsightSection(BaseModel):
@@ -160,7 +170,7 @@ class CombinedInsightSection(BaseModel):
 class CombinedQuizSection(BaseModel):
     questions: list[QuizQuestion]
     model_name: str
-    schema_version: int = 3
+    schema_version: int = 4
 
 
 class GenerateTailoredLearningResponse(BaseModel):
