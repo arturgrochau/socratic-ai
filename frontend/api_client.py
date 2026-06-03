@@ -22,11 +22,11 @@ def base_url() -> str:
 
 
 def _headers() -> dict[str, str]:
-    user_id = ""
+    user_id = "local"
     try:
-        user_id = str(app.storage.user.get("user_id", "") or "").strip()
+        user_id = str(app.storage.user.get("user_id") or "local").strip() or "local"
     except Exception:
-        user_id = ""
+        user_id = "local"
     return {"X-User-ID": user_id}
 
 

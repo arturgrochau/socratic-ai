@@ -22,13 +22,7 @@ def _header() -> None:
         with ui.row().classes("items-center gap-2"):
             ui.icon("school")
             ui.label("Socratic AI").classes("text-lg font-semibold")
-        with ui.row().classes("items-center gap-3"):
-            user_input = ui.input(placeholder="User ID", value=state.user_id()).props(
-                "dense dark standout"
-            )
-            user_input.on(
-                "blur", lambda: state.set_user_id(user_input.value or "")
-            )
+        with ui.row().classes("items-center gap-2"):
             ui.button(
                 "Reset",
                 icon="restart_alt",

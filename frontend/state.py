@@ -12,9 +12,12 @@ from typing import Any
 from nicegui import app
 
 
-DEFAULT_USER_ID = "demo-user"
+# Single-user local app: a fixed id satisfies the backend X-User-ID requirement
+# and scopes the local DB. No user-facing account concept.
+LOCAL_USER_ID = "local"
 
 _TAB_DEFAULTS: dict[str, Any] = {
+    "step": 1,                            # 1 = video, 2 = documents
     "video_mode": "YouTube link",         # or "Upload video"
     "video_upload": None,                 # {"name","mime_type","data"}
     "video_url": "",
@@ -55,11 +58,7 @@ def tab() -> dict[str, Any]:
 
 
 def user_id() -> str:
-    return str(app.storage.user.get("user_id", DEFAULT_USER_ID) or "").strip()
-
-
-def set_user_id(value: str) -> None:
-    app.storage.user["user_id"] = str(value or "").strip()
+    return str(app.storage.user.get("user_id") or LOCAL_USER_ID).strip()
 
 
 def reset_builder() -> None:

@@ -17,10 +17,19 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
-async def test_index_renders_sources(user) -> None:
+async def test_index_renders_step_one(user) -> None:
     await user.open("/")
-    await user.should_see("Add your sources")
-    await user.should_see("Generate Socratic learning")
+    await user.should_see("Step 1 of 2")
+    await user.should_see("Skip video →")
+
+
+async def test_skip_video_requires_document(user) -> None:
+    await user.open("/")
+    await user.should_see("Skip video →")  # wait for the connected render
+    user.find("Skip video →").click()
+    await user.should_see("Step 2 of 2")
+    # With no video, a document is mandatory until one is uploaded.
+    await user.should_see("Add at least one document to continue.")
 
 
 @pytest.mark.nicegui_main_file("tests/_ui_quiz_probe.py")
