@@ -23,9 +23,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+# Generation issues LLM calls from parallel worker threads; cassette reads of a
+# plain dict are fine, but record-mode mutation + file rewrite must be serialized.
+_cassette_lock = threading.Lock()
 
 
 CASSETTE_DIR = Path(__file__).resolve().parent / "_cassettes"
@@ -97,7 +103,8 @@ class _CassetteCompletions:
                 f"Re-record with SOCRATIC_RECORD=1."
             )
 
-        # Record path — hit the real API and persist.
+        # Record path — hit the real API and persist (serialized: parallel
+        # generation threads may record concurrently).
         completion = self._real.chat.completions.create(
             model=model,
             messages=messages,
@@ -115,12 +122,13 @@ class _CassetteCompletions:
                 "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
             },
         }
-        self._cassette[key] = entry
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(self._cassette, indent=2, ensure_ascii=True, sort_keys=True),
-            encoding="utf-8",
-        )
+        with _cassette_lock:
+            self._cassette[key] = entry
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                json.dumps(self._cassette, indent=2, ensure_ascii=True, sort_keys=True),
+                encoding="utf-8",
+            )
         return _build_fake(entry)
 
 
@@ -164,11 +172,12 @@ class _CassetteEmbeddings:
             raise RuntimeError(f"Embedding cassette miss {key}; re-record with SOCRATIC_RECORD=1.")
         real_resp = self._real.embeddings.create(model=model, input=inputs)
         embeddings = [item.embedding for item in real_resp.data]
-        self._cassette[key] = {"embeddings": embeddings}
-        self._path.write_text(
-            json.dumps(self._cassette, indent=2, ensure_ascii=True, sort_keys=True),
-            encoding="utf-8",
-        )
+        with _cassette_lock:
+            self._cassette[key] = {"embeddings": embeddings}
+            self._path.write_text(
+                json.dumps(self._cassette, indent=2, ensure_ascii=True, sort_keys=True),
+                encoding="utf-8",
+            )
         class _D: pass
         response = _D()
         response.data = [type("E", (), {"embedding": e})() for e in embeddings]
@@ -202,14 +211,31 @@ class CassetteClient:
 
 
 def install_cassette(monkeypatch: Any, cassette_name: str) -> CassetteClient:
-    """Replace openai_client across every importing module with a cassette."""
+    """Route every LLM call through a cassette.
+
+    Two interception points are needed because the codebase reaches the model two
+    ways: (1) the bare ``config.openai_client`` (transcription) and (2) the
+    ``LLMClient`` wrapper returned by ``config.get_llm_client()`` /
+    ``get_aux_client()`` (all generation/chat/retrieval calls). The cassette is
+    shape-compatible with the bare OpenAI SDK, so we back an ``OpenAIClient``
+    wrapper with it and hand that out from the factories."""
+    import importlib
+
     cassette_path = CASSETTE_DIR / f"{cassette_name}.json"
     client = CassetteClient(cassette_path)
 
+    # An OpenAIClient wrapper whose underlying SDK client IS the cassette.
+    from app.llm_client import OpenAIClient
+    wrapped = OpenAIClient.__new__(OpenAIClient)
+    wrapped._client = client  # type: ignore[attr-defined]
+
     import config
     monkeypatch.setattr(config, "openai_client", client)
-    # Modules that did `from config import openai_client` captured the symbol
-    # at import time; rebind each one.
+    monkeypatch.setattr(config, "get_llm_client", lambda provider=None: wrapped)
+    monkeypatch.setattr(config, "get_aux_client", lambda: wrapped)
+
+    # Modules that did `from config import openai_client / get_llm_client /
+    # get_aux_client` captured those symbols at import time; rebind each one.
     for mod_name in (
         "app.generation",
         "app.interaction",
@@ -217,10 +243,13 @@ def install_cassette(monkeypatch: Any, cassette_name: str) -> CassetteClient:
         "app.ingestion",
     ):
         try:
-            import importlib
             mod = importlib.import_module(mod_name)
-            if hasattr(mod, "openai_client"):
-                monkeypatch.setattr(mod, "openai_client", client)
         except ImportError:
-            pass
+            continue
+        if hasattr(mod, "openai_client"):
+            monkeypatch.setattr(mod, "openai_client", client)
+        if hasattr(mod, "get_llm_client"):
+            monkeypatch.setattr(mod, "get_llm_client", lambda provider=None: wrapped)
+        if hasattr(mod, "get_aux_client"):
+            monkeypatch.setattr(mod, "get_aux_client", lambda: wrapped)
     return client

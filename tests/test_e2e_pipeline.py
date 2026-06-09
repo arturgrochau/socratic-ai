@@ -54,8 +54,6 @@ def _isolated_env(monkeypatch, tmp_path):
         "app.json_reliability",
         "app.models",
         "app.ingestion",
-        "app.processing",
-        "app.linking",
         "app.retrieval",
         "app.interaction",
         "app.ledger",
@@ -156,13 +154,17 @@ def test_e2e_single_pdf_generation(monkeypatch, _isolated_env):
     # Reflection points should span at least one named depth.
     assert depths, "reflection depth_level missing"
 
+    # A single document now gets full enrichment: a quiz + apply-it scenarios.
+    assert response.quiz.questions, "single-document quiz should not be empty"
+    assert response.insights.application_scenarios, "single-document applications expected"
+    assert not response.insights.intersections, "single source must not fabricate intersections"
+
     # ── No refusal pattern leakage in any section text ────────────────────────
     refusal_marker = "don't have enough information"
     for section_text in (
         doc_section.summary_text,
         doc_section.deep_dive_text,
         doc_section.under_surface_explainer or "",
-        doc_section.first_principles_synthesis or "",
     ):
         assert refusal_marker not in section_text.lower(), (
             f"Refusal marker leaked into section: {section_text[:120]}"

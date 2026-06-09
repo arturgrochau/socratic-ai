@@ -1,8 +1,9 @@
 """All prompt constants and JSON schemas for the Socratic AI pipeline.
 
-Stages: ledger extraction, consolidation, synthesis, section audit, chat
-(+ chat depth classification). Per-source and cross-source section roles, budgets,
-and non-overlap rules are declared once in prompts.sections and injected here.
+Stages: ledger extraction (parallel map), consolidation, insights + quiz
+(parallel pair), chat. Per-source and cross-source section roles, budgets, and
+non-overlap rules are declared once in prompts.sections and injected here;
+budget/restatement enforcement is pure code (app/section_validator.py).
 """
 from __future__ import annotations
 
@@ -21,8 +22,14 @@ _CROSS_SOURCE_CONTRACTS = render_contracts(CROSS_SOURCE_SECTIONS)
 # Stage 1: Ledger extraction (per window)
 # ---------------------------------------------------------------------------
 
+# Context-free by design: windows are extracted in PARALLEL (map step), so no
+# call sees the ledger built from other windows. Cross-window duplicates are
+# removed by the pure-code dedup merge in app/ledger.py (reduce step). This is
+# the map-reduce pattern; it replaced the sequential each-call-sees-the-full-
+# prior-ledger design, whose token cost grew quadratically with source length.
 LEDGER_EXTRACTION_SYSTEM_PROMPT = """\
-You extract atomic knowledge units from source material into a structured ledger.
+You extract atomic knowledge units from a section of source material into a
+structured ledger.
 
 A knowledge unit is ONE self-contained claim. Classify each by type:
   - foundational: the core thesis or a central finding.
@@ -34,10 +41,9 @@ A knowledge unit is ONE self-contained claim. Classify each by type:
   - open_question: an unresolved gap, a failure mode, an unanswered question.
 
 RULES:
-1. You are given the ledger built from earlier material. Do NOT emit a unit that
-   restates a claim already in it. Only emit genuinely new claims from the new
-   material. If the new material adds nothing, return an empty list.
-2. Each claim is at most two sentences, specific, and self-contained.
+1. Each claim is at most two sentences, specific, and self-contained.
+2. Emit each distinct claim ONCE; do not emit near-duplicate phrasings of the
+   same point. If the section teaches nothing substantive, return an empty list.
 3. evidence: a short verbatim phrase from the source that anchors the claim. Do
    not invent evidence; if none fits, use an empty string.
 4. Do NOT speculate beyond the source. Do not use em dashes.
@@ -169,10 +175,14 @@ CONSOLIDATION_JSON_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Synthesis (cross-source) — consumes the merged ledger
+# Stage 3: Insights + Quiz (two focused calls, run in PARALLEL)
 # ---------------------------------------------------------------------------
+# The former single synthesis mega-prompt asked a mini model for five different
+# artifacts at once. Splitting the quiz into its own focused call measurably
+# improves question quality and costs no wall-clock because both calls run
+# concurrently against the same rendered ledger.
 
-SYNTHESIS_SYSTEM_PROMPT = f"""\
+INSIGHTS_SYSTEM_PROMPT = f"""\
 You synthesize a merged, cross-source knowledge ledger into a comparative
 artifact. Each ledger unit carries its source id, so you can ground every
 comparison in specific claims.
@@ -203,26 +213,12 @@ GLOBAL RULES:
    text field.
 6. Do not invent topics absent from the ledger. If the sources share little,
    say so in one sentence and produce fewer items.
-7. questions: write exactly four options each and set answer_index to the
-   correct one, varying which index is correct across questions. Each question
-   must test whether the learner understood the SPECIFIC comparison you just
-   presented (a key takeaway or an intersection) by making them resolve a tension
-   between the sources or apply the combined insight. Reject any question that is
-   answerable from general domain knowledge without the synthesis, and any with a
-   single obviously-correct option. The three wrong options must each be a
-   PLAUSIBLE position a strong student would actually pick (a real confusion
-   grounded in the material), not filler. Provide option_explanations with exactly
-   one entry per option, index-aligned to options: for the correct option, explain
-   why it is right and name the mechanism; for each wrong option, name the specific
-   misconception it represents and state what the concept ACTUALLY is (e.g. "No, X
-   is actually about ..."). The top-level explanation gives the overall correct
-   reasoning. No "Option A" labels anywhere.
-8. Continuous prose in text fields. No markdown. No em dashes.
+7. Continuous prose in text fields. No markdown. No em dashes.
 
 Return ONLY valid JSON matching the schema."""
 
-SYNTHESIS_JSON_SCHEMA = {
-    "name": "cross_source_synthesis",
+INSIGHTS_JSON_SCHEMA = {
+    "name": "synthesis_insights",
     "strict": True,
     "schema": {
         "type": "object",
@@ -260,30 +256,6 @@ SYNTHESIS_JSON_SCHEMA = {
                     ],
                 },
             },
-            "questions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "question": {"type": "string"},
-                        "options": {"type": "array", "items": {"type": "string"}},
-                        "answer_index": {"type": "integer"},
-                        "explanation": {"type": "string"},
-                        "option_explanations": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": [
-                        "question",
-                        "options",
-                        "answer_index",
-                        "explanation",
-                        "option_explanations",
-                    ],
-                },
-            },
             "application_scenarios": {
                 "type": "array",
                 "items": {
@@ -308,54 +280,120 @@ SYNTHESIS_JSON_SCHEMA = {
             "key_takeaways",
             "synthesis_text",
             "intersections",
-            "questions",
             "application_scenarios",
         ],
     },
 }
 
+QUIZ_SYSTEM_PROMPT = """\
+You write a short, hard multiple-choice quiz from a knowledge ledger. The quiz
+tests genuine understanding of the material's mechanisms, tradeoffs, and limits,
+never rote recall.
 
-# ---------------------------------------------------------------------------
-# Stage 4: Section audit (cheap, runs on the aux model)
-# ---------------------------------------------------------------------------
-
-AUDIT_SYSTEM_PROMPT = """\
-You are a strict editor checking one or more generated sections against their
-contracts and the knowledge ledger. Each section block lists its role, its
-non-overlap rule, its length budget, and its content. Sections are given in arc
-order, so earlier sections are the "prior" material that later sections must not
-restate. Prefix every violation you report with the offending section's title.
-
-Flag a violation ONLY when it clearly breaks a rule:
-  - restatement: the section repeats a claim already shown in an earlier section.
-  - off_contract: the section does something its role forbids.
-  - over_budget: the section clearly exceeds its length budget.
-  - ungrounded: a comparative item lacks support from two different sources.
-  - low_diversity: questions mostly test the same shallow operation or recall.
-
-Be conservative: if the section is acceptable, return ok=true and no violations.
-Do NOT rewrite the section. Just report.
+RULES:
+1. 3-4 questions, exactly four options each. Set answer_index to the correct
+   option and VARY which index is correct across questions.
+2. If the user message says the ledger spans MULTIPLE sources, every question
+   must test the relationship between them (resolving a tension, applying the
+   combined insight); if it is a SINGLE source, test that source's mechanisms,
+   tradeoffs, and boundaries.
+3. Reject any question answerable from general domain knowledge without the
+   material, and any with a single obviously-correct option.
+4. The three wrong options must each be a PLAUSIBLE position a strong student
+   would actually pick: a real misconception or partial truth grounded in the
+   material, not filler.
+5. option_explanations: exactly one entry per option, index-aligned to options.
+   For the correct option, explain why it is right and name the mechanism. For
+   each wrong option, name the specific misconception it represents and state
+   what the concept ACTUALLY is (e.g. "No, X is actually about ..."). The
+   top-level explanation gives the overall correct reasoning.
+6. No "Option A" labels anywhere. Refer to sources by name from the SOURCE
+   LEGEND if given; never "source <number>" or ledger ids. No em dashes.
 
 Return ONLY valid JSON matching the schema."""
 
-AUDIT_JSON_SCHEMA = {
-    "name": "section_audit",
+QUIZ_JSON_SCHEMA = {
+    "name": "quiz_generation",
     "strict": True,
     "schema": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "ok": {"type": "boolean"},
-            "violations": {"type": "array", "items": {"type": "string"}},
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "question": {"type": "string"},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                        "answer_index": {"type": "integer"},
+                        "explanation": {"type": "string"},
+                        "option_explanations": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "question",
+                        "options",
+                        "answer_index",
+                        "explanation",
+                        "option_explanations",
+                    ],
+                },
+            },
         },
-        "required": ["ok", "violations"],
+        "required": ["questions"],
     },
 }
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: Chat (depth classification + budget-aware answering)
+# Stage 3b: Single-source deepening — one source, no cross-source grounding
 # ---------------------------------------------------------------------------
+# Reuses INSIGHTS_JSON_SCHEMA (same fields); the quiz is its own parallel call
+# (QUIZ_SYSTEM_PROMPT). intersections stays empty (there is nothing to compare
+# across); the value is the apply-it scenarios, the headline takeaways, and a
+# short "bigger picture" synthesis grounded in the one source. This is why a
+# single document is no longer a dead end.
+
+SINGLE_SOURCE_INSIGHTS_SYSTEM_PROMPT = """\
+You deepen a SINGLE source's knowledge ledger into an active study artifact: the
+headline takeaways, a short "bigger picture" reflection, and concrete apply-it
+scenarios. Each ledger unit carries its source id and evidence, so ground
+everything in specific claims.
+
+PRODUCE:
+  - key_takeaways: the 1-3 most important things to leave with, most important
+    first, one sentence each. These are the headline.
+  - synthesis_text: 1-2 tight paragraphs on the bigger picture — how the source's
+    main ideas fit together, why they matter, and where they transfer. This is
+    integration and implication, NOT a recap of the summary. State your inference
+    as inference ("together these imply"), not as a source fact.
+  - application_scenarios: 2 concrete "do this" scenarios that transfer the ideas
+    to a real situation. Each has a specific prompt, ordered transfer_steps, and a
+    real common_pitfall a learner would actually hit.
+  - intersections: ALWAYS an empty array (single source, nothing to compare).
+
+RULES:
+1. BE SELECTIVE AND DIRECT. Only what genuinely matters. No preamble, no abstract
+   labels standing in for the point, no padding.
+2. Do not invent topics absent from the ledger.
+3. Refer to the material as "the source". Never write "source <number>", ledger ids
+   (u4), or "(evidence: ...)" in any text field.
+4. Continuous prose in text fields. No markdown. No em dashes.
+
+Return ONLY valid JSON matching the schema."""
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Chat (heuristic depth tier + budget-aware answering)
+# ---------------------------------------------------------------------------
+# The former LLM audit pass and LLM depth classifier were replaced by code:
+# app/section_validator.py enforces budgets/restatement, and
+# app/interaction.py:_heuristic_depth picks the chat tier. Counting sentences
+# and keyword-routing a 4-way tier are not a model's job.
 
 # Tier -> (one-line budget instruction, context scale 0..1)
 CHAT_DEPTH_BUDGETS: dict[str, tuple[str, float]] = {
@@ -368,33 +406,6 @@ CHAT_DEPTH_BUDGETS: dict[str, tuple[str, float]] = {
         "three paragraphs. Do NOT paraphrase what you already said.",
         1.0,
     ),
-}
-
-DEPTH_CLASSIFIER_SYSTEM_PROMPT = """\
-Classify the scope of a study question so the answer length matches the question.
-
-Tiers:
-  - lookup: a definition or single fact. Tiny answer.
-  - explain: "how/why" about one concept. Short answer.
-  - analyze: comparison, synthesis, tradeoff, or multi-part reasoning. Fuller answer.
-  - deepen: the user asks to go deeper or elaborate on the previous answer.
-
-Use the recent turns to detect deepen requests. Return ONLY valid JSON."""
-
-DEPTH_CLASSIFIER_JSON_SCHEMA = {
-    "name": "chat_depth",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "tier": {
-                "type": "string",
-                "enum": ["lookup", "explain", "analyze", "deepen"],
-            },
-        },
-        "required": ["tier"],
-    },
 }
 
 CHAT_SYSTEM_PROMPT_TEMPLATE = """\

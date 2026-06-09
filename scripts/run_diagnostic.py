@@ -10,11 +10,9 @@ Usage:
     python scripts/run_diagnostic.py --fixture test_assets/sample_notes.pdf
     python scripts/run_diagnostic.py --fixture test_assets/sample_notes.pdf \\
         --video test_assets/sample_video.mp4
-    python scripts/run_diagnostic.py --fixture test_assets/sample_notes.pdf --progressive
 
-Modes:
-    --baseline   (default) — runs with GENERATION_PROGRESSIVE_CHUNKING=false
-    --progressive          — runs with GENERATION_PROGRESSIVE_CHUNKING=true
+(The old --baseline/--progressive modes were removed: GENERATION_PROGRESSIVE_CHUNKING
+was a pre-v2.0 knob that no longer exists; windowing is fixed in app/generation.py.)
 """
 from __future__ import annotations
 
@@ -477,8 +475,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--video", default=None, help="Path to video fixture")
     parser.add_argument("--user-id", default=DEFAULT_USER_ID)
     parser.add_argument("--api-base-url", default=None, help="If set, talk to an already-running backend")
-    parser.add_argument("--baseline", action="store_true", help="Force GENERATION_PROGRESSIVE_CHUNKING=false (default)")
-    parser.add_argument("--progressive", action="store_true", help="Force GENERATION_PROGRESSIVE_CHUNKING=true")
     parser.add_argument("--skip-chat", action="store_true", help="Skip the 5 chat probes")
     parser.add_argument(
         "--validate-cache",
@@ -497,20 +493,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("At least one --fixture (PDF) or --video is required.")
     video_path = Path(args.video).resolve() if args.video else None
 
-    # --baseline forces progressive OFF; --progressive forces it ON; otherwise
-    # use the config default (currently ON since v1.2.4 with min-4-chunks guard).
-    if args.progressive:
-        mode = "progressive"
-    elif args.baseline:
-        mode = "baseline"
-    else:
-        mode = "default"
+    mode = "default"  # single mode since the pre-v2.0 progressive-chunking knob was removed
     env_overrides: dict[str, str] = {"ENABLE_SESSION_LOG": "true"}
-    if mode == "progressive":
-        env_overrides["GENERATION_PROGRESSIVE_CHUNKING"] = "true"
-    elif mode == "baseline":
-        env_overrides["GENERATION_PROGRESSIVE_CHUNKING"] = "false"
-    # mode == "default" → no override; uses config.py setting.
 
     DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
     SESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)

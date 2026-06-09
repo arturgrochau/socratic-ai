@@ -1,6 +1,6 @@
 [project]
 name = "socratic-ai"
-version = "2.1.0"
+version = "2.2.0"
 description = "Turn videos, PDFs, and lectures into a Socratic thinking workout — a structured learning generator with an in-app local/API model switch."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,3 +1,14 @@
+> **⚠️ SUPERSEDED / HISTORICAL — does not match the current codebase.**
+> This is the original pre-v2.0 build plan. It describes an architecture that no longer
+> exists: a Streamlit frontend, `app/processing.py` / `app/linking.py` modules,
+> `prompts/concept_extraction.py` / `prompts/cross_reference.py` / `prompts/socratic.py`,
+> and a `gpt-4o` critic stage — all removed in the v2.0/v2.1 rewrite. The current app uses
+> a NiceGUI UI mounted on FastAPI and an iterative-accumulation ledger pipeline.
+> Kept for provenance only. **For the real architecture see [`/ARCHITECTURE.md`](../../ARCHITECTURE.md)
+> and [`/docs/pipeline.md`](../pipeline.md).**
+
+---
+
 # Study Assistant Implementation Plan - OpenAI Version
 
 This document guides an AI coding agent through iterative, section-by-section development of the study assistant using **OpenAI API** (gpt-4o, gpt-4o-mini, and whisper-1). Each phase is self-contained, includes acceptance criteria, and follows the original feasibility stages. Work strictly in order. After completing a phase, run the specified tests, verify acceptance criteria, then move to the next phase.

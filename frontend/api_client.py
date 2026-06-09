@@ -59,23 +59,11 @@ def _raise_for_payload(response: httpx.Response, label: str) -> None:
     raise RuntimeError(f"{label} failed: {detail}")
 
 
-async def upload(
+async def _post_upload(
     *,
-    video: dict[str, Any] | None,
-    video_url: str,
-    documents: list[dict[str, Any]],
+    files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+    data: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    files: list[tuple[str, tuple[str, bytes, str]]] = []
-    data: dict[str, str] = {}
-
-    if video is not None:
-        files.append(("video", (str(video["name"]), video["data"], str(video["mime_type"]))))
-    elif video_url.strip():
-        data["video_url"] = video_url.strip()
-
-    for doc in documents:
-        files.append(("documents", (str(doc["name"]), doc["data"], str(doc["mime_type"]))))
-
     async with httpx.AsyncClient(timeout=_request_timeout()) as client:
         response = await client.post(
             f"{base_url()}/upload",
@@ -85,6 +73,34 @@ async def upload(
         )
     _raise_for_payload(response, "/upload")
     return response.json()
+
+
+async def upload_document(*, name: str, mime_type: str, data: bytes) -> dict[str, Any]:
+    """Ingest one document immediately; return a JSON-safe {name, source_id} ref.
+
+    Uploading on add (instead of buffering bytes in tab storage) is what makes the
+    builder survive an alt-tab reconnect."""
+    payload = await _post_upload(files=[("documents", (name, data, mime_type))])
+    docs = payload.get("documents") or []
+    if not docs or int(docs[0].get("source_id", 0) or 0) <= 0:
+        raise RuntimeError("Upload did not return a document source id.")
+    return {"name": name, "source_id": int(docs[0]["source_id"])}
+
+
+async def upload_video_file(*, name: str, mime_type: str, data: bytes) -> dict[str, Any]:
+    payload = await _post_upload(files=[("video", (name, data, mime_type))])
+    source_id = int((payload.get("video") or {}).get("source_id", 0) or 0)
+    if source_id <= 0:
+        raise RuntimeError("Upload did not return a video source id.")
+    return {"name": name, "source_id": source_id, "kind": "file"}
+
+
+async def upload_video_url(url: str) -> dict[str, Any]:
+    payload = await _post_upload(data={"video_url": url.strip()})
+    source_id = int((payload.get("video") or {}).get("source_id", 0) or 0)
+    if source_id <= 0:
+        raise RuntimeError("Upload did not return a video source id.")
+    return {"name": url.strip(), "source_id": source_id, "kind": "youtube"}
 
 
 async def generate(*, video_source_id: int | None, document_source_ids: list[int]) -> dict[str, Any]:

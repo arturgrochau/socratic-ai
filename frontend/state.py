@@ -16,12 +16,16 @@ from nicegui import app
 # and scopes the local DB. No user-facing account concept.
 LOCAL_USER_ID = "local"
 
+# IMPORTANT: every value here must be JSON-serializable. NiceGUI serializes tab
+# storage on reconnect, so raw upload BYTES must never live here — files are
+# uploaded to the backend immediately and only their {name, source_id} reference
+# is kept (see frontend/pages/build.py). Storing bytes here was the cause of the
+# "alt-tab resets the page / not connected" bug.
 _TAB_DEFAULTS: dict[str, Any] = {
     "step": 1,                            # 1 = video, 2 = documents
     "video_mode": "YouTube link",         # or "Upload video"
-    "video_upload": None,                 # {"name","mime_type","data"}
-    "video_url": "",
-    "document_uploads": [],               # list of {"name","mime_type","data"}
+    "video_source": None,                 # {"name","source_id","kind":"file"|"youtube"} once uploaded
+    "document_sources": [],               # list of {"name","source_id"} once uploaded
     "pipeline_ready": False,
     "generation_result": None,
     "video_source_id": None,

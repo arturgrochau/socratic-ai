@@ -3,8 +3,8 @@
 Section roles, the ledger unit types they consume, their non-overlap rules, and
 their length budgets live here in one place rather than being scattered across
 prompt strings. The registry is rendered into a contract block that is injected
-into the consolidation (per-source) and synthesis (cross-source) prompts, and is
-also what the generic audit pass checks each section against.
+into the consolidation (per-source) and synthesis (cross-source) prompts, and its
+machine-checkable limits are what app/section_validator.py enforces in code.
 
 Ordering follows the cognitive arc:
   thesis -> mechanisms -> tradeoffs -> implications -> open questions -> glossary
@@ -12,7 +12,7 @@ Ordering follows the cognitive arc:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -23,8 +23,12 @@ class SectionSpec:
     role: str           # one-line cognitive contract
     consumes: tuple[str, ...]   # ledger unit types that feed it
     forbids: str        # explicit non-overlap rule injected into the prompt
-    budget: str         # length / shape contract
-    audit: tuple[str, ...] = dc_field(default_factory=tuple)  # audit rule keys
+    budget: str         # length / shape contract (prose, injected into the prompt)
+    # Machine-checkable limits consumed by app/section_validator.py (which
+    # replaced the old LLM audit pass — counting sentences is not a model's job).
+    max_sentences: int | None = None    # prose fields: hard sentence ceiling
+    max_items: int | None = None        # list fields: hard item ceiling
+    check_restatement: bool = False     # flag if this section restates an earlier one
 
 
 # Per-source arc (produced by one consolidation call, mapped onto
@@ -37,8 +41,8 @@ PER_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
         role="State the one load-bearing claim in the first sentence, then say why it matters.",
         consumes=("foundational",),
         forbids="No mechanism walk-throughs, no term definitions, no examples, no warm-up sentence.",
-        budget="At most 3 sentences. The first sentence is the claim itself.",
-        audit=("budget_paragraph",),
+        budget="2-5 sentences. The first sentence is the claim itself; the rest say why it matters.",
+        max_sentences=5,
     ),
     SectionSpec(
         id="mechanisms",
@@ -53,8 +57,9 @@ PER_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
             "Do NOT paraphrase or list every mechanism in the source; pick the few that carry the "
             "most weight. Do not restate the thesis. Do not define terms. No filler transitions."
         ),
-        budget="2-4 short paragraphs, one mechanism each. Omit the rest rather than pad.",
-        audit=("novelty",),
+        budget="3-6 short paragraphs, one mechanism each. Cover the ones that genuinely matter; omit the rest rather than pad.",
+        max_sentences=28,
+        check_restatement=True,
     ),
     SectionSpec(
         id="open_questions",
@@ -63,8 +68,9 @@ PER_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
         role="Name the 1-3 genuinely unresolved tensions, failure modes, or hidden assumptions, concretely.",
         consumes=("boundary", "open_question", "assumption"),
         forbids="Do not repeat mechanism explanations. Do not reassure or summarize. No generic caveats.",
-        budget="1 short paragraph, the few that actually matter.",
-        audit=("budget_paragraph", "novelty"),
+        budget="1-3 short paragraphs, the tensions that actually matter.",
+        max_sentences=12,
+        check_restatement=True,
     ),
     SectionSpec(
         id="glossary",
@@ -76,8 +82,8 @@ PER_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
             "Skip terms merely mentioned in passing or assumed-known; include a term only if the "
             "source explains it. No analogy unless the term is genuinely abstract."
         ),
-        budget="3-8 taught concepts. At most 2 short sentences total per term.",
-        audit=("glossary_budget",),
+        budget="Up to ~10 taught concepts. At most 2 short sentences total per term.",
+        max_items=10,
     ),
     SectionSpec(
         id="retrieval_practice",
@@ -90,8 +96,8 @@ PER_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
             "Do NOT reuse template stems like 'What if X changed?', 'What assumptions underlie X?', "
             "or 'What would happen if X weren't done?'; name the actual mechanism or decision."
         ),
-        budget="3-5 questions spanning at least 3 distinct cognitive operations.",
-        audit=("diversity",),
+        budget="4-6 questions spanning at least 3 distinct cognitive operations.",
+        max_items=6,
     ),
 )
 
@@ -114,7 +120,7 @@ CROSS_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
             "at least two different sources. Do not fabricate connections, do not pad to fill space."
         ),
         budget="2-3 tight paragraphs; only the 2-3 most significant grounded intersections.",
-        audit=("grounding",),
+        max_sentences=15,
     ),
     SectionSpec(
         id="operational_implications",
@@ -124,7 +130,7 @@ CROSS_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
         consumes=("mechanism", "tradeoff", "boundary"),
         forbids="No restating the comparison. Each scenario needs specific steps and a real pitfall.",
         budget="2 scenarios, the most useful ones.",
-        audit=(),
+        max_items=3,
     ),
     SectionSpec(
         id="cross_retrieval_practice",
@@ -142,7 +148,7 @@ CROSS_SOURCE_SECTIONS: tuple[SectionSpec, ...] = (
             "distractors are plausible positions. Vary the answer index."
         ),
         budget="3-4 four-option questions, each tied to a stated takeaway or intersection.",
-        audit=("diversity",),
+        max_items=4,
     ),
 )
 

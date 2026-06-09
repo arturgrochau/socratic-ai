@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from sqlalchemy import text
 
@@ -14,11 +15,9 @@ from app.models import (
 )
 from app.retrieval import build_context_text, retrieve_context
 import config
-from config import db_engine, get_aux_client, get_aux_model, get_llm_client
+from config import db_engine, get_llm_client
 from prompts import (
     CHAT_JSON_SCHEMA,
-    DEPTH_CLASSIFIER_JSON_SCHEMA,
-    DEPTH_CLASSIFIER_SYSTEM_PROMPT,
     build_chat_system_prompt,
     chat_context_scale,
 )
@@ -80,10 +79,27 @@ def _build_in_clause(values: list[int], prefix: str) -> tuple[str, dict[str, int
 
 
 def _truncate_text(text_value: str, max_chars: int) -> str:
+    """Shorten to <= max_chars, preferring a sentence boundary.
+
+    A blind character cut drops the back half of an enumeration ("A) ... and
+    B) ..." -> "A) ...") and feeds the model a clause fragment. Instead, greedily
+    keep whole sentences up to the budget; only hard-cut when the first sentence
+    alone already exceeds it."""
     normalized = " ".join(text_value.split())
     if len(normalized) <= max_chars:
         return normalized
-    return normalized[: max_chars - 3].rstrip() + "..."
+
+    budget = max_chars - 3  # leave room for the ellipsis
+    kept = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", normalized):
+        candidate = f"{kept} {sentence}".strip() if kept else sentence
+        if len(candidate) > budget:
+            break
+        kept = candidate
+
+    if not kept:  # first sentence overruns the budget on its own
+        kept = normalized[:budget].rstrip()
+    return kept.rstrip() + "..."
 
 
 # ---------------------------------------------------------------------------
@@ -216,40 +232,35 @@ def _load_generated_learning_context(
 
 
 # ---------------------------------------------------------------------------
-# Depth-tier classification (cheap aux pass)
+# Depth tier (pure heuristic — replaced an LLM classifier call per chat turn)
 # ---------------------------------------------------------------------------
+# The tier only scales how much context is assembled and the answer-length
+# budget; a keyword/length heuristic routes it as well as a model did, at zero
+# cost and zero latency. Misroutes degrade gracefully (slightly more or less
+# context), never break correctness.
+
+_DEEPEN_MARKERS = (
+    "deeper", "more detail", "elaborate", "expand", "go on", "tell me more",
+    "more depth", "keep going", "dig into",
+)
+_LOOKUP_PREFIXES = ("what is", "what's", "define", "who ", "when ", "where ", "which ")
+_ANALYZE_MARKERS = (
+    "compare", "contrast", "versus", " vs ", "trade-off", "tradeoff", "why ",
+    "synthesize", "relationship", "difference", "implication", "evaluate",
+    "critique", "analyze", "analyse",
+)
 
 
-_VALID_TIERS = ("lookup", "explain", "analyze", "deepen")
-
-
-def _classify_depth(
-    query: str,
-    recent_turns: list[InteractionTurnRecord],
-    user_id: str,
-) -> str:
+def _heuristic_depth(query: str, recent_turns: list[InteractionTurnRecord]) -> str:
     """Map a query to a length tier so the answer scope matches the question scope."""
-    recent_json = [turn.model_dump() for turn in recent_turns[-2:]]
-    user_prompt = (
-        f"Recent turns:\n{json.dumps(recent_json, ensure_ascii=True)}\n\n"
-        f"New question:\n{query}"
-    )
-    try:
-        result = get_aux_client().chat_json(
-            model=get_aux_model(),
-            system=DEPTH_CLASSIFIER_SYSTEM_PROMPT,
-            user=user_prompt,
-            json_schema=DEPTH_CLASSIFIER_JSON_SCHEMA,
-            temperature=0.0,
-        )
-        log_api_usage(
-            response=result.raw, user_id=user_id,
-            call_stage="interaction", model_name=get_aux_model(),
-        )
-        tier = str(safe_json_loads(result.content, default={}).get("tier", "")).strip()
-    except Exception:
-        tier = ""
-    return tier if tier in _VALID_TIERS else "explain"
+    q = " ".join(query.lower().split())
+    if recent_turns and any(marker in q for marker in _DEEPEN_MARKERS):
+        return "deepen"
+    if any(marker in q for marker in _ANALYZE_MARKERS) or len(q) > 200:
+        return "analyze"
+    if len(q) < 60 and any(q.startswith(p) for p in _LOOKUP_PREFIXES):
+        return "lookup"
+    return "explain"
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +342,7 @@ def handle_user_query(
 
     recent_turns = state.turns[-MAX_PROMPT_TURNS:]
 
-    tier = _classify_depth(normalized_query, recent_turns, user_id)
+    tier = _heuristic_depth(normalized_query, recent_turns)
     scale = chat_context_scale(tier)
     generated_context = _load_generated_learning_context(
         normalized_source_ids, user_id,

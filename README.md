@@ -45,11 +45,30 @@ It is built to do the opposite of what most AI study tools do. It does not summa
  │ Whisper  │    │ accumulate +      │    │ on top │
  │ + PDFs   │    │ consolidate + sx  │    │ of all │
  └──────────┘    └───────────────────┘    └────────┘
-   per source     ~5 calls per source       1 call /Q
+   per source    parallel map-reduce        1 call /Q
                   + 1 cross-source
 ```
 
-A 2-source session is ~11 LLM calls (all on `gpt-4o-mini`) and costs roughly **~$0.01** per run. Results are cached, so reopening a session is free.
+A 2-source session is ~12 LLM calls (all on `gpt-4o-mini`) that run in ~4 parallel waves and cost
+roughly **~$0.01** per run; chat is exactly one call per question. Results are cached, so reopening a
+session is free.
+
+### What's new in v2.2
+
+- **A single document is now a full learning artifact** — one source produces key takeaways, a
+  bigger-picture synthesis, practical "apply it" scenarios, and an interactive quiz (not just a few
+  short sections). Per-source sections are deeper too, while staying selective.
+- **Several times faster generation** — ledger extraction runs as parallel map-reduce (window calls
+  are concurrent and context-free, merged by code dedup — no more quadratic re-sending of the
+  accumulated ledger), all sources build concurrently, and the insights + quiz are two focused
+  parallel calls. A fresh run collapses from N serial round-trips to ~4.
+- **Fewer, smarter mini-model calls** — the section audit and the chat depth classifier are now pure
+  code (counting sentences and keyword-routing a tier are not a model's job); chat is exactly one LLM
+  call per turn; chunks embed in the background at ingest so the first chat answer retrieves instantly.
+- **Reliable uploads** — add a video (step 1) then documents (step 2); each file uploads the moment you
+  add it and only a lightweight reference is kept in the browser tab. Adding a document just works, and
+  alt-tabbing away no longer resets the page or drops the connection (generation also runs off the UI
+  thread).
 
 ### What's new in v2.1
 
@@ -100,7 +119,7 @@ Socratic AI is built on that premise. It does not answer your questions — it g
 
 </details>
 
-**Per-source analysis (iterative accumulation)** — the source text is split into chunks. The pipeline groups them into windows (2–3 chunks each) and walks through them. Each LLM call sees the entire accumulated analysis so far plus the next window, and is explicitly told not to repeat anything already covered. A final consolidation call structures the accumulated prose into:
+**Per-source analysis (iterative accumulation)** — the source text is split into chunks. The pipeline groups them into windows (3–4 chunks each) and walks through them. Each LLM call sees the entire accumulated analysis so far plus the next window, and is explicitly told not to repeat anything already covered. A final consolidation call structures the accumulated prose into:
 
 | Section | What it covers |
 |---|---|
@@ -129,6 +148,13 @@ FastAPI + NiceGUI  (one uvicorn process, port 8000)
         ├── ChromaDB         (vector embeddings for retrieval)
         └── LLMClient        (OpenAI by default; Ollama optional, switchable in Settings)
 ```
+
+### Documentation
+
+- [`AGENTS.md`](AGENTS.md) — how to run, test, and work in this repo (also linked as `CLAUDE.md`).
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — file-by-file map, data model, and the known-issues backlog.
+- [`docs/pipeline.md`](docs/pipeline.md) — the exact call-by-call runtime trace.
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records (why each major choice was made).
 
 ---
 

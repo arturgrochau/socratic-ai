@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import get_user_id
 from app.interaction import handle_user_query
@@ -17,10 +18,13 @@ async def ask_endpoint(
 ) -> AskResponse:
     try:
         user_id = get_user_id(http_request)
-        return handle_user_query(
-            query=request.query,
-            source_ids=request.source_ids,
-            session_id=request.session_id,
+        # Offload the synchronous, LLM-bound handler to a worker thread so it
+        # doesn't freeze the shared event loop (and the NiceGUI websocket).
+        return await run_in_threadpool(
+            handle_user_query,
+            request.query,
+            request.source_ids,
+            request.session_id,
             user_id=user_id,
             top_k=request.top_k,
         )

@@ -257,13 +257,13 @@ class _FakeClient:
         schema_name = json_schema.get("name", "") if json_schema else ""
         if schema_name == "ledger_extraction":
             return _FakeResult(content=json.dumps(_LEDGER_RESPONSE))
-        if schema_name == "section_audit":
-            # Always pass: keep the pipeline single-pass in the smoke test.
-            return _FakeResult(content=json.dumps({"ok": True, "violations": []}))
         if schema_name == "source_consolidation":
             return _FakeResult(content=json.dumps(_CONSOLIDATION_RESPONSE))
-        if schema_name == "cross_source_synthesis":
-            return _FakeResult(content=json.dumps(_SYNTHESIS_RESPONSE))
+        if schema_name == "synthesis_insights":
+            insights = {k: v for k, v in _SYNTHESIS_RESPONSE.items() if k != "questions"}
+            return _FakeResult(content=json.dumps(insights))
+        if schema_name == "quiz_generation":
+            return _FakeResult(content=json.dumps({"questions": _SYNTHESIS_RESPONSE["questions"]}))
         raise AssertionError(f"Unexpected schema name in smoke test: {schema_name!r}")
 
     def embed(self, *, model: str, inputs: list[str]) -> list[list[float]]:
@@ -387,9 +387,17 @@ class PipelineSmokeTests(unittest.TestCase):
                 f"Expected varied reflection depths; got {depths}",
             )
 
-            # Single-source path: no synthesis, but empty insights/quiz objects exist.
-            self.assertEqual(response.insights.synthesis_text, "")
-            self.assertEqual(response.quiz.questions, [])
+            # Single source now gets full enrichment: a quiz, apply-it scenarios,
+            # takeaways, and a bigger-picture synthesis — but no fabricated
+            # cross-source intersections.
+            self.assertTrue(response.insights.synthesis_text.strip(), "single-source synthesis empty")
+            self.assertTrue(response.quiz.questions, "single-source quiz empty")
+            self.assertTrue(response.insights.application_scenarios, "single-source applications empty")
+            self.assertTrue(response.insights.key_takeaways, "single-source takeaways empty")
+            self.assertEqual(
+                response.insights.intersections, [],
+                "a single source must not fabricate cross-source intersections",
+            )
 
     def test_two_document_synthesis(self) -> None:
         with TemporaryDirectory() as tmpdir:

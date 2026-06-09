@@ -42,12 +42,6 @@ SUPPORTED_YOUTUBE_HOSTS = {
     "www.youtu.be",
 }
 
-SUMMARY_SECTION_TITLES = {
-    "core thesis and scope": "Core Thesis and Scope",
-    "key mechanisms and how they work": "Key Mechanisms and How They Work",
-    "practical implications and limitations": "Practical Implications and Limitations",
-}
-
 
 # ── File / URL validation ─────────────────────────────────────────────────────
 def file_extension(filename: str) -> str:
@@ -95,10 +89,6 @@ def normalize_youtube_url(url_value: str) -> str:
             return candidate if tail else ""
 
     return ""
-
-
-def is_supported_youtube_url(url_value: str) -> bool:
-    return bool(normalize_youtube_url(url_value))
 
 
 def are_supported_document_names(filenames: list[str]) -> tuple[bool, list[str]]:
@@ -199,41 +189,6 @@ def format_long_prose_markdown(text_value: str, *, max_sentences_per_paragraph: 
         for index in range(0, len(sentences), paragraph_size)
     ]
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
-
-
-def parse_summary_sections(summary_text: str) -> list[tuple[str, str]]:
-    lines = str(summary_text or "").splitlines()
-    sections: list[tuple[str, str]] = []
-    current_title = ""
-    current_body: list[str] = []
-
-    def _normalize_heading(value: str) -> str:
-        cleaned = re.sub(r"^#{1,6}\s*", "", value.strip())
-        cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned.lower()).strip()
-        return cleaned
-
-    def _flush() -> None:
-        nonlocal current_title, current_body
-        body_text = "\n".join(current_body).strip()
-        if current_title and body_text:
-            sections.append((current_title, body_text))
-        current_title = ""
-        current_body = []
-
-    for line in lines:
-        stripped = line.strip()
-        normalized_heading = _normalize_heading(stripped)
-        canonical = SUMMARY_SECTION_TITLES.get(normalized_heading)
-        if canonical:
-            _flush()
-            current_title = canonical
-            continue
-
-        if current_title:
-            current_body.append(line)
-
-    _flush()
-    return sections
 
 
 # ── Chat / quiz prompt builders ───────────────────────────────────────────────
@@ -351,27 +306,30 @@ def resolve_source_label_map(video_payload: dict | None, document_payloads: list
     return label_map
 
 
-def should_show_cross_source_section(
+def should_show_enrichment_section(
     *,
     generation_result: dict,
     insights_payload: dict,
     quiz_payload: dict,
 ) -> bool:
-    source_ids = generation_result.get("source_ids") or []
-    if len(source_ids) < 2:
-        return False
+    """Whether to show the enrichment tab (quiz / applications / synthesis).
 
+    Now shown for ANY source count: a single document produces a quiz, apply-it
+    scenarios, and takeaways, so the section is no longer gated on >=2 sources.
+    """
     return any(
         [
             bool(insights_payload.get("intersections")),
-            bool(insights_payload.get("parallels")),
             bool(str(insights_payload.get("synthesis_text") or "").strip()),
-            bool(str(insights_payload.get("layman_bridge") or "").strip()),
-            bool(str(insights_payload.get("comparative_analysis") or "").strip()),
             bool(insights_payload.get("application_scenarios")),
+            bool(insights_payload.get("key_takeaways")),
             bool(quiz_payload.get("questions")),
         ]
     )
+
+
+# Backwards-compatible alias (older callers / tests).
+should_show_cross_source_section = should_show_enrichment_section
 
 
 # ── Export builders ───────────────────────────────────────────────────────────
@@ -434,13 +392,10 @@ def _build_source_export_markdown(section_payload: dict, *, fallback_title: str)
             if isinstance(point, dict):
                 question = normalize_continuous_text_for_display(str(point.get("question") or ""))
                 explanation = normalize_continuous_text_for_display(str(point.get("explanation") or ""))
-                reasoning_traps = normalize_continuous_text_for_display(str(point.get("reasoning_traps") or point.get("under_the_hood") or ""))
                 if question:
                     lines.append(f"{index}. {question}")
                 if explanation:
                     lines.append(f"   - Why: {explanation}")
-                if reasoning_traps:
-                    lines.append(f"   - Reasoning traps: {reasoning_traps}")
             else:
                 cleaned_point = normalize_continuous_text_for_display(str(point))
                 if cleaned_point:

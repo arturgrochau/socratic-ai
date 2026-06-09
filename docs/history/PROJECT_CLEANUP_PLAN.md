@@ -1,3 +1,11 @@
+> **⚠️ SUPERSEDED / HISTORICAL — references files that no longer exist.**
+> This early cleanup note talks about `socratic-ai` / `socratic_ai` bash launchers (replaced
+> by the `uv run socratic-ai` entry point + `run.py`) and `frontend/app.py` (replaced by the
+> `frontend/` package: `ui.py`, `format.py`, `pages/`, `components/`). Kept for provenance only.
+> **The current cleanup + documentation effort supersedes this — see [`/ARCHITECTURE.md`](../../ARCHITECTURE.md).**
+
+---
+
 # Project Cleanup Plan
 
 ## Scope

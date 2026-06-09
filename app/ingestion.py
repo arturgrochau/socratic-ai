@@ -54,12 +54,33 @@ SUPPORTED_YOUTUBE_HOSTS = {
 }
 RAW_CHUNK_TARGET_CHARS = 2400
 RAW_CHUNK_OVERLAP_CHARS = 320
-TRANSCRIPT_TEXT_PLACEHOLDER = "[chunked transcript stored in source_text_chunks]"
 WHISPER_MAX_REQUEST_BYTES = 24 * 1024 * 1024
 WHISPER_CHUNK_SECONDS = 540
 
 
 logger = logging.getLogger(__name__)
+
+# Strong refs so fire-and-forget embedding tasks aren't garbage-collected mid-run.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_background_embedding(source_ids: list[int], user_id: str) -> None:
+    """Embed the new sources' chunks in the background (never fails ingest)."""
+    from app.retrieval import upsert_retrieval_embeddings  # local: avoid import cycle at module load
+
+    async def _embed() -> None:
+        try:
+            count = await asyncio.to_thread(upsert_retrieval_embeddings, source_ids, user_id)
+            logger.info("Background-embedded %s chunk(s) for sources %s", count, source_ids)
+        except Exception:  # noqa: BLE001 — embedding is best-effort; lazy path covers misses
+            logger.warning("Background embedding failed for %s", source_ids, exc_info=True)
+
+    try:
+        task = asyncio.get_running_loop().create_task(_embed())
+    except RuntimeError:  # no running loop (sync test contexts) — lazy path will cover it
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def ensure_ingestion_tables() -> None:
@@ -92,34 +113,9 @@ def ensure_ingestion_tables() -> None:
                 """
             )
         )
-        connection.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS transcripts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id INTEGER NOT NULL,
-                    transcript_text TEXT NOT NULL,
-                    segments_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (source_id) REFERENCES sources(id)
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS document_pages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id INTEGER NOT NULL,
-                    page_number INTEGER NOT NULL,
-                    page_text TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (source_id) REFERENCES sources(id)
-                )
-                """
-            )
-        )
+        # NOTE: the old `transcripts` and `document_pages` tables were write-only
+        # (nothing ever read them) and are no longer created or written. All text
+        # lives in source_text_chunks, which carries timestamps and page numbers.
         connection.execute(
             text(
                 """
@@ -839,26 +835,9 @@ def store_video_transcript(
     transcript: TranscriptPayload,
 ) -> VideoIngestionRecord:
     transcript_chunks = build_transcript_chunks(transcript)
-    segments_json = json.dumps(
-        [segment.model_dump() for segment in transcript.segments],
-        ensure_ascii=True,
-    )
 
     with db_engine.begin() as connection:
         source_id = _insert_source_row(connection, user_id, "video", filename, mime_type)
-        connection.execute(
-            text(
-                """
-                INSERT INTO transcripts (source_id, transcript_text, segments_json)
-                VALUES (:source_id, :transcript_text, :segments_json)
-                """
-            ),
-            {
-                "source_id": source_id,
-                "transcript_text": TRANSCRIPT_TEXT_PLACEHOLDER,
-                "segments_json": segments_json,
-            },
-        )
         _store_source_chunks(
             connection=connection,
             user_id=user_id,
@@ -883,20 +862,6 @@ def store_document_pages(
     document_chunks = build_document_chunks(pages)
     with db_engine.begin() as connection:
         source_id = _insert_source_row(connection, user_id, "document", filename, mime_type)
-        for page in pages:
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO document_pages (source_id, page_number, page_text)
-                    VALUES (:source_id, :page_number, :page_text)
-                    """
-                ),
-                {
-                    "source_id": source_id,
-                    "page_number": page.page_number,
-                    "page_text": page.text,
-                },
-            )
         _store_source_chunks(
             connection=connection,
             user_id=user_id,
@@ -994,31 +959,39 @@ async def ingest_upload_bundle(
                 "or use documents-only mode for faster validation."
             ) from exc
 
-    # 4) PDF or note parsing
+    # 4) PDF or note parsing (off the event loop — PDF parsing is blocking)
     parsed_documents: list[tuple[UploadFile, list[DocumentPageText]]] = []
     for document_file, document_path in saved_documents:
-        pages = parse_document_text(document_path)
+        pages = await asyncio.to_thread(parse_document_text, document_path)
         parsed_documents.append((document_file, pages))
 
-    # 5) Storage
+    # 5) Storage (DB writes off the event loop)
     video_record: VideoIngestionRecord | None = None
     if transcript is not None and video_display_name is not None:
-        video_record = store_video_transcript(
-            user_id=user_id,
-            filename=video_display_name,
-            mime_type=video_mime_type,
-            transcript=transcript,
+        video_record = await asyncio.to_thread(
+            store_video_transcript,
+            user_id,
+            video_display_name,
+            video_mime_type,
+            transcript,
         )
 
     document_records: list[DocumentIngestionRecord] = []
     for document_file, pages in parsed_documents:
-        document_record = store_document_pages(
-            user_id=user_id,
-            filename=Path(document_file.filename or "document").name,
-            mime_type=document_file.content_type,
-            pages=pages,
+        document_record = await asyncio.to_thread(
+            store_document_pages,
+            user_id,
+            Path(document_file.filename or "document").name,
+            document_file.content_type,
+            pages,
         )
         document_records.append(document_record)
+
+    # Embed at ingest (fire-and-forget) so the first chat turn is instant.
+    # The lazy upsert in retrieval.retrieve_context remains as a safety net.
+    stored_ids = [r.source_id for r in ([video_record] if video_record else []) + document_records]
+    if stored_ids:
+        _schedule_background_embedding(stored_ids, user_id)
 
     return IngestionResponse(
         message="Ingestion completed successfully.",

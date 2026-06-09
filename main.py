@@ -46,4 +46,6 @@ ui.run_with(
     title="Socratic AI",
     favicon="🦉",
     storage_secret=os.getenv("SOCRATIC_STORAGE_SECRET", "socratic-ai-local-secret"),
+    # Tolerate brief disconnects (alt-tab, sleep) without purging per-tab state.
+    reconnect_timeout=float(os.getenv("SOCRATIC_RECONNECT_TIMEOUT", "20")),
 )

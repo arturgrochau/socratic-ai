@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import contextvars
 import json
+import threading
 import time
 import uuid
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, TypeVar
 
 from sqlalchemy import text
 
 from app.cost_logging import log_api_usage, log_generation_stage_event
 from app.json_reliability import parse_json_object, safe_json_loads
+from app.section_validator import validate_arc
 from app.session_logger import get_active_logger, session_log
 from app.ledger import (
     KnowledgeUnit,
@@ -40,25 +44,48 @@ from config import (
     get_llm_client,
 )
 from prompts import (
-    AUDIT_JSON_SCHEMA,
-    AUDIT_SYSTEM_PROMPT,
     CONSOLIDATION_JSON_SCHEMA,
     CONSOLIDATION_SYSTEM_PROMPT,
+    INSIGHTS_JSON_SCHEMA,
+    INSIGHTS_SYSTEM_PROMPT,
     LEDGER_EXTRACTION_JSON_SCHEMA,
     LEDGER_EXTRACTION_SYSTEM_PROMPT,
-    SYNTHESIS_JSON_SCHEMA,
-    SYNTHESIS_SYSTEM_PROMPT,
+    QUIZ_JSON_SCHEMA,
+    QUIZ_SYSTEM_PROMPT,
+    SINGLE_SOURCE_INSIGHTS_SYSTEM_PROMPT,
 )
 from prompts.sections import (
     CROSS_SOURCE_SECTIONS,
     PER_SOURCE_SECTIONS,
-    SectionSpec,
 )
 
 
-GENERATION_SCHEMA_VERSION = 15
-LEDGER_SCHEMA_VERSION = 1
+GENERATION_SCHEMA_VERSION = 17
+LEDGER_SCHEMA_VERSION = 2  # v2: parallel context-free window extraction (map-reduce)
 GENERATION_MAX_STAGE_ATTEMPTS = 3
+# Global cap on concurrent LLM calls (sources × windows can nest pools, so the
+# cap is enforced with a semaphore at the call site, not per pool).
+MAX_PARALLEL_LLM_CALLS = 8
+_llm_call_slots = threading.BoundedSemaphore(MAX_PARALLEL_LLM_CALLS)
+
+_T = TypeVar("_T")
+
+
+def _run_parallel(jobs: list[Callable[[], _T]]) -> list[_T]:
+    """Run blocking jobs concurrently, preserving order; re-raises the first error.
+
+    Each job is wrapped in a copy of the caller's contextvars so the active
+    session logger (a ContextVar) keeps working inside worker threads.
+    """
+    if not jobs:
+        return []
+    if len(jobs) == 1:
+        return [jobs[0]()]
+    wrapped = [
+        (lambda job=job, ctx=contextvars.copy_context(): ctx.run(job)) for job in jobs
+    ]
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_LLM_CALLS, len(jobs))) as pool:
+        return list(pool.map(lambda fn: fn(), wrapped))
 
 
 class GenerationStageError(RuntimeError):
@@ -109,13 +136,14 @@ def _run_structured_generation_step(
             attempt_number=attempt_number, status="started",
         )
         try:
-            result = client.chat_json(
-                model=model_name,
-                system=system_prompt,
-                user=user_prompt,
-                json_schema=response_schema,
-                temperature=0.0,
-            )
+            with _llm_call_slots:  # global concurrency cap across nested pools
+                result = client.chat_json(
+                    model=model_name,
+                    system=system_prompt,
+                    user=user_prompt,
+                    json_schema=response_schema,
+                    temperature=0.0,
+                )
             log_api_usage(
                 response=result.raw, user_id=user_id,
                 call_stage="generation", model_name=model_name,
@@ -232,6 +260,7 @@ def ensure_generation_tables() -> None:
             "schema_version": "INTEGER DEFAULT 1",
             "intersections_json": "TEXT DEFAULT '[]'",
             "application_scenarios_json": "TEXT DEFAULT '[]'",
+            "key_takeaways_json": "TEXT DEFAULT '[]'",
         }
         for col, col_type in combined_migrations.items():
             if col not in combined_columns:
@@ -315,26 +344,37 @@ def _extract_source_ledger(
     run_id: str,
     user_id: str,
 ) -> list[KnowledgeUnit]:
-    """Iterate windows, emitting deduped typed KnowledgeUnits into a ledger."""
+    """Map-reduce: extract every window in PARALLEL, then merge with code dedup.
+
+    Map calls are context-free (no prior ledger in the prompt), which removes the
+    old quadratic re-send of the accumulated ledger AND turns N serial round-trips
+    into one parallel batch. The reduce step is `append_units` — the same
+    token-overlap dedup the sequential design relied on — applied in window order
+    so unit ids stay deterministic.
+    """
+    def _extract_window(idx: int, window: str) -> Callable[[], dict[str, Any]]:
+        def job() -> dict[str, Any]:
+            user_prompt = (
+                f"Source: {source_name}\n\n"
+                f"=== Material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
+                "Extract the knowledge units this material teaches."
+            )
+            return _run_structured_generation_step(
+                run_id=run_id,
+                stage_name=f"ledger:{source_name}:{idx + 1}",
+                user_id=user_id,
+                system_prompt=LEDGER_EXTRACTION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                response_schema=LEDGER_EXTRACTION_JSON_SCHEMA,
+                required_keys=["units"],
+                use_aux=True,
+            )
+        return job
+
+    payloads = _run_parallel([_extract_window(idx, w) for idx, w in enumerate(windows)])
+
     ledger: list[KnowledgeUnit] = []
-    for idx, window in enumerate(windows):
-        prior = render_units(ledger) if ledger else "(empty - this is the first material)"
-        user_prompt = (
-            f"Source: {source_name}\n\n"
-            f"=== Ledger built from earlier material (do NOT restate these) ===\n{prior}\n\n"
-            f"=== New material (section {idx + 1} of {len(windows)}) ===\n{window}\n\n"
-            "Extract only genuinely new knowledge units from the new material."
-        )
-        payload = _run_structured_generation_step(
-            run_id=run_id,
-            stage_name=f"ledger:{source_name}:{idx + 1}",
-            user_id=user_id,
-            system_prompt=LEDGER_EXTRACTION_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_schema=LEDGER_EXTRACTION_JSON_SCHEMA,
-            required_keys=["units"],
-            use_aux=True,
-        )
+    for payload in payloads:  # window order => deterministic ids and dedup winner
         new_units = parse_units(payload.get("units", []), source_id, next_unit_id(ledger))
         append_units(ledger, new_units)
     return ledger
@@ -372,87 +412,11 @@ def _consolidate_ledger(
 
 
 # ---------------------------------------------------------------------------
-# Generic section audit (cheap aux passes, one re-gen on violation)
-# ---------------------------------------------------------------------------
-
-
-def _render_field_for_audit(value: Any) -> str:
-    if isinstance(value, str):
-        return value.strip()
-    if not isinstance(value, list):
-        return str(value)
-    parts: list[str] = []
-    for item in value:
-        if not isinstance(item, dict):
-            parts.append(str(item))
-        elif "term" in item:
-            parts.append(f"{item.get('term')}: {item.get('layman', '')} {item.get('technical', '')}")
-        elif "question" in item:
-            parts.append(
-                f"Q: {item.get('question')} | {item.get('explanation', '')} "
-                f"[{item.get('depth_level', '')}]"
-            )
-        else:
-            parts.append(json.dumps(item, ensure_ascii=True))
-    return "\n".join(parts)
-
-
-def _audit_arc(
-    specs: tuple[SectionSpec, ...],
-    structured: dict[str, Any],
-    *,
-    run_id: str,
-    user_id: str,
-) -> list[str]:
-    """Audit the whole arc in ONE aux call.
-
-    Sections are rendered in arc order with their contracts so the auditor can
-    check each against its own rules and against earlier sections for
-    restatement. Sections with no audit rules or empty content are skipped.
-    Replaces the former per-section loop (one call per section)."""
-    blocks: list[str] = []
-    for spec in specs:
-        if not spec.audit:
-            continue
-        field = spec.field.split("+")[0]
-        content = _render_field_for_audit(structured.get(field, ""))
-        if not content.strip():
-            continue
-        blocks.append(
-            f"### SECTION: {spec.title}\n"
-            f"ROLE: {spec.role}\n"
-            f"NON-OVERLAP RULE: {spec.forbids}\n"
-            f"LENGTH BUDGET: {spec.budget}\n"
-            f"CONTENT:\n{content}"
-        )
-
-    if not blocks:
-        return []
-
-    user_prompt = (
-        "Audit the following sections against their contracts. They are listed "
-        "in arc order, so each section's 'prior' material is everything above "
-        "it. Report only clear violations, each prefixed with its section title.\n\n"
-        + "\n\n".join(blocks)
-    )
-    payload = _run_structured_generation_step(
-        run_id=run_id,
-        stage_name="audit:arc",
-        user_id=user_id,
-        system_prompt=AUDIT_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        response_schema=AUDIT_JSON_SCHEMA,
-        required_keys=["ok", "violations"],
-        use_aux=True,
-    )
-    if payload.get("ok"):
-        return []
-    return [str(v).strip() for v in payload.get("violations", []) if str(v).strip()]
-
-
-# ---------------------------------------------------------------------------
 # Per-source section builder
 # ---------------------------------------------------------------------------
+# Section budgets/restatement are validated in pure code (app/section_validator
+# .validate_arc) — the former LLM audit call was paying a model to count
+# sentences and measure token overlap. One regen on violation, as before.
 
 
 def _build_source_learning_section(
@@ -492,9 +456,7 @@ def _build_source_learning_section(
     structured = _consolidate_ledger(
         ledger, source_name, run_id=run_id, user_id=user_id,
     )
-    violations = _audit_arc(
-        PER_SOURCE_SECTIONS, structured, run_id=run_id, user_id=user_id,
-    )
+    violations = validate_arc(PER_SOURCE_SECTIONS, structured)
     if violations:
         structured = _consolidate_ledger(
             ledger, source_name, run_id=run_id, user_id=user_id,
@@ -569,18 +531,82 @@ def _merge_source_ledgers(
 
 def _ground_intersections(
     raw_intersections: list[Any],
+    valid_source_ids: set[int],
 ) -> list[InsightIntersection]:
-    """Keep only intersections grounded in >=2 distinct source ids (anti-fabrication)."""
+    """Keep only intersections grounded in >=2 *real* distinct source ids.
+
+    Anti-fabrication, in two steps: first drop any attributed sentence citing a
+    source id that wasn't actually loaded for this run (a hallucinated id), then
+    require the surviving citations to span >=2 distinct sources. This rejects
+    both fabricated source ids and single-source 'intersections', and never
+    surfaces a fabricated attribution to the user."""
     grounded: list[InsightIntersection] = []
     for entry in raw_intersections:
         try:
             intersection = InsightIntersection.model_validate(entry)
         except Exception:
             continue
-        source_ids = {s.source_id for s in intersection.attributed_sentences}
+        real_sentences = [
+            s for s in intersection.attributed_sentences if s.source_id in valid_source_ids
+        ]
+        source_ids = {s.source_id for s in real_sentences}
         if len(source_ids) >= 2:
-            grounded.append(intersection)
+            grounded.append(
+                intersection.model_copy(update={"attributed_sentences": real_sentences})
+            )
     return grounded
+
+
+def _generate_quiz_payload(
+    rendered_ledger: str,
+    *,
+    run_id: str,
+    user_id: str,
+    legend: str | None,
+) -> dict[str, Any]:
+    """Focused quiz call. `legend` present => multi-source comparison questions."""
+    if legend is not None:
+        scope_line = (
+            "The ledger spans MULTIPLE sources; every question must test the "
+            "relationship between them.\n\n"
+            "=== SOURCE LEGEND ===\n" + legend + "\n\n"
+        )
+    else:
+        scope_line = (
+            "The ledger covers a SINGLE source; test its mechanisms, tradeoffs, "
+            "and boundaries.\n\n"
+        )
+    return _run_structured_generation_step(
+        run_id=run_id,
+        stage_name="quiz",
+        user_id=user_id,
+        system_prompt=QUIZ_SYSTEM_PROMPT,
+        user_prompt=(
+            scope_line + f"=== Knowledge ledger (id | type | source) ===\n{rendered_ledger}"
+        ),
+        response_schema=QUIZ_JSON_SCHEMA,
+        required_keys=["questions"],
+    )
+
+
+def _parse_quiz_questions(payload: dict[str, Any], *, max_questions: int = 4) -> list[QuizQuestion]:
+    questions: list[QuizQuestion] = []
+    for entry in payload.get("questions", []):
+        try:
+            questions.append(QuizQuestion.model_validate(entry))
+        except Exception:
+            continue
+    return questions[:max_questions]
+
+
+def _parse_scenarios(payload: dict[str, Any]) -> list[ApplicationScenario]:
+    scenarios: list[ApplicationScenario] = []
+    for entry in payload.get("application_scenarios", []):
+        try:
+            scenarios.append(ApplicationScenario.model_validate(entry))
+        except Exception:
+            continue
+    return scenarios
 
 
 def _generate_synthesis(
@@ -599,7 +625,7 @@ def _generate_synthesis(
         legend_lines.append(f"  source {section.source_id} = {prefix}: {section.generated_title}")
     legend = "\n".join(legend_lines) or "  (no named sources)"
 
-    def _run(extra_violations: list[str] | None) -> dict[str, Any]:
+    def _insights_call(extra_violations: list[str] | None = None) -> dict[str, Any]:
         user_prompt = (
             "Synthesize ACROSS the sources using only the following knowledge ledger. "
             "Every intersection must cite claims from at least two different sources via "
@@ -616,54 +642,104 @@ def _generate_synthesis(
             )
         return _run_structured_generation_step(
             run_id=run_id,
-            stage_name="synthesis",
+            stage_name="synthesis:insights",
             user_id=user_id,
-            system_prompt=SYNTHESIS_SYSTEM_PROMPT,
+            system_prompt=INSIGHTS_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            response_schema=SYNTHESIS_JSON_SCHEMA,
+            response_schema=INSIGHTS_JSON_SCHEMA,
             required_keys=[
-                "key_takeaways", "synthesis_text", "intersections",
-                "questions", "application_scenarios",
+                "key_takeaways", "synthesis_text", "intersections", "application_scenarios",
             ],
         )
 
-    payload = _run(None)
-    violations = _audit_arc(
-        CROSS_SOURCE_SECTIONS, payload, run_id=run_id, user_id=user_id,
-    )
+    # Insights and quiz are independent given the same ledger — run them in parallel.
+    insights_payload, quiz_payload = _run_parallel([
+        _insights_call,
+        lambda: _generate_quiz_payload(rendered, run_id=run_id, user_id=user_id, legend=legend),
+    ])
+
+    violations = validate_arc(CROSS_SOURCE_SECTIONS, insights_payload)
     if violations:
-        payload = _run(violations)
+        insights_payload = _insights_call(violations)
 
-    intersections = _ground_intersections(payload.get("intersections", []))
-
-    questions: list[QuizQuestion] = []
-    for entry in payload.get("questions", []):
-        try:
-            questions.append(QuizQuestion.model_validate(entry))
-        except Exception:
-            continue
-
-    application_scenarios: list[ApplicationScenario] = []
-    for entry in payload.get("application_scenarios", []):
-        try:
-            application_scenarios.append(ApplicationScenario.model_validate(entry))
-        except Exception:
-            continue
-
+    valid_source_ids = {section.source_id for section in source_sections}
+    intersections = _ground_intersections(
+        insights_payload.get("intersections", []), valid_source_ids
+    )
     key_takeaways = [
-        str(t).strip() for t in (payload.get("key_takeaways") or []) if str(t).strip()
+        str(t).strip() for t in (insights_payload.get("key_takeaways") or []) if str(t).strip()
     ][:3]
 
     insights = CombinedInsightSection(
         key_takeaways=key_takeaways,
-        synthesis_text=str(payload.get("synthesis_text", "")).strip(),
+        synthesis_text=str(insights_payload.get("synthesis_text", "")).strip(),
         intersections=intersections,
-        application_scenarios=application_scenarios,
+        application_scenarios=_parse_scenarios(insights_payload),
         model_name=config.generation_model(),
         schema_version=GENERATION_SCHEMA_VERSION,
     )
     quiz = CombinedQuizSection(
-        questions=questions,
+        questions=_parse_quiz_questions(quiz_payload),
+        model_name=config.generation_model(),
+        schema_version=GENERATION_SCHEMA_VERSION,
+    )
+    return insights, quiz
+
+
+def _generate_single_source_deepening(
+    section: SourceLearningSection,
+    *,
+    run_id: str,
+    user_id: str,
+) -> tuple[CombinedInsightSection, CombinedQuizSection]:
+    """Deepen a lone source into takeaways + bigger-picture + apply-it scenarios +
+    a quiz, grounded in that one ledger. This is what makes a single document a
+    full learning artifact instead of a dead end. No cross-source intersections.
+
+    Insights and quiz are two focused calls run in parallel (same wall-clock as
+    one call; better per-artifact quality from a mini model)."""
+    units = load_ledger(
+        user_id=user_id, source_id=section.source_id, schema_version=LEDGER_SCHEMA_VERSION,
+    ) or []
+    rendered = render_units(units)
+
+    def _insights_call() -> dict[str, Any]:
+        user_prompt = (
+            f"Source: {section.generated_title}\n\n"
+            "Deepen this single source into key takeaways, a short bigger-picture "
+            "reflection, and apply-it scenarios, using only the following knowledge "
+            "ledger. Set intersections to an empty array.\n\n"
+            f"=== Knowledge ledger (id | type | source) ===\n{rendered}"
+        )
+        return _run_structured_generation_step(
+            run_id=run_id,
+            stage_name="deepening:insights",
+            user_id=user_id,
+            system_prompt=SINGLE_SOURCE_INSIGHTS_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            response_schema=INSIGHTS_JSON_SCHEMA,
+            required_keys=["key_takeaways", "synthesis_text", "application_scenarios"],
+        )
+
+    insights_payload, quiz_payload = _run_parallel([
+        _insights_call,
+        lambda: _generate_quiz_payload(rendered, run_id=run_id, user_id=user_id, legend=None),
+    ])
+
+    key_takeaways = [
+        str(t).strip() for t in (insights_payload.get("key_takeaways") or []) if str(t).strip()
+    ][:3]
+
+    insights = CombinedInsightSection(
+        key_takeaways=key_takeaways,
+        synthesis_text=str(insights_payload.get("synthesis_text", "")).strip(),
+        intersections=[],
+        application_scenarios=_parse_scenarios(insights_payload),
+        model_name=config.generation_model(),
+        schema_version=GENERATION_SCHEMA_VERSION,
+    )
+    quiz = CombinedQuizSection(
+        questions=_parse_quiz_questions(quiz_payload),
         model_name=config.generation_model(),
         schema_version=GENERATION_SCHEMA_VERSION,
     )
@@ -815,12 +891,12 @@ def _store_combined_learning_sections(
                 INSERT INTO combined_learning_sections (
                     user_id, video_source_id, document_source_ids_json,
                     intersections_json, parallels_json, layman_bridge,
-                    synthesis_text, application_scenarios_json,
+                    synthesis_text, application_scenarios_json, key_takeaways_json,
                     quiz_json, schema_version, model_name
                 ) VALUES (
                     :user_id, :video_source_id, :document_source_ids_json,
                     :intersections_json, :parallels_json, :layman_bridge,
-                    :synthesis_text, :application_scenarios_json,
+                    :synthesis_text, :application_scenarios_json, :key_takeaways_json,
                     :quiz_json, :schema_version, :model_name
                 )
                 ON CONFLICT(user_id, video_source_id, document_source_ids_json) DO UPDATE SET
@@ -829,6 +905,7 @@ def _store_combined_learning_sections(
                     layman_bridge = excluded.layman_bridge,
                     synthesis_text = excluded.synthesis_text,
                     application_scenarios_json = excluded.application_scenarios_json,
+                    key_takeaways_json = excluded.key_takeaways_json,
                     quiz_json = excluded.quiz_json,
                     schema_version = excluded.schema_version,
                     model_name = excluded.model_name,
@@ -841,12 +918,15 @@ def _store_combined_learning_sections(
                 "intersections_json": json.dumps(
                     [e.model_dump() for e in insights.intersections], ensure_ascii=True,
                 ),
+                # Legacy v1.x columns (NOT NULL in existing DBs): written as inert
+                # constants; nothing reads them. Dropping needs a real migration.
                 "parallels_json": "[]",
                 "layman_bridge": "",
                 "synthesis_text": insights.synthesis_text,
                 "application_scenarios_json": json.dumps(
                     [e.model_dump() for e in insights.application_scenarios], ensure_ascii=True,
                 ),
+                "key_takeaways_json": json.dumps(insights.key_takeaways, ensure_ascii=True),
                 "quiz_json": json.dumps(quiz.model_dump(), ensure_ascii=True),
                 "schema_version": GENERATION_SCHEMA_VERSION,
                 "model_name": config.generation_model(),
@@ -864,7 +944,7 @@ def _load_cached_combined_learning_sections(
         row = connection.execute(
             text("""
                 SELECT intersections_json, synthesis_text,
-                       application_scenarios_json, quiz_json,
+                       application_scenarios_json, key_takeaways_json, quiz_json,
                        model_name, schema_version
                 FROM combined_learning_sections
                 WHERE user_id = :user_id
@@ -891,9 +971,6 @@ def _load_cached_combined_learning_sections(
         except Exception:
             continue
 
-    if not intersections:
-        return None
-
     application_scenarios: list[ApplicationScenario] = []
     for entry in safe_json_loads(row.get("application_scenarios_json"), default=[]):
         try:
@@ -907,8 +984,21 @@ def _load_cached_combined_learning_sections(
     except Exception:
         return None
 
+    key_takeaways = [
+        str(t).strip()
+        for t in safe_json_loads(row.get("key_takeaways_json"), default=[])
+        if str(t).strip()
+    ]
+    synthesis_text = str(row["synthesis_text"] or "").strip()
+
+    # A valid cached artifact has *some* content. For a single source there are no
+    # intersections, so accept the row if it has a quiz, takeaways, or synthesis.
+    if not (intersections or quiz_section.questions or synthesis_text or key_takeaways):
+        return None
+
     insights_section = CombinedInsightSection(
-        synthesis_text=str(row["synthesis_text"] or "").strip(),
+        key_takeaways=key_takeaways,
+        synthesis_text=synthesis_text,
         intersections=intersections,
         application_scenarios=application_scenarios,
         model_name=str(row["model_name"]),
@@ -964,55 +1054,56 @@ def generate_tailored_learning(
             ),
         )
 
-        video_section = (
-            _build_source_learning_section(normalized_video_id, user_id, run_id)
-            if normalized_video_id is not None
-            else None
+        # Sources are independent — build every section concurrently. (Each one
+        # upserts rows keyed by (user_id, source_id), so writes don't collide.)
+        ordered_ids: list[int] = (
+            ([normalized_video_id] if normalized_video_id is not None else [])
+            + normalized_document_ids
         )
-        document_sections = [
-            _build_source_learning_section(sid, user_id, run_id)
-            for sid in normalized_document_ids
-        ]
+        built_sections = _run_parallel([
+            (lambda sid=sid: _build_source_learning_section(sid, user_id, run_id))
+            for sid in ordered_ids
+        ])
+        by_id = dict(zip(ordered_ids, built_sections))
+
+        video_section = by_id.get(normalized_video_id) if normalized_video_id is not None else None
+        document_sections = [by_id[sid] for sid in normalized_document_ids]
 
         all_sections = ([video_section] if video_section else []) + document_sections
         if not all_sections:
             raise ValueError("No source learning sections were generated.")
 
-        total_sources = len(all_sections)
-        if total_sources >= 2:
-            cached_combined = None
-            if CACHE_PROCESSED_SOURCES and normalized_video_id is not None:
-                cached_combined = _load_cached_combined_learning_sections(
-                    user_id=user_id,
-                    video_source_id=normalized_video_id,
-                    document_source_ids=normalized_document_ids,
-                )
+        # Both single- and multi-source runs produce an enrichment artifact
+        # (takeaways + bigger picture + apply-it scenarios + quiz). Caching uses a
+        # sentinel video id of 0 when there is no video, so docs-only runs cache too.
+        cache_video_key = normalized_video_id if normalized_video_id is not None else 0
+        cached_combined = None
+        if CACHE_PROCESSED_SOURCES:
+            cached_combined = _load_cached_combined_learning_sections(
+                user_id=user_id,
+                video_source_id=cache_video_key,
+                document_source_ids=normalized_document_ids,
+            )
 
-            if cached_combined is not None:
-                insights_section, quiz_section = cached_combined
-            else:
+        if cached_combined is not None:
+            insights_section, quiz_section = cached_combined
+        else:
+            if len(all_sections) >= 2:
                 insights_section, quiz_section = _generate_synthesis(
                     all_sections, run_id=run_id, user_id=user_id,
                 )
-                if normalized_video_id is not None:
-                    _store_combined_learning_sections(
-                        user_id=user_id,
-                        video_source_id=normalized_video_id,
-                        document_source_ids=normalized_document_ids,
-                        insights=insights_section,
-                        quiz=quiz_section,
-                    )
-        else:
-            insights_section = CombinedInsightSection(
-                synthesis_text="",
-                intersections=[],
-                application_scenarios=[],
-                model_name=config.generation_model(),
-            )
-            quiz_section = CombinedQuizSection(
-                questions=[],
-                model_name=config.generation_model(),
-            )
+            else:
+                insights_section, quiz_section = _generate_single_source_deepening(
+                    all_sections[0], run_id=run_id, user_id=user_id,
+                )
+            if CACHE_PROCESSED_SOURCES:
+                _store_combined_learning_sections(
+                    user_id=user_id,
+                    video_source_id=cache_video_key,
+                    document_source_ids=normalized_document_ids,
+                    insights=insights_section,
+                    quiz=quiz_section,
+                )
 
         return GenerateTailoredLearningResponse(
             status_message="Tailored Socratic learning generated successfully.",

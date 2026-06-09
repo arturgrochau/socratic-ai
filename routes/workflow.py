@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import get_user_id
 from app.generation import GenerationStageError, generate_tailored_learning
@@ -20,10 +21,14 @@ async def generate_tailored_learning_endpoint(
 ) -> GenerateTailoredLearningResponse:
     try:
         user_id = get_user_id(http_request)
-        return generate_tailored_learning(
-            video_source_id=request.video_source_id,
-            document_source_ids=request.document_source_ids,
-            user_id=user_id,
+        # Generation is synchronous and slow (many LLM calls). Run it in a worker
+        # thread so it never blocks the shared event loop that also serves the
+        # NiceGUI websocket — otherwise the UI shows "not connected" mid-run.
+        return await run_in_threadpool(
+            generate_tailored_learning,
+            request.video_source_id,
+            request.document_source_ids,
+            user_id,
         )
     except GenerationStageError as exc:
         raise HTTPException(

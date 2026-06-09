@@ -29,23 +29,27 @@ def render_dashboard() -> None:
     insights_payload = generation_result.get("insights", {}) or {}
     quiz_payload = generation_result.get("quiz", {}) or {}
 
-    show_cross = fmt.should_show_cross_source_section(
+    show_enrichment = fmt.should_show_enrichment_section(
         generation_result=generation_result,
         insights_payload=insights_payload,
         quiz_payload=quiz_payload,
     )
+    source_count = len(generation_result.get("source_ids") or [])
+    is_single_source = source_count < 2
+    # One source -> quiz + apply-it scenarios; many -> cross-source synthesis.
+    enrichment_tab = "Quiz & Applications" if is_single_source else "Cross-Source"
 
     with ui.tabs().classes("w-full") as tabs:
         if video_payload:
             ui.tab("Video")
         if document_payloads:
             ui.tab("Documents")
-        if show_cross:
-            ui.tab("Cross-Source")
+        if show_enrichment:
+            ui.tab(enrichment_tab)
         ui.tab("Socratic Chat")
 
-    # Default to the most useful starting tab (cross-source if present, else first).
-    default_tab = "Cross-Source" if show_cross else ("Video" if video_payload else (
+    # Default to the most useful starting tab (enrichment if present, else first).
+    default_tab = enrichment_tab if show_enrichment else ("Video" if video_payload else (
         "Documents" if document_payloads else "Socratic Chat"))
 
     # Lets the quiz hand off into the chat tab, seeding it with a question.
@@ -76,9 +80,12 @@ def render_dashboard() -> None:
                             with ui.tab_panel(f"Doc {index}"):
                                 render_source_learning_section(section)
 
-        if show_cross:
-            with ui.tab_panel("Cross-Source"):
-                render_cross_source(insights_payload, quiz_payload, on_discuss=on_discuss)
+        if show_enrichment:
+            with ui.tab_panel(enrichment_tab):
+                render_cross_source(
+                    insights_payload, quiz_payload,
+                    on_discuss=on_discuss, single_source=is_single_source,
+                )
 
         with ui.tab_panel("Socratic Chat"):
             chat_handle["refresh"] = build_chat_panel()

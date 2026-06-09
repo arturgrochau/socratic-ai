@@ -40,13 +40,6 @@ def render_source_learning_section(section: dict[str, Any]) -> None:
         if deep_parts:
             ui.label("Deep Dive").classes("text-lg font-semibold mt-2")
             ui.markdown(fmt.format_long_prose_markdown("\n\n".join(deep_parts), max_sentences_per_paragraph=4))
-            checklist = section.get("diagnostic_checklist", []) or []
-            if checklist:
-                with ui.expansion("Read more").classes("w-full"):
-                    for item in checklist:
-                        cleaned = fmt.normalize_continuous_text_for_display(str(item))
-                        if cleaned:
-                            ui.markdown(f"- {cleaned}")
 
         # Key concepts (layman + technical collapsibles)
         key_terms = [str(t) for t in (section.get("key_terms", []) or [])]
@@ -86,19 +79,10 @@ def _render_reflection_points(reflection_points: list[Any]) -> None:
             continue
         question = str(point.get("question", "")).strip()
         explanation = str(point.get("explanation", "")).strip()
-        reasoning_traps = str(point.get("reasoning_traps") or point.get("under_the_hood") or "").strip()
 
         ui.markdown(f"**Q{index}. {question}**")
         if explanation:
             ui.markdown(fmt.format_long_prose_markdown(explanation))
-        if reasoning_traps:
-            with ui.expansion("Read more").classes("w-full"):
-                ui.markdown(
-                    fmt.format_long_prose_markdown(
-                        fmt.normalize_continuous_text_for_display(reasoning_traps),
-                        max_sentences_per_paragraph=4,
-                    )
-                )
 
 
 def render_cross_source(
@@ -106,11 +90,25 @@ def render_cross_source(
     quiz: dict[str, Any],
     *,
     on_discuss: Callable[[str], None],
+    single_source: bool = False,
 ) -> None:
-    ui.label("Cross-Source Synthesis").classes("text-xl font-semibold")
-    ui.label("Synthesized across your sources (AI inference, not a quote).").classes(
-        "text-xs text-gray-400 -mt-2"
-    )
+    if single_source:
+        ui.label("Quiz & Applications").classes("text-xl font-semibold")
+        ui.label("Going deeper on this source: takeaways, where it applies, and a quiz.").classes(
+            "text-xs text-gray-400 -mt-2"
+        )
+        synthesis_caption = "The bigger picture (AI inference, not a quote)."
+        quiz_caption = "Built from this source. Pick an answer to lock it in — no retries; wrong picks explain the trap."
+    else:
+        ui.label("Cross-Source Synthesis").classes("text-xl font-semibold")
+        ui.label("Synthesized across your sources (AI inference, not a quote).").classes(
+            "text-xs text-gray-400 -mt-2"
+        )
+        synthesis_caption = ""
+        quiz_caption = (
+            "Study aid built from the synthesis. Pick an answer to lock it in — no retries; "
+            "wrong picks explain the trap."
+        )
 
     # Hierarchy: the 1-3 headline takeaways first.
     takeaways = [str(t).strip() for t in (insights.get("key_takeaways") or []) if str(t).strip()]
@@ -124,11 +122,35 @@ def render_cross_source(
         fmt.strip_source_artifacts(str(insights.get("synthesis_text", "")))
     )
     if synthesis_text:
+        if synthesis_caption:
+            ui.label(synthesis_caption).classes("text-xs text-gray-400")
         ui.markdown(fmt.format_long_prose_markdown(synthesis_text, max_sentences_per_paragraph=4))
 
+    _render_application_scenarios(insights.get("application_scenarios") or [])
+
     ui.label("Quiz").classes("text-lg font-semibold mt-3")
-    ui.label(
-        "Study aid built from the synthesis. Pick an answer to lock it in — no retries; "
-        "wrong picks explain the trap."
-    ).classes("text-sm text-gray-500")
+    ui.label(quiz_caption).classes("text-sm text-gray-500")
     render_quiz(quiz, on_discuss=on_discuss)
+
+
+def _render_application_scenarios(scenarios: list[Any]) -> None:
+    """Render apply-it scenarios (previously generated but never displayed)."""
+    scenarios = [s for s in scenarios if isinstance(s, dict)]
+    if not scenarios:
+        return
+    ui.label("Apply it").classes("text-lg font-semibold mt-3")
+    ui.label("Transfer the ideas to a concrete situation.").classes("text-sm text-gray-500")
+    for scenario in scenarios:
+        title = str(scenario.get("scenario_title", "")).strip()
+        prompt = fmt.normalize_continuous_text_for_display(str(scenario.get("scenario_prompt", "")))
+        steps = [str(s).strip() for s in (scenario.get("transfer_steps") or []) if str(s).strip()]
+        pitfall = fmt.normalize_continuous_text_for_display(str(scenario.get("common_pitfall", "")))
+        with ui.card().classes("w-full"):
+            if title:
+                ui.label(title).classes("font-semibold")
+            if prompt:
+                ui.markdown(prompt)
+            if steps:
+                ui.markdown("\n".join(f"{i}. {s}" for i, s in enumerate(steps, start=1)))
+            if pitfall:
+                ui.markdown(f"**Watch out:** {pitfall}")

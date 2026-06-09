@@ -36,3 +36,9 @@ logs/
 
 # Build dumps (PyInstaller output etc.)
 export/
+
+# Local academic submission materials (not part of the app)
+a2/
+
+# Per-machine Claude Code session settings
+.claude/

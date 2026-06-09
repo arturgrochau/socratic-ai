@@ -3,7 +3,7 @@ Failure-mode catalog: rules over session telemetry that map to remediation hints
 
 Every check reads from:
   * `logs/sessions/<run_id>.jsonl` — emitted by app.session_logger
-  * DB tables (api_call_usage, generation_stage_events, generation_novelty_ledger)
+  * DB tables (api_call_usage, generation_stage_events)
 
 Each check returns a CheckResult with a status (pass | warn | fail) and a
 remediation hint pointing at a specific config knob or prompt file. Used both
@@ -13,6 +13,7 @@ e2e pytest (fails the test on `status == "fail"`).
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,10 @@ from sqlalchemy import text
 
 
 Status = Literal["pass", "warn", "fail"]
+
+# Soft warning ceiling on total tokens per diagnostic run. (Used to be imported
+# from config, where it no longer exists — that import crashed this check.)
+DIAGNOSTIC_TOKEN_CEILING = int(os.getenv("DIAGNOSTIC_TOKEN_CEILING", "60000"))
 
 
 @dataclass
@@ -190,8 +195,6 @@ def check_token_budget(rows: list[dict[str, Any]], db_engine: Any, run_id: str) 
     or outside that context). So we go directly to api_call_usage which
     log_api_usage always writes to, regardless of session_logger state.
     """
-    from config import DIAGNOSTIC_TOKEN_CEILING
-
     session_start = next((r for r in rows if r.get("stage") == "session_start"), None)
     user_id = (session_start or {}).get("user_id", "unknown")
     # The harness sets the run-specific started_at into session_start.started_at.

@@ -32,11 +32,19 @@ async def test_skip_video_requires_document(user) -> None:
     await user.should_see("Upload a document above to enable Generate.")
 
 
-async def test_document_upload_lands_and_enables_generate(user) -> None:
-    # Regression guard for the NiceGUI 3.x upload-event API: a real upload must
-    # register and flip Generate from disabled to enabled.
+async def test_document_upload_lands_and_enables_generate(user, monkeypatch) -> None:
+    # Regression guard for the NiceGUI 3.x upload-event API AND the upload-on-add
+    # flow: a real upload must ingest (mocked here, since the in-process User
+    # simulation can't reach the loopback HTTP backend) and flip Generate on.
     from nicegui import ui
     from nicegui.elements.upload_files import SmallFileUpload
+
+    from frontend import api_client
+
+    async def _fake_upload_document(*, name: str, mime_type: str, data: bytes) -> dict:
+        return {"name": name, "source_id": 1}
+
+    monkeypatch.setattr(api_client, "upload_document", _fake_upload_document)
 
     await user.open("/")
     await user.should_see("Skip video →")
