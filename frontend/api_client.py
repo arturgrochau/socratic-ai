@@ -6,7 +6,9 @@ boundary and reuses the routes' validation, error mapping, and auth header.
 """
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -123,6 +125,26 @@ async def ask(*, session_id: str, source_ids: list[int], query: str, top_k: int 
         )
     _raise_for_payload(response, "/ask")
     return response.json()
+
+
+async def ask_stream(
+    *, session_id: str, source_ids: list[int], query: str, top_k: int = 8
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield the NDJSON events of POST /ask/stream: {"delta"}..., {"done"} or {"error"}."""
+    async with httpx.AsyncClient(timeout=_request_timeout()) as client:
+        async with client.stream(
+            "POST",
+            f"{base_url()}/ask/stream",
+            json={"session_id": session_id, "source_ids": source_ids, "query": query, "top_k": top_k},
+            headers=_headers(),
+        ) as response:
+            if response.status_code >= 400:
+                await response.aread()
+                _raise_for_payload(response, "/ask/stream")
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
 
 
 async def get_settings() -> dict[str, Any]:

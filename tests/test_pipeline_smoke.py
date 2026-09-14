@@ -15,7 +15,7 @@ from __future__ import annotations
 import importlib
 import json
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -399,6 +399,23 @@ class PipelineSmokeTests(unittest.TestCase):
                 response.insights.intersections, [],
                 "a single source must not fabricate cross-source intersections",
             )
+
+            # Cache is keyed by provider+model: the same source under a different
+            # provider must miss (and regenerate) instead of serving the other
+            # model's pack; switching back hits again.
+            self.assertEqual(doc.model_name, gen_mod.cache_model_tag())
+            self.assertIsNotNone(gen_mod._load_cached_source_learning_section(source_id, user_id))
+            other = replace(config_mod.get_settings(), llm_provider="openai")
+            config_mod.apply_settings(other, persist=False)
+            try:
+                self.assertIsNone(gen_mod._load_cached_source_learning_section(
+                    user_id=user_id, source_id=source_id,
+                ))
+            finally:
+                config_mod.apply_settings(
+                    replace(other, llm_provider="ollama"), persist=False,
+                )
+            self.assertIsNotNone(gen_mod._load_cached_source_learning_section(source_id, user_id))
 
     def test_two_document_synthesis(self) -> None:
         with TemporaryDirectory() as tmpdir:

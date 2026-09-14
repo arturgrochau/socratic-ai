@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import text
 
 import config
 from app.cost_logging import log_api_usage
 from app.json_reliability import safe_json_loads
+from app.llm_client import ChatResult, StreamState
 from app.models import (
     AskModelOutput,
     AskResponse,
@@ -289,45 +293,19 @@ def _heuristic_depth(query: str, recent_turns: list[InteractionTurnRecord]) -> s
 # ---------------------------------------------------------------------------
 
 
-def _run_chat_completion(
+def _chat_user_prompt(
     query: str,
     context_text: str,
     generated_context: str,
     recent_turns: list[InteractionTurnRecord],
-    user_id: str,
-    tier: str,
-) -> AskModelOutput:
+) -> str:
     recent_turns_json = [turn.model_dump() for turn in recent_turns]
-    client = get_llm_client()
-
-    user_prompt = (
+    return (
         f"User query:\n{query}\n\n"
         f"Generated learning context:\n{generated_context or '[None available]'}\n\n"
         f"Retrieved grounded context:\n{context_text}\n\n"
         f"Recent conversation turns:\n{json.dumps(recent_turns_json, ensure_ascii=True)}"
     )
-
-    result = client.chat_json(
-        model=config.chat_model(),
-        system=build_chat_system_prompt(tier),
-        user=user_prompt,
-        json_schema=CHAT_JSON_SCHEMA,
-        temperature=0.3,
-    )
-    # Pass the ChatResult (which always carries usage), not the raw provider
-    # payload — Ollama's raw dict has no `usage` key, which nulled telemetry.
-    log_api_usage(
-        response=result,
-        user_id=user_id,
-        call_stage="interaction",
-        model_name=config.chat_model(),
-    )
-
-    content = result.content
-    if not content:
-        raise RuntimeError("Chat model returned an empty response.")
-
-    return AskModelOutput.model_validate_json(content)
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +313,32 @@ def _run_chat_completion(
 # ---------------------------------------------------------------------------
 
 
-def handle_user_query(
+@dataclass
+class TurnPlan:
+    """Everything a chat turn needs before the model is called: validated
+    inputs, the loaded session, the depth tier and the assembled prompt."""
+
+    state: InteractionSessionState
+    query: str
+    tier: str
+    system_prompt: str
+    user_prompt: str
+    user_id: str
+
+
+def prepare_turn(
     query: str,
     source_ids: list[int],
     session_id: str,
     *,
     user_id: str,
     top_k: int = 8,
-) -> AskResponse:
+    plain_output: bool = False,
+) -> TurnPlan:
+    """Validate, load the session, retrieve context and build the prompt.
+
+    Shared by the JSON (`handle_user_query`) and streaming (`stream_user_query`)
+    paths so both stay identical up to the model call."""
     ensure_interaction_tables()
 
     normalized_source_ids = _normalize_source_ids(source_ids)
@@ -390,30 +386,93 @@ def handle_user_query(
     else:
         context_text = "[No retrieval results]"
 
-    model_output = _run_chat_completion(
+    return TurnPlan(
+        state=state,
         query=normalized_query,
-        context_text=context_text,
-        generated_context=generated_context,
-        recent_turns=recent_turns,
-        user_id=user_id,
         tier=tier,
+        system_prompt=build_chat_system_prompt(tier, plain=plain_output),
+        user_prompt=_chat_user_prompt(normalized_query, context_text, generated_context, recent_turns),
+        user_id=user_id,
     )
 
-    answer = (model_output.answer or "").strip()
-    if not answer:
-        answer = (
-            "Your uploaded materials do not appear to cover this directly. "
-            "Try rephrasing the question against something specific from the lecture or document."
-        )
 
-    state.turns.append(InteractionTurnRecord(query=normalized_query, answer=answer))
+_EMPTY_ANSWER_FALLBACK = (
+    "Your uploaded materials do not appear to cover this directly. "
+    "Try rephrasing the question against something specific from the lecture or document."
+)
+
+
+def finish_turn(plan: TurnPlan, answer: str) -> AskResponse:
+    """Record the answer on the session and persist it."""
+    answer = (answer or "").strip() or _EMPTY_ANSWER_FALLBACK
+    state = plan.state
+    state.turns.append(InteractionTurnRecord(query=plan.query, answer=answer))
     if len(state.turns) > MAX_STORED_TURNS:
         state.turns = state.turns[-MAX_STORED_TURNS:]
+    _save_interaction_session(state, plan.user_id)
+    return AskResponse(session_id=state.session_id, answer=answer, model_name=config.chat_model())
 
-    _save_interaction_session(state, user_id)
 
-    return AskResponse(
-        session_id=state.session_id,
-        answer=answer,
+def handle_user_query(
+    query: str,
+    source_ids: list[int],
+    session_id: str,
+    *,
+    user_id: str,
+    top_k: int = 8,
+) -> AskResponse:
+    plan = prepare_turn(query, source_ids, session_id, user_id=user_id, top_k=top_k)
+    client = get_llm_client()
+    result = client.chat_json(
+        model=config.chat_model(),
+        system=plan.system_prompt,
+        user=plan.user_prompt,
+        json_schema=CHAT_JSON_SCHEMA,
+        temperature=0.3,
+    )
+    # Pass the ChatResult (which always carries usage), not the raw provider
+    # payload: Ollama's raw dict has no `usage` key, which nulled telemetry.
+    log_api_usage(response=result, user_id=user_id, call_stage="interaction", model_name=config.chat_model())
+    if not result.content:
+        raise RuntimeError("Chat model returned an empty response.")
+    model_output = AskModelOutput.model_validate_json(result.content)
+    return finish_turn(plan, model_output.answer)
+
+
+def stream_user_query(
+    query: str,
+    source_ids: list[int],
+    session_id: str,
+    *,
+    user_id: str,
+    top_k: int = 8,
+) -> Iterator[dict[str, Any]]:
+    """Same turn as handle_user_query, yielded as events for a streaming route:
+    {"delta": str}... then {"done": True, "session_id", "answer", "model_name"}."""
+    plan = prepare_turn(query, source_ids, session_id, user_id=user_id, top_k=top_k, plain_output=True)
+    client = get_llm_client()
+    state = StreamState()
+    parts: list[str] = []
+    for delta in client.chat_stream(
+        model=config.chat_model(),
+        system=plan.system_prompt,
+        user=plan.user_prompt,
+        temperature=0.3,
+        state=state,
+    ):
+        parts.append(delta)
+        yield {"delta": delta}
+    answer = "".join(parts)
+    log_api_usage(
+        response=ChatResult(content=answer, raw=None, usage=state.usage),
+        user_id=user_id,
+        call_stage="interaction",
         model_name=config.chat_model(),
     )
+    response = finish_turn(plan, answer)
+    yield {
+        "done": True,
+        "session_id": response.session_id,
+        "answer": response.answer,
+        "model_name": response.model_name,
+    }

@@ -15,6 +15,33 @@ from frontend import api_client
 WHISPER_PROVIDERS = ["local", "openai", "none"]
 
 
+# Known OpenAI-compatible endpoints. Model names are sensible starting points,
+# not requirements; the user can type any model the provider serves.
+API_PRESETS: dict[str, dict[str, str]] = {
+    "OpenAI": {"base_url": "", "model": "gpt-4o-mini", "embedding": "text-embedding-3-small"},
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-4o-mini",
+        "embedding": "openai/text-embedding-3-small",
+    },
+    "Groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "note": "Groq serves no embeddings: set Embedding provider to Ollama under Advanced, or keep OpenAI.",
+    },
+    "DeepSeek": {
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "note": "DeepSeek serves no embeddings: set Embedding provider to Ollama under Advanced.",
+    },
+    "LM Studio (local)": {
+        "base_url": "http://localhost:1234/v1",
+        "model": "local-model",
+        "note": "Use the model id shown in LM Studio's server tab. Any key works.",
+    },
+}
+
+
 async def render_settings_page() -> None:
     ui.label("Settings").classes("text-2xl font-bold")
     ui.label(
@@ -58,14 +85,14 @@ async def render_settings_page() -> None:
             with ui.row().classes("items-center gap-4"):
                 ui.label("Mode").classes("text-lg font-semibold")
                 ui.toggle(
-                    {"local": "Local (private)", "api": "OpenAI API"},
+                    {"local": "Local (private)", "api": "Cloud API"},
                     value=current["mode"],
                     on_change=lambda e: switch_mode(str(e.value)),
                 ).props("color=primary")
             ui.label(
                 "Local: Ollama models + on-device transcription. Nothing leaves this machine."
                 if is_local
-                else "API: OpenAI models + Whisper. Requires an API key."
+                else "API: OpenAI or any OpenAI-compatible endpoint. Your material is sent to that provider."
             ).classes("text-xs text-gray-500")
 
         with ui.card().classes("w-full max-w-2xl gap-2 mt-3"):
@@ -113,15 +140,43 @@ async def render_settings_page() -> None:
                     "local_aux_model": aux_model,
                 }
                 aux_use_local = None
+                embed_local = None
             else:
-                ui.label("OpenAI").classes("text-lg font-semibold")
+                ui.label("Cloud API (OpenAI-compatible)").classes("text-lg font-semibold")
                 key_placeholder = (
                     f"Stored: {current['openai_api_key_masked']} — leave blank to keep"
                     if current["openai_api_key_set"]
                     else "sk-..."
                 )
                 api_key = ui.input(
-                    "OpenAI API key", password=True, placeholder=key_placeholder
+                    "API key", password=True, placeholder=key_placeholder
+                ).classes("w-full")
+                base_url = ui.input(
+                    "Base URL (blank = api.openai.com)",
+                    value=current.get("openai_base_url", ""),
+                    placeholder="https://openrouter.ai/api/v1",
+                ).classes("w-full")
+
+                def use_preset(e: Any) -> None:
+                    preset = API_PRESETS.get(str(e.value))
+                    if not preset:
+                        return
+                    base_url.value = preset["base_url"]
+                    generation_model.value = preset["model"]
+                    chat_model.value = preset["model"]
+                    aux_model.value = preset["model"]
+                    if preset.get("embedding"):
+                        retrieval_model.value = preset["embedding"]
+                    ui.notify(
+                        preset.get("note", "Preset applied. Check the models, then Apply."),
+                        type="info",
+                        multi_line=True,
+                    )
+
+                ui.select(
+                    list(API_PRESETS.keys()),
+                    label="Fill from a provider preset (optional)",
+                    on_change=use_preset,
                 ).classes("w-full")
                 generation_model = ui.input(
                     "Generation model", value=current["openai_generation_model"]
@@ -139,6 +194,10 @@ async def render_settings_page() -> None:
                         "Route aux passes to local Ollama when available",
                         value=current["aux_use_local"],
                     )
+                    embed_local = ui.switch(
+                        "Embeddings via local Ollama (for providers without /embeddings)",
+                        value=current["embedding_provider"] == "ollama",
+                    )
                     whisper = ui.select(
                         WHISPER_PROVIDERS,
                         value=current["whisper_provider"],
@@ -150,6 +209,7 @@ async def render_settings_page() -> None:
                     "openai_chat_model": chat_model,
                     "openai_retrieval_model": retrieval_model,
                     "openai_aux_model": aux_model,
+                    "openai_base_url": base_url,
                 }
 
             async def test(provider: str) -> None:
@@ -171,6 +231,8 @@ async def render_settings_page() -> None:
                 payload["ollama_host"] = ollama_host.value
                 if aux_use_local is not None:
                     payload["aux_use_local"] = aux_use_local.value
+                if embed_local is not None:
+                    payload["embedding_provider"] = "ollama" if embed_local.value else "openai"
                 if api_key is not None:
                     key_value = (api_key.value or "").strip()
                     if key_value:

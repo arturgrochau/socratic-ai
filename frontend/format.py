@@ -551,3 +551,15 @@ def build_generation_export_json(generation_result: dict, *, user_id: str) -> st
         "generation_result": generation_result,
     }
     return json.dumps(export_payload, ensure_ascii=True, indent=2)
+
+
+def describe_model_tag(tag: object) -> str:
+    """'ollama:qwen3:8b' -> 'Generated with qwen3:8b (local)'; '' for unknown."""
+    text_value = str(tag or "").strip()
+    if not text_value:
+        return ""
+    provider, sep, model = text_value.partition(":")
+    if not sep:
+        return f"Generated with {text_value}"
+    where = "local" if provider == "ollama" else "cloud API"
+    return f"Generated with {model} ({where})"

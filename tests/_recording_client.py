@@ -227,6 +227,8 @@ def install_cassette(monkeypatch: Any, cassette_name: str) -> CassetteClient:
     from app.llm_client import OpenAIClient
     wrapped = OpenAIClient.__new__(OpenAIClient)
     wrapped._client = client  # type: ignore[attr-defined]
+    wrapped.base_url = None
+    wrapped._schema_unsupported = False  # type: ignore[attr-defined]
 
     import config
     monkeypatch.setattr(config, "openai_client", client)

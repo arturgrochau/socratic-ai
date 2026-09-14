@@ -14,6 +14,10 @@ def build_chat_panel():
     question into `pending_chat_prompt` and trigger an auto-submit here.
     """
 
+    # The element that receives streamed tokens for the in-flight reply. Kept
+    # outside the refreshable so submit() can find it after a refresh.
+    live: dict[str, ui.markdown | None] = {"md": None}
+
     @ui.refreshable
     def panel() -> None:
         st = state.tab()
@@ -36,9 +40,11 @@ def build_chat_panel():
                 ).classes("w-full")
             if st.get("ask_pending"):
                 with ui.chat_message(name="Socratic AI").classes("w-full"):
-                    with ui.row().classes("items-center gap-2"):
+                    with ui.row().classes("items-center gap-2") as thinking:
                         ui.spinner(size="sm")
                         ui.label("Thinking…").classes("text-gray-500")
+                    live["md"] = ui.markdown("").classes("w-full")
+                    live["thinking"] = thinking
 
         async def submit(query: str, *, display: str | None = None) -> None:
             query_text = (query or "").strip()
@@ -49,12 +55,23 @@ def build_chat_panel():
             st["ask_pending"] = True
             panel.refresh()
             try:
-                result = await api_client.ask(
+                buffer = ""
+                async for event in api_client.ask_stream(
                     session_id=st["session_id"],
                     source_ids=st["source_ids"],
                     query=query_text,
-                )
-                answer = str(result.get("answer", "")).strip() or (
+                ):
+                    if "delta" in event:
+                        if not buffer and live.get("thinking") is not None:
+                            live["thinking"].set_visibility(False)
+                        buffer += str(event["delta"])
+                        if live["md"] is not None:
+                            live["md"].set_content(buffer)
+                    elif event.get("error"):
+                        raise RuntimeError(str(event["error"]))
+                    elif event.get("done"):
+                        buffer = str(event.get("answer") or buffer)
+                answer = buffer.strip() or (
                     "I could not generate an answer this time. Please try rephrasing your question."
                 )
                 messages.append({"role": "assistant", "content": answer})

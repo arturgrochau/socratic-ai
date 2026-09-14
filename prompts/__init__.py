@@ -421,7 +421,10 @@ RULES:
 5. No markdown headings or bullet lists. Continuous prose. No em dashes.
 6. LENGTH: {budget} Match answer size to question size. Do not pad.
 
-Return ONLY valid JSON matching the schema."""
+{output_rule}"""
+
+CHAT_OUTPUT_RULE_JSON = "Return ONLY valid JSON matching the schema."
+CHAT_OUTPUT_RULE_PLAIN = "Reply with the answer text only. No JSON, no quotes around it, no labels."
 
 CHAT_JSON_SCHEMA = {
     "name": "chat_response",
@@ -437,9 +440,11 @@ CHAT_JSON_SCHEMA = {
 }
 
 
-def build_chat_system_prompt(tier: str) -> str:
+def build_chat_system_prompt(tier: str, *, plain: bool = False) -> str:
+    """`plain=True` is the streaming variant: same rules, prose instead of JSON."""
     budget, _ = CHAT_DEPTH_BUDGETS.get(tier, CHAT_DEPTH_BUDGETS["explain"])
-    return CHAT_SYSTEM_PROMPT_TEMPLATE.format(budget=budget)
+    rule = CHAT_OUTPUT_RULE_PLAIN if plain else CHAT_OUTPUT_RULE_JSON
+    return CHAT_SYSTEM_PROMPT_TEMPLATE.format(budget=budget, output_rule=rule)
 
 
 def chat_context_scale(tier: str) -> float:

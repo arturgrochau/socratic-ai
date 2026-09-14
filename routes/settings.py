@@ -33,6 +33,7 @@ class SettingsView(BaseModel):
     ollama_host: str
     openai_api_key_masked: str
     openai_api_key_set: bool
+    openai_base_url: str
     openai_generation_model: str
     openai_chat_model: str
     openai_retrieval_model: str
@@ -58,6 +59,7 @@ class SettingsUpdate(BaseModel):
     whisper_provider: str | None = None
     ollama_host: str | None = None
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
     openai_generation_model: str | None = None
     openai_chat_model: str | None = None
     openai_retrieval_model: str | None = None
@@ -82,6 +84,7 @@ def _view(settings: config.Settings) -> SettingsView:
         ollama_host=settings.ollama_host,
         openai_api_key_masked=_mask_key(settings.openai_api_key),
         openai_api_key_set=bool(settings.openai_api_key),
+        openai_base_url=settings.openai_base_url or "",
         openai_generation_model=settings.openai_generation_model,
         openai_chat_model=settings.openai_chat_model,
         openai_retrieval_model=settings.openai_retrieval_model,
@@ -150,6 +153,9 @@ def update_settings(body: SettingsUpdate) -> SettingsView:
         for key, value in body.model_dump().items()
         if value is not None and key != "openai_api_key"
     }
+    if "openai_base_url" in fields:
+        # Blank clears the override (back to api.openai.com); the form can't send None.
+        fields["openai_base_url"] = fields["openai_base_url"].strip().rstrip("/") or None
     incoming_key = body.openai_api_key
     # Blank/None => keep the existing key.
     new_key = (
@@ -229,8 +235,20 @@ def test_connection(provider: str) -> dict[str, object]:
             if not settings.openai_api_key:
                 return {"ok": False, "provider": provider, "detail": "No API key configured."}
             client = config.get_llm_client("openai")
-            client.raw.models.list()
-            return {"ok": True, "provider": provider, "detail": "Authenticated."}
+            where = settings.openai_base_url or "api.openai.com"
+            try:
+                client.raw.models.list()
+            except Exception as exc:  # noqa: BLE001
+                # Some OpenAI-compatible servers have no /models; a one-token
+                # chat is the real test anyway.
+                if getattr(exc, "status_code", None) not in (404, 405) or not settings.openai_base_url:
+                    raise
+                client.raw.chat.completions.create(
+                    model=settings.openai_chat_model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                )
+            return {"ok": True, "provider": provider, "detail": f"Authenticated against {where}."}
         raise HTTPException(status_code=400, detail=f"Unknown provider: {provider!r}")
     except HTTPException:
         raise

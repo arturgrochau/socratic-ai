@@ -27,6 +27,11 @@ def render_dashboard() -> None:
 
     video_payload = generation_result.get("video") or None
     document_payloads = generation_result.get("documents", []) or []
+    provenance = fmt.describe_model_tag(
+        (video_payload or (document_payloads[0] if document_payloads else {}) or {}).get("model_name")
+    )
+    if provenance:
+        ui.label(provenance).classes("text-xs text-gray-500")
     insights_payload = generation_result.get("insights", {}) or {}
     quiz_payload = generation_result.get("quiz", {}) or {}
 

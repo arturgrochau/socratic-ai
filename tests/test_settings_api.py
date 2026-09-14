@@ -169,3 +169,29 @@ def test_legacy_persisted_settings_migrate(client):
     assert settings.local_retrieval_model == "nomic-embed-text"
     assert settings.local_aux_model == "qwen3:4b-instruct-2507-q4_K_M"
     assert settings.whisper_provider == "local"  # legacy "ollama" alias
+
+
+def test_base_url_round_trips_and_reaches_the_client(client):
+    http, config = client
+    resp = http.put("/settings", json={"openai_base_url": "https://openrouter.ai/api/v1/"})
+    assert resp.status_code == 200
+    assert resp.json()["openai_base_url"] == "https://openrouter.ai/api/v1"  # trailing slash dropped
+    http.put("/settings/mode", json={"mode": "api"})
+    llm = config.get_llm_client("openai")
+    assert str(llm.raw.base_url).rstrip("/") == "https://openrouter.ai/api/v1"
+    assert config.openai_client is not None  # transcription client rebuilt with the same base
+    assert str(config.openai_client.base_url).rstrip("/") == "https://openrouter.ai/api/v1"
+
+    # Blank clears the override.
+    resp = http.put("/settings", json={"openai_base_url": "  "})
+    assert resp.json()["openai_base_url"] == ""
+    assert config.get_settings().openai_base_url is None
+
+
+def test_base_url_env_bootstrap(client, monkeypatch):
+    _, config = client
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.delenv("SOCRATIC_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("SOCRATIC_CONFIG_DIR", str(config._config_path().parent / "fresh"))
+    importlib.reload(config)
+    assert config.get_settings().openai_base_url == "http://localhost:1234/v1"

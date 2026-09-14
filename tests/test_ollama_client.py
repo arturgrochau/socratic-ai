@@ -1,14 +1,15 @@
 """OllamaClient contract tests: structured outputs, context sizing, keep-alive,
-batched embeddings, and the informed JSON retry — all against a mocked daemon."""
+batched embeddings, streaming, and the informed JSON retry, all against a fake
+daemon served through httpx.MockTransport."""
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 import config
-from app.llm_client import OllamaClient
+from app.llm_client import OllamaClient, StreamState
 
 SCHEMA = {
     "name": "test_schema",
@@ -22,11 +23,27 @@ SCHEMA = {
 }
 
 
-def _response(payload: dict) -> MagicMock:
-    resp = MagicMock()
-    resp.json.return_value = payload
-    resp.raise_for_status.return_value = None
-    return resp
+class FakeDaemon:
+    """Scripted Ollama: each queued item is one response body (dict -> JSON,
+    list[dict] -> NDJSON stream). Records every request it served."""
+
+    def __init__(self, *responses: dict | list) -> None:
+        self.queue = list(responses)
+        self.requests: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        body = self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+        if isinstance(body, list):
+            ndjson = "".join(json.dumps(line) + "\n" for line in body)
+            return httpx.Response(200, content=ndjson.encode(), headers={"content-type": "application/x-ndjson"})
+        return httpx.Response(200, json=body)
+
+    def client(self) -> OllamaClient:
+        return OllamaClient(host="http://test:11434", client=httpx.Client(transport=httpx.MockTransport(self.handler)))
+
+    def payload(self, index: int = -1) -> dict:
+        return json.loads(self.requests[index].content)
 
 
 def _chat_payload(content: str) -> dict:
@@ -38,12 +55,11 @@ def _chat_payload(content: str) -> dict:
 
 
 def test_chat_json_sends_bare_schema_and_options() -> None:
-    client = OllamaClient(host="http://test:11434")
-    with patch("requests.post", return_value=_response(_chat_payload('{"answer": "ok"}'))) as post:
-        result = client.chat_json(
-            model="qwen3:test", system="sys", user="usr", json_schema=SCHEMA, temperature=0.0,
-        )
-    payload = post.call_args.kwargs["json"]
+    daemon = FakeDaemon(_chat_payload('{"answer": "ok"}'))
+    result = daemon.client().chat_json(
+        model="qwen3:test", system="sys", user="usr", json_schema=SCHEMA, temperature=0.0,
+    )
+    payload = daemon.payload()
     # Structured outputs: the OpenAI envelope is unwrapped to the bare schema.
     assert payload["format"] == SCHEMA["schema"]
     assert payload["options"]["num_ctx"] == config.OLLAMA_NUM_CTX
@@ -55,58 +71,63 @@ def test_chat_json_sends_bare_schema_and_options() -> None:
 
 
 def test_chat_json_large_context_and_sampling() -> None:
-    client = OllamaClient(host="http://test:11434")
-    with patch("requests.post", return_value=_response(_chat_payload('{"answer": "ok"}'))) as post:
-        client.chat_json(
-            model="qwen3:test", system="sys", user="usr",
-            json_schema=SCHEMA, temperature=0.7, large_context=True,
-        )
-    options = post.call_args.kwargs["json"]["options"]
+    daemon = FakeDaemon(_chat_payload('{"answer": "ok"}'))
+    daemon.client().chat_json(
+        model="qwen3:test", system="sys", user="usr", json_schema=SCHEMA, temperature=0.7, large_context=True,
+    )
+    options = daemon.payload()["options"]
     assert options["num_ctx"] == config.OLLAMA_NUM_CTX_LARGE
     assert options["top_p"] == 0.8  # qwen3-instruct guidance when sampling
 
 
 def test_chat_json_retry_shows_model_its_bad_output() -> None:
-    client = OllamaClient(host="http://test:11434")
-    bad = _chat_payload("not json at all")
-    good = _chat_payload('{"answer": "fixed"}')
-    with patch("requests.post", side_effect=[_response(bad), _response(good)]) as post:
-        result = client.chat_json(
-            model="qwen3:test", system="sys", user="usr", json_schema=SCHEMA,
-        )
+    daemon = FakeDaemon(_chat_payload("not json at all"), _chat_payload('{"answer": "fixed"}'))
+    result = daemon.client().chat_json(model="qwen3:test", system="sys", user="usr", json_schema=SCHEMA)
     assert json.loads(result.content) == {"answer": "fixed"}
-    retry_messages = post.call_args_list[1].kwargs["json"]["messages"]
+    retry = daemon.payload(1)
     # The failed output is in the retry transcript so the model can correct it,
     # and sampling is nudged off the deterministic path.
-    assert any(m["role"] == "assistant" and m["content"] == "not json at all" for m in retry_messages)
-    assert post.call_args_list[1].kwargs["json"]["options"]["temperature"] >= 0.3
+    assert any(m["role"] == "assistant" and m["content"] == "not json at all" for m in retry["messages"])
+    assert retry["options"]["temperature"] >= 0.3
 
 
 def test_chat_json_raises_after_two_invalid() -> None:
-    client = OllamaClient(host="http://test:11434")
-    bad = _response(_chat_payload("still not json"))
-    with patch("requests.post", return_value=bad):
-        with pytest.raises(RuntimeError, match="invalid JSON twice"):
-            client.chat_json(model="qwen3:test", system="s", user="u", json_schema=SCHEMA)
+    daemon = FakeDaemon(_chat_payload("still not json"))
+    with pytest.raises(RuntimeError, match="invalid JSON twice"):
+        daemon.client().chat_json(model="qwen3:test", system="s", user="u", json_schema=SCHEMA)
 
 
 def test_embed_batches_via_api_embed() -> None:
-    client = OllamaClient(host="http://test:11434")
-    with patch(
-        "requests.post",
-        return_value=_response({"embeddings": [[0.1, 0.2], [0.3, 0.4]]}),
-    ) as post:
-        vectors = client.embed(model="nomic-embed-text", inputs=["a", "b"])
-    assert post.call_args.args[0].endswith("/api/embed")
-    assert post.call_args.kwargs["json"]["input"] == ["a", "b"]
+    daemon = FakeDaemon({"embeddings": [[0.1, 0.2], [0.3, 0.4]]})
+    vectors = daemon.client().embed(model="nomic-embed-text", inputs=["a", "b"])
+    assert daemon.requests[-1].url.path == "/api/embed"
+    assert daemon.payload()["input"] == ["a", "b"]
     assert vectors == [[0.1, 0.2], [0.3, 0.4]]
 
 
 def test_embed_count_mismatch_raises() -> None:
-    client = OllamaClient(host="http://test:11434")
-    with patch("requests.post", return_value=_response({"embeddings": [[0.1]]})):
-        with pytest.raises(RuntimeError, match="1 embeddings for 2 inputs"):
-            client.embed(model="nomic-embed-text", inputs=["a", "b"])
+    daemon = FakeDaemon({"embeddings": [[0.1]]})
+    with pytest.raises(RuntimeError, match="1 embeddings for 2 inputs"):
+        daemon.client().embed(model="nomic-embed-text", inputs=["a", "b"])
+
+
+def test_chat_stream_yields_deltas_and_records_usage() -> None:
+    daemon = FakeDaemon([
+        {"model": "qwen3:test", "message": {"role": "assistant", "content": "Soc"}, "done": False},
+        {"model": "qwen3:test", "message": {"role": "assistant", "content": "rates "}, "done": False},
+        {"model": "qwen3:test", "message": {"role": "assistant", "content": "asks."}, "done": False},
+        {"model": "qwen3:test", "message": {"role": "assistant", "content": ""}, "done": True,
+         "prompt_eval_count": 50, "eval_count": 7},
+    ])
+    state = StreamState()
+    text = "".join(daemon.client().chat_stream(model="qwen3:test", system="s", user="u", state=state))
+    assert text == "Socrates asks."
+    payload = daemon.payload()
+    assert payload["stream"] is True
+    assert "format" not in payload  # plain prose: no grammar constraint
+    assert state.usage.prompt_tokens == 50 and state.usage.completion_tokens == 7
+    assert state.usage.total_tokens == 57
+    assert state.model == "qwen3:test"
 
 
 class TestRetrievalCollectionKeying:

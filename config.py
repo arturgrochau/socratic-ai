@@ -125,6 +125,9 @@ class Settings:
     whisper_provider: str = "local"  # local | openai | none
     ollama_host: str = "http://localhost:11434"
     openai_api_key: str | None = None
+    # Empty = api.openai.com. Any OpenAI-compatible server works here
+    # (OpenRouter, Groq, LM Studio, llama.cpp, DeepSeek...).
+    openai_base_url: str | None = None
     # Hosted (OpenAI) bundle — used by roles whose provider is "openai".
     openai_generation_model: str = "gpt-4o-mini"
     openai_chat_model: str = "gpt-4o-mini"
@@ -138,6 +141,11 @@ class Settings:
     # API mode only: route the high-volume aux passes (ledger extraction) to a
     # local Ollama daemon when one is reachable. Moot in local mode.
     aux_use_local: bool = False
+    # Context window for local calls; the first-run wizard sizes it to RAM
+    # (8k on 16 GB machines). 0 = use the SOCRATIC_OLLAMA_NUM_CTX env default.
+    local_num_ctx: int = 0
+    # Set by the Welcome page once the user has picked Local or API.
+    setup_complete: bool = False
 
 
 # Fields that may be persisted to / loaded from the user config file.
@@ -216,6 +224,7 @@ def _settings_from_env() -> Settings:
         ),
         ollama_host=os.getenv("OLLAMA_HOST", defaults.ollama_host).strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY"),
+        openai_base_url=(os.getenv("OPENAI_BASE_URL") or "").strip() or None,
         openai_aux_model=os.getenv("AUX_MODEL", defaults.openai_aux_model).strip(),
         local_aux_model=os.getenv("AUX_LOCAL_MODEL", defaults.local_aux_model).strip(),
         aux_use_local=_env_bool("AUX_USE_LOCAL", defaults.aux_use_local),
@@ -376,7 +385,11 @@ if _settings.llm_provider == "openai" and not _settings.openai_api_key:
 
 # Kept for backwards compatibility — the OpenAI transcription path and the test
 # cassette still reference openai_client directly. Recomputed by apply_settings.
-openai_client = OpenAI(api_key=_settings.openai_api_key) if _settings.openai_api_key else None  # type: ignore[assignment]
+openai_client = (
+    OpenAI(api_key=_settings.openai_api_key, base_url=_settings.openai_base_url)
+    if _settings.openai_api_key
+    else None
+)  # type: ignore[assignment]
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")
 if _is_sqlite:
@@ -467,7 +480,9 @@ def apply_settings(new: Settings, *, persist: bool = True) -> Settings:
         _settings = new
         _llm_client_cache.clear()
         _aux_probe = None
-        openai_client = OpenAI(api_key=new.openai_api_key) if new.openai_api_key else None  # type: ignore[assignment]
+        openai_client = (
+            OpenAI(api_key=new.openai_api_key, base_url=new.openai_base_url) if new.openai_api_key else None
+        )  # type: ignore[assignment]
         # Keep the backwards-compat module constants coherent with the new state.
         OPENAI_API_KEY = new.openai_api_key
         LLM_PROVIDER = new.llm_provider
@@ -510,6 +525,14 @@ class _LazyChroma:
 
 
 chroma_client = _LazyChroma()
+
+
+def ollama_num_ctx(*, large: bool = False) -> int:
+    """Per-call context window: the wizard's RAM-sized choice when set, else env."""
+    chosen = int(_settings.local_num_ctx or 0)
+    if chosen >= 2048:
+        return chosen
+    return OLLAMA_NUM_CTX_LARGE if large else OLLAMA_NUM_CTX
 
 
 def local_models_in_use() -> list[str]:
