@@ -3,18 +3,42 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-import chromadb
 from dotenv import load_dotenv
 from openai import OpenAI
+from platformdirs import user_data_dir
 from sqlalchemy import create_engine, text
 
 
-load_dotenv()
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def data_dir() -> Path:
+    """Where runtime state lives: SQLite DB, Chroma vectors, uploads, logs.
+
+    Defaults to the per-user application data dir (macOS:
+    ~/Library/Application Support/socratic-ai). SOCRATIC_DATA_DIR overrides it;
+    tests and Docker set it explicitly. Never next to the code: inside a
+    frozen .app bundle the code dir is read-only and cwd is `/`."""
+    override = os.getenv("SOCRATIC_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(user_data_dir("socratic-ai"))
+
+
+# A .env in the working directory is a developer convenience; a frozen app has
+# no meaningful cwd, so it reads only the one in the data dir (which lets .app
+# users set env overrides without a terminal).
+if not _is_frozen():
+    load_dotenv()
+DATA_DIR = data_dir()
+load_dotenv(DATA_DIR / ".env")
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +54,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # These stay module-level globals because tests reload `config` and read
 # `config.db_engine` directly, and reload-order assumptions depend on them
 # existing at import time. Only provider/model/key/host settings are mutable.
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'app.db'}")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", str(DATA_DIR / "chroma_data"))
+UPLOAD_ROOT = Path(os.getenv("SOCRATIC_UPLOAD_DIR", str(DATA_DIR / "uploads")))
 USER_ID_HEADER = os.getenv("USER_ID_HEADER", "X-User-ID")
 ENABLE_COST_LOGGING = _env_bool("ENABLE_COST_LOGGING", True)
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "production")
@@ -139,6 +164,33 @@ def _config_path() -> Path:
         except Exception:
             base = Path.home() / ".config" / "socratic-ai"
     return base / "settings.json"
+
+
+def storage_secret() -> str:
+    """Per-install secret for NiceGUI's browser storage cookie.
+
+    Generated once and kept next to settings.json. SOCRATIC_STORAGE_SECRET
+    still overrides it (Docker / multi-instance deploys)."""
+    override = os.getenv("SOCRATIC_STORAGE_SECRET")
+    if override:
+        return override
+    path = _config_path().with_name("storage_secret")
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    import secrets
+
+    value = secrets.token_urlsafe(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # read-only config dir: fall back to a per-process secret
+    return value
 
 
 def _normalize_whisper(value: str) -> str:
@@ -327,6 +379,10 @@ if _settings.llm_provider == "openai" and not _settings.openai_api_key:
 openai_client = OpenAI(api_key=_settings.openai_api_key) if _settings.openai_api_key else None  # type: ignore[assignment]
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")
+if _is_sqlite:
+    _db_file = DATABASE_URL.removeprefix("sqlite:///")
+    if _db_file and _db_file != ":memory:":
+        Path(_db_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
 db_engine = create_engine(
     DATABASE_URL,
     future=True,
@@ -362,15 +418,9 @@ def _local_aux_reachable() -> bool:
     now = time.monotonic()
     if _aux_probe is not None and (now - _aux_probe[0]) < _AUX_PROBE_TTL_SECONDS:
         return _aux_probe[1]
-    try:
-        import requests
+    from app.ollama_probe import is_reachable
 
-        requests.get(
-            f"{_settings.ollama_host.rstrip('/')}/api/tags", timeout=1.5
-        ).raise_for_status()
-        ok = True
-    except Exception:
-        ok = False
+    ok = is_reachable(_settings.ollama_host, timeout=1.5)
     _aux_probe = (now, ok)
     return ok
 
@@ -433,8 +483,41 @@ def apply_settings(new: Settings, *, persist: bool = True) -> Settings:
         return _settings
 
 
-Path(CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
-chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+class _LazyChroma:
+    """Opens the Chroma store on first use, not at import.
+
+    Import-time construction made every `import config` (tests, the pywebview
+    spawn child, `--selftest`) open the vector store. The proxy keeps
+    `from config import chroma_client` working unchanged; the first touch
+    happens in run_startup_checks() inside the server process."""
+
+    def __init__(self) -> None:
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _get(self):
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    import chromadb
+
+                    Path(CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+                    self._client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+chroma_client = _LazyChroma()
+
+
+def local_models_in_use() -> list[str]:
+    """Distinct local model names the current settings can load."""
+    s = _settings
+    return list(dict.fromkeys(
+        [s.local_generation_model, s.local_chat_model, s.local_aux_model, s.local_retrieval_model]
+    ))
 
 
 def run_startup_checks() -> None:

@@ -1,7 +1,19 @@
 [project]
 name = "socratic-ai"
-version = "2.3.0"
-description = "Turn videos, PDFs, and lectures into a Socratic thinking workout — private by default: local models, local transcription, one-click API switch."
+version = "3.0.0"
+description = "Turn lectures and PDFs into Socratic questions and a chat grounded in your own material. Runs fully on your Mac with Ollama, or on any OpenAI-compatible API."
+keywords = ["socratic", "study", "learning", "ollama", "local-llm", "rag", "education", "macos"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: MacOS X",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+]
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -19,11 +31,19 @@ dependencies = [
     "python-multipart",
     "yt-dlp",
     "platformdirs",
-    "requests",
 ]
 
+[project.urls]
+Homepage = "https://github.com/arturgrochau/socratic-ai"
+Repository = "https://github.com/arturgrochau/socratic-ai"
+Issues = "https://github.com/arturgrochau/socratic-ai/issues"
+Changelog = "https://github.com/arturgrochau/socratic-ai/blob/master/CHANGELOG.md"
+
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "ruff", "pyinstaller"]
+# Native desktop window (pywebview). Only the .app build and `socratic-ai-app`
+# need it; the browser-tab path stays lean for servers.
+app = ["nicegui[native]"]
 # On-device transcription (Apple Silicon / MLX). Local LLM+embedding roles only
 # need a running Ollama daemon — no extra Python deps.
 local = [
@@ -33,6 +53,7 @@ local = [
 
 [project.scripts]
 socratic-ai = "run:main"
+socratic-ai-app = "app_native:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -45,6 +66,7 @@ packages = ["app", "routes", "frontend", "prompts"]
 "main.py" = "main.py"
 "config.py" = "config.py"
 "run.py" = "run.py"
+"app_native.py" = "app_native.py"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -53,3 +75,18 @@ markers = [
     "e2e: end-to-end pipeline tests (slow; require cassettes or OPENAI_API_KEY).",
 ]
 
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["docs", "test_assets"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# B008: FastAPI `File(...)`/`Depends(...)` defaults are the framework idiom.
+ignore = ["E501", "B008", "B039", "SIM105", "SIM117"]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["E402"]
+"tests/*" = ["E402", "E701"]
+"scripts/*" = ["E402"]

@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import config
-
+from app import ollama_probe
 
 router = APIRouter(tags=["settings"])
 
@@ -177,9 +177,7 @@ def update_mode(body: ModeUpdate) -> SettingsView:
         # Local mode without a reachable daemon would fail on every later call
         # with opaque connection errors — reject the switch with the reason.
         try:
-            import requests
-
-            requests.get(f"{new.ollama_host.rstrip('/')}/api/tags", timeout=2).raise_for_status()
+            ollama_probe.list_models(new.ollama_host, timeout=2)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=422,
@@ -195,13 +193,7 @@ def list_ollama_models() -> dict[str, object]:
     """Models available on the local daemon, for the Settings dropdowns."""
     settings = config.get_settings()
     try:
-        import requests
-
-        resp = requests.get(f"{settings.ollama_host.rstrip('/')}/api/tags", timeout=3)
-        resp.raise_for_status()
-        models = sorted(
-            str(m.get("name", "")) for m in resp.json().get("models", []) if m.get("name")
-        )
+        models = sorted(ollama_probe.list_models(settings.ollama_host, timeout=3))
         return {"ok": True, "models": models}
     except Exception as exc:  # noqa: BLE001 — surface the probe failure to the UI
         return {"ok": False, "models": [], "detail": str(exc)[:300]}
@@ -214,13 +206,8 @@ def test_connection(provider: str) -> dict[str, object]:
     settings = config.get_settings()
     try:
         if provider == "ollama":
-            import requests
-
-            resp = requests.get(f"{settings.ollama_host.rstrip('/')}/api/tags", timeout=3)
-            resp.raise_for_status()
             models: set[str] = set()
-            for m in resp.json().get("models", []):
-                name = str(m.get("name", ""))
+            for name in ollama_probe.list_models(settings.ollama_host, timeout=3):
                 models.add(name)
                 if name.endswith(":latest"):  # "foo" and "foo:latest" are the same model
                     models.add(name[: -len(":latest")])

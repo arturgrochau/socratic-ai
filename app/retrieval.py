@@ -6,10 +6,9 @@ from typing import Any
 
 from sqlalchemy import text
 
-from app.models import RetrievedContext, RetrievalHit
 import config
+from app.models import RetrievalHit, RetrievedContext
 from config import chroma_client, db_engine, get_llm_client
-
 
 # Collections are keyed by embedding provider+model: vectors from different
 # models share neither dimensionality nor geometry, so a provider switch must
@@ -66,8 +65,11 @@ def _build_in_clause(values: list[int | str], prefix: str) -> tuple[str, dict[st
 
 
 def _get_collection() -> Any:
+    # embedding_function=None: vectors are always supplied by our own provider,
+    # so Chroma must not instantiate its default ONNX embedder (a 40 MB+ import).
     return chroma_client.get_or_create_collection(
         name=_collection_name(),
+        embedding_function=None,
         metadata={
             "hnsw:space": "cosine",
             "embedding_provider": config.embedding_provider(),
@@ -281,7 +283,7 @@ def retrieve_context(
     distances = raw_result.get("distances", [[]])[0]
 
     candidate_hits: list[RetrievalHit] = []
-    for _entry_id, metadata, document, distance in zip(ids, metadatas, documents, distances):
+    for _entry_id, metadata, document, distance in zip(ids, metadatas, documents, distances, strict=False):
         if metadata is None:
             continue
         field_type = str(metadata.get("field_type", "")).strip()

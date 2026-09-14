@@ -6,7 +6,8 @@ browser. No venv bootstrap, no second process, no port 8501.
 
 Run it with uv:
 
-    uv run socratic-ai
+    uv run socratic-ai              # browser tab
+    uv run socratic-ai --native     # native window (same as socratic-ai-app)
 
 or directly:
 
@@ -15,6 +16,7 @@ or directly:
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import webbrowser
 
@@ -24,6 +26,12 @@ def _open_browser(url: str) -> None:
 
 
 def main() -> None:
+    if "--native" in sys.argv:
+        from app_native import main as native_main
+
+        native_main()
+        return
+
     import uvicorn
 
     host = os.getenv("HOST", "127.0.0.1")

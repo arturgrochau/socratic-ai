@@ -21,13 +21,15 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
+import config
 
-SESSION_LOG_DIR = Path(os.getenv("SESSION_LOG_DIR", "./logs/sessions"))
+SESSION_LOG_DIR = Path(os.getenv("SESSION_LOG_DIR", str(config.DATA_DIR / "logs" / "sessions")))
 ENABLE_SESSION_LOG = os.getenv("ENABLE_SESSION_LOG", "true").lower() == "true"
 
 
@@ -42,7 +44,7 @@ class _NullSessionLogger:
         return None
 
 
-_active_logger: ContextVar["SessionLogger | _NullSessionLogger"] = ContextVar(
+_active_logger: ContextVar[SessionLogger | _NullSessionLogger] = ContextVar(
     "active_session_logger", default=_NullSessionLogger()
 )
 
@@ -76,7 +78,7 @@ class SessionLogger:
         except OSError:
             pass
 
-    def __enter__(self) -> "SessionLogger":
+    def __enter__(self) -> SessionLogger:
         self._token = _active_logger.set(self)
         self.record("session_start", {"started_at": self.started_at})
         return self
@@ -93,7 +95,7 @@ class SessionLogger:
         _active_logger.reset(self._token)
 
 
-def get_active_logger() -> "SessionLogger | _NullSessionLogger":
+def get_active_logger() -> SessionLogger | _NullSessionLogger:
     return _active_logger.get()
 
 

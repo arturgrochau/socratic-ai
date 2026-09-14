@@ -22,6 +22,7 @@ from fastapi import UploadFile
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+import config
 from app.cost_logging import log_api_usage
 from app.models import (
     DocumentIngestionRecord,
@@ -32,7 +33,6 @@ from app.models import (
     UploadRequestMeta,
     VideoIngestionRecord,
 )
-import config
 from config import (
     INGESTION_VIDEO_STEP_TIMEOUT_SECONDS,
     WHISPER_TRANSCRIPTION_MAX_RETRIES,
@@ -40,8 +40,7 @@ from config import (
     db_engine,
 )
 
-
-UPLOAD_ROOT = Path("uploads")
+UPLOAD_ROOT = config.UPLOAD_ROOT
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
 SUPPORTED_YOUTUBE_HOSTS = {
@@ -1045,7 +1044,7 @@ async def ingest_upload_bundle(
                 transcription_seconds,
                 audio_path.name,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise RuntimeError(
                 "Video ingestion exceeded timeout budget during extraction/transcription. "
                 f"Increase INGESTION_VIDEO_STEP_TIMEOUT_SECONDS (current={INGESTION_VIDEO_STEP_TIMEOUT_SECONDS}) "

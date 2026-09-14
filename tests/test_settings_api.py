@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import replace
-
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
@@ -17,10 +16,7 @@ from fastapi.testclient import TestClient
 
 def _daemon_up() -> patch:
     """Mock the Ollama reachability probe so tests don't need a live daemon."""
-    ok = MagicMock()
-    ok.raise_for_status.return_value = None
-    ok.json.return_value = {"models": []}
-    return patch("requests.get", return_value=ok)
+    return patch("app.ollama_probe.list_models", return_value=[])
 
 
 @pytest.fixture()
@@ -85,9 +81,7 @@ def test_mode_toggle_switches_all_providers_and_models(client):
 def test_mode_local_requires_reachable_daemon(client):
     http, config = client
     http.put("/settings/mode", json={"mode": "api"})
-    import requests
-
-    with patch("requests.get", side_effect=requests.ConnectionError("refused")):
+    with patch("app.ollama_probe.list_models", side_effect=ConnectionError("refused")):
         resp = http.put("/settings/mode", json={"mode": "local"})
     assert resp.status_code == 422
     assert "not reachable" in resp.json()["detail"]
