@@ -17,7 +17,7 @@ The first time you open it, macOS will say it cannot check the app for malicious
 
 The app opens to the Welcome page.
 
-![Welcome page](media/01-welcome.png)
+![Welcome page](media/01-welcome.jpg)
 
 Pick where the models should run:
 
@@ -30,7 +30,7 @@ You can change your mind later in Settings.
 
 The next step is a checklist. Each row is either green or tells you what to do:
 
-![Local checklist](media/02-checklist.png)
+![Local checklist](media/02-checklist.jpg)
 
 1. Ollama is the program that runs the models. If it is not installed, click the download link, install it like any Mac app, and open it once. If it is installed but not running, click Start Ollama.
 2. Models. Click Download. The bar shows progress; the 8b model takes a few minutes on a normal connection.
@@ -48,11 +48,11 @@ The main screen has two steps.
 
 Step 1 is the video. Paste a YouTube link, or switch to Upload video and drop in a file. Or click Skip video if you only have documents.
 
-![Step 1: add a video](media/03-step1.png)
+![Step 1: add a video](media/03-step1.jpg)
 
 Step 2 is documents. Add PDFs, `.txt` or `.md` files. Each file uploads the moment you add it. Then click Generate Socratic learning.
 
-![Step 2: add documents](media/04-step2.png)
+![Step 2: add documents](media/04-step2.jpg)
 
 Generation takes a few minutes on a local model (the first run also loads the model into memory) and under a minute on the Cloud API. The label under the button tells you which stage it is on.
 
@@ -60,7 +60,11 @@ Generation takes a few minutes on a local model (the first run also loads the mo
 
 When it finishes you land on the dashboard. There is one tab per source, plus a tab for what ties them together, plus the chat.
 
-![Dashboard](media/05-dashboard.png)
+![Dashboard](media/05-dashboard.jpg)
+
+Each source gets its own tab with the sections below; this is the Documents tab for one PDF:
+
+![A document's pack](media/05b-documents.jpg)
 
 A suggestion for how to use it, since the order matters:
 
@@ -75,7 +79,7 @@ With two or more sources, the Cross-Source tab adds a synthesis, the places the 
 
 The quiz is under the Cross-Source tab (or Quiz & Applications for a single source). Click an answer. It locks on your first pick: green if right, red if wrong, with an explanation of the specific misunderstanding behind the wrong option.
 
-![Quiz](media/06-quiz.png)
+![Quiz](media/06-quiz.jpg)
 
 After a wrong answer there is a button that takes the question into the chat, so you can argue about it.
 
@@ -83,13 +87,13 @@ After a wrong answer there is a button that takes the question into the chat, so
 
 The Socratic Chat tab answers questions from your material only. Answers stream in word by word. If the sources do not cover something, it says so instead of making it up.
 
-![Chat](media/07-chat.png)
+![Chat](media/07-chat.jpg)
 
 Under each answer there are two buttons: Elaborate further, and Quiz me on this. Quiz mode asks you a question, grades your answer, and offers the next one.
 
 ## 6. Export and where things live
 
-The buttons at the top of the dashboard export the pack as Markdown or PDF.
+The buttons at the top of the dashboard save the pack as a Markdown study snapshot, or the raw JSON if you want to process it yourself. For a PDF, open the Markdown file and print it.
 
 Everything the app stores is in `~/Library/Application Support/socratic-ai/`: the database, the search index, uploaded files, and logs. Settings, including your API key, are in `~/Library/Application Support/socratic-ai/settings.json`. Delete the folder to start over.
 
@@ -97,7 +101,7 @@ Everything the app stores is in `~/Library/Application Support/socratic-ai/`: th
 
 The gear in the top right opens Settings.
 
-![Settings](media/08-settings.png)
+![Settings](media/08-settings.jpg)
 
 - The Mode toggle switches between On this Mac and Cloud API. Each mode remembers its own models.
 - In local mode, the dropdowns list the models Ollama has downloaded. A bigger model gives sharper packs and takes longer; `qwen3:30b-a3b` is the best of the defaults if you have 32 GB.

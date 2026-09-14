@@ -149,14 +149,14 @@ async def ask_stream(
 
 async def get_settings() -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(f"{base_url()}/settings", headers=_headers())
+        response = await client.get(f"{base_url()}/api/settings", headers=_headers())
     _raise_for_payload(response, "GET /settings")
     return response.json()
 
 
 async def put_settings(payload: dict[str, Any]) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.put(f"{base_url()}/settings", json=payload, headers=_headers())
+        response = await client.put(f"{base_url()}/api/settings", json=payload, headers=_headers())
     _raise_for_payload(response, "PUT /settings")
     return response.json()
 
@@ -164,7 +164,7 @@ async def put_settings(payload: dict[str, Any]) -> dict[str, Any]:
 async def test_connection(provider: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get(
-            f"{base_url()}/settings/test", params={"provider": provider}, headers=_headers()
+            f"{base_url()}/api/settings/test", params={"provider": provider}, headers=_headers()
         )
     _raise_for_payload(response, "GET /settings/test")
     return response.json()
@@ -173,7 +173,7 @@ async def test_connection(provider: str) -> dict[str, Any]:
 async def put_mode(mode: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.put(
-            f"{base_url()}/settings/mode", json={"mode": mode}, headers=_headers()
+            f"{base_url()}/api/settings/mode", json={"mode": mode}, headers=_headers()
         )
     _raise_for_payload(response, "PUT /settings/mode")
     return response.json()
@@ -181,7 +181,7 @@ async def put_mode(mode: str) -> dict[str, Any]:
 
 async def get_ollama_models() -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(f"{base_url()}/settings/ollama-models", headers=_headers())
+        response = await client.get(f"{base_url()}/api/settings/ollama-models", headers=_headers())
     _raise_for_payload(response, "GET /settings/ollama-models")
     return response.json()
 

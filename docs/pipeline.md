@@ -156,14 +156,14 @@ learner missed; `chat.py` auto-submits it as the first chat query.
 
 ---
 
-## 4. Settings — `GET/PUT /settings`, `GET /settings/test`
+## 4. Settings — `GET/PUT /api/settings`, `GET /api/settings/test`
 
 `frontend/pages/settings.py` → `frontend/api_client.py` → `routes/settings.py`:
-- `GET /settings` → `read_settings` (`SettingsView`, key always masked via `_mask_key`).
-- `PUT /settings` → `update_settings` → `config.apply_settings(new)`: under `_settings_lock`, swap
+- `GET /api/settings` → `read_settings` (`SettingsView`, key always masked via `_mask_key`).
+- `PUT /api/settings` → `update_settings` → `config.apply_settings(new)`: under `_settings_lock`, swap
   `_settings`, clear the LLM client cache, reset the Ollama reachability probe, rebuild the
   bare `openai_client`, refresh the backwards-compat module constants, and persist to the user config
   dir. Takes effect immediately for subsequent requests — no restart. (A blank key preserves the
   stored one.)
-- `GET /settings/test?provider=` → `test_connection`: pings the Ollama daemon's `/api/tags` or lists
+- `GET /api/settings/test?provider=` → `test_connection`: pings the Ollama daemon's `/api/tags` or lists
   OpenAI models, for the panel's "Test" button.

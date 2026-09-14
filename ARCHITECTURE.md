@@ -22,7 +22,7 @@ flowchart TB
     subgraph proc["Single uvicorn process (port 8000)"]
         direction TB
         UI["NiceGUI UI<br/>(frontend/)"]
-        API["FastAPI routes<br/>(/upload, /generate-tailored-learning, /ask, /settings)"]
+        API["FastAPI routes<br/>(/upload, /generate-tailored-learning, /ask, /api/settings)"]
         UI -- "loopback HTTP<br/>(frontend/api_client.py)" --> API
 
         subgraph core["app/ — business logic"]
@@ -92,7 +92,7 @@ Line counts are approximate (current as of this writing).
 | `routes/upload.py` | 39 | `POST /upload` → `ingest_upload_bundle`. |
 | `routes/workflow.py` | 44 | `POST /generate-tailored-learning` → `generate_tailored_learning`; maps `GenerationStageError` to 422 with run/stage detail. |
 | `routes/interaction.py` | 32 | `POST /ask` → `handle_user_query`. |
-| `routes/settings.py` | 117 | `GET /settings` (key masked), `PUT /settings` (apply at runtime), `GET /settings/test` (provider probe). |
+| `routes/settings.py` | 117 | `GET /api/settings` (key masked), `PUT /api/settings` (apply at runtime), `GET /api/settings/test` (provider probe). |
 
 ### `prompts/` — LLM contracts
 | Path | LOC | Purpose |

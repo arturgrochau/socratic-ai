@@ -58,7 +58,7 @@ uv run pytest tests/ -m e2e   # end-to-end; replays recorded calls from tests/_c
 | Dir | What |
 |---|---|
 | `app/` | Backend logic: ingestion, generation, interaction, retrieval, ledger, llm_client, setup (first-run), ollama_probe, models. |
-| `routes/` | Thin FastAPI endpoints (`/upload`, `/generate-tailored-learning`, `/ask`, `/ask/stream`, `/settings`, `/setup`). |
+| `routes/` | Thin FastAPI endpoints (`/upload`, `/generate-tailored-learning`, `/ask`, `/ask/stream`, `/api/settings`, `/setup`). |
 | `frontend/` | NiceGUI UI (`ui.py`, `state.py`, `api_client.py`, `format.py`, `pages/` incl. `welcome.py`, `components/`). |
 | `prompts/` | System prompts + JSON schemas (`__init__.py`) and the section-contract registry (`sections.py`). |
 | `scripts/` | Diagnostics, validation, regression tooling (dev-only). |

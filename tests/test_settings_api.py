@@ -40,7 +40,7 @@ def client(tmp_path, monkeypatch):
 
 def test_local_by_default_and_masked_key(client):
     http, config = client
-    resp = http.get("/settings")
+    resp = http.get("/api/settings")
     assert resp.status_code == 200
     body = resp.json()
     # Local is the default: no provider env set => everything on-device.
@@ -59,7 +59,7 @@ def test_mode_toggle_switches_all_providers_and_models(client):
     # Local mode resolves the local bundle.
     assert config.generation_model() == config.get_settings().local_generation_model
 
-    resp = http.put("/settings/mode", json={"mode": "api"})
+    resp = http.put("/api/settings/mode", json={"mode": "api"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["mode"] == "api"
@@ -71,7 +71,7 @@ def test_mode_toggle_switches_all_providers_and_models(client):
     assert type(config.get_llm_client()).__name__ == "OpenAIClient"
 
     with _daemon_up():
-        resp = http.put("/settings/mode", json={"mode": "local"})
+        resp = http.put("/api/settings/mode", json={"mode": "local"})
     assert resp.status_code == 200
     assert resp.json()["mode"] == "local"
     assert config.generation_model() == config.get_settings().local_generation_model
@@ -80,9 +80,9 @@ def test_mode_toggle_switches_all_providers_and_models(client):
 
 def test_mode_local_requires_reachable_daemon(client):
     http, config = client
-    http.put("/settings/mode", json={"mode": "api"})
+    http.put("/api/settings/mode", json={"mode": "api"})
     with patch("app.ollama_probe.list_models", side_effect=ConnectionError("refused")):
-        resp = http.put("/settings/mode", json={"mode": "local"})
+        resp = http.put("/api/settings/mode", json={"mode": "local"})
     assert resp.status_code == 422
     assert "not reachable" in resp.json()["detail"]
     assert config.get_settings().llm_provider == "openai"  # unchanged
@@ -92,21 +92,21 @@ def test_mode_api_requires_key(client):
     http, config = client
     # Drop the stored key, then try to switch to API mode.
     config.apply_settings(replace(config.get_settings(), openai_api_key=None), persist=False)
-    resp = http.put("/settings/mode", json={"mode": "api"})
+    resp = http.put("/api/settings/mode", json={"mode": "api"})
     assert resp.status_code == 422
     assert config.get_settings().llm_provider == "ollama"  # unchanged
 
 
 def test_put_rejects_unknown_provider(client):
     http, _config = client
-    resp = http.put("/settings", json={"llm_provider": "banana"})
+    resp = http.put("/api/settings", json={"llm_provider": "banana"})
     assert resp.status_code == 422
 
 
 def test_put_partial_update_preserves_key_and_other_fields(client):
     http, config = client
     before = config.get_settings().openai_api_key
-    resp = http.put("/settings", json={"openai_chat_model": "gpt-4o"})
+    resp = http.put("/api/settings", json={"openai_chat_model": "gpt-4o"})
     assert resp.status_code == 200
     assert config.get_settings().openai_api_key == before
     assert resp.json()["openai_chat_model"] == "gpt-4o"
@@ -116,7 +116,7 @@ def test_put_partial_update_preserves_key_and_other_fields(client):
 
 def test_put_new_key_updates_and_masks(client):
     http, config = client
-    resp = http.put("/settings", json={"openai_api_key": "sk-brand-new-key-wxyz9876"})
+    resp = http.put("/api/settings", json={"openai_api_key": "sk-brand-new-key-wxyz9876"})
     assert resp.status_code == 200
     assert config.get_settings().openai_api_key == "sk-brand-new-key-wxyz9876"
     assert resp.json()["openai_api_key_masked"] == "sk-...9876"
@@ -138,7 +138,7 @@ def test_apply_settings_invalidates_caches(client):
 
 def test_settings_persist_across_reload(client):
     http, config = client
-    http.put("/settings/mode", json={"mode": "api"})
+    http.put("/api/settings/mode", json={"mode": "api"})
 
     # Reload config; the persisted choice (api mode) should win over defaults.
     importlib.reload(config)
@@ -173,17 +173,17 @@ def test_legacy_persisted_settings_migrate(client):
 
 def test_base_url_round_trips_and_reaches_the_client(client):
     http, config = client
-    resp = http.put("/settings", json={"openai_base_url": "https://openrouter.ai/api/v1/"})
+    resp = http.put("/api/settings", json={"openai_base_url": "https://openrouter.ai/api/v1/"})
     assert resp.status_code == 200
     assert resp.json()["openai_base_url"] == "https://openrouter.ai/api/v1"  # trailing slash dropped
-    http.put("/settings/mode", json={"mode": "api"})
+    http.put("/api/settings/mode", json={"mode": "api"})
     llm = config.get_llm_client("openai")
     assert str(llm.raw.base_url).rstrip("/") == "https://openrouter.ai/api/v1"
     assert config.openai_client is not None  # transcription client rebuilt with the same base
     assert str(config.openai_client.base_url).rstrip("/") == "https://openrouter.ai/api/v1"
 
     # Blank clears the override.
-    resp = http.put("/settings", json={"openai_base_url": "  "})
+    resp = http.put("/api/settings", json={"openai_base_url": "  "})
     assert resp.json()["openai_base_url"] == ""
     assert config.get_settings().openai_base_url is None
 

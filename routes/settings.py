@@ -8,7 +8,9 @@ from pydantic import BaseModel
 import config
 from app import ollama_probe
 
-router = APIRouter(tags=["settings"])
+# /api prefix: the NiceGUI page lives at /settings, and a bare GET /settings
+# API route registered first would shadow it in the browser.
+router = APIRouter(prefix="/api", tags=["settings"])
 
 VALID_LLM_PROVIDERS = {"openai", "ollama"}
 VALID_WHISPER_PROVIDERS = {"local", "openai", "none"}

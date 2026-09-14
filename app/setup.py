@@ -159,6 +159,24 @@ def detect_environment() -> EnvironmentReport:
         else [tier.generation_model, EMBEDDING_MODEL]
     )
     missing = [m for m in dict.fromkeys(wanted) if not _has_model(ollama.models, m)] if ollama.running else wanted
+    if settings.setup_complete:
+        # Re-running the wizard: describe what is configured, not what we would pick.
+        shown = TierView(
+            name="current",
+            generation_model=settings.local_generation_model,
+            embedding_model=settings.local_retrieval_model,
+            download_gb=0.0,
+            num_ctx=config.ollama_num_ctx(),
+        )
+    else:
+        shown = TierView(
+            name=tier.name,
+            generation_model=tier.generation_model,
+            embedding_model=EMBEDDING_MODEL,
+            download_gb=round(tier.download_gb + 0.3, 1),
+            num_ctx=tier.num_ctx,
+            note=tier.note,
+        )
     return EnvironmentReport(
         platform=sys.platform,
         arch=platform.machine(),
@@ -166,14 +184,7 @@ def detect_environment() -> EnvironmentReport:
         ffmpeg=_ffmpeg_status(),
         ollama=ollama,
         mlx_available=_mlx_available(),
-        recommended=TierView(
-            name=tier.name,
-            generation_model=tier.generation_model,
-            embedding_model=EMBEDDING_MODEL,
-            download_gb=round(tier.download_gb + 0.3, 1),
-            num_ctx=tier.num_ctx,
-            note=tier.note,
-        ),
+        recommended=shown,
         missing_models=missing,
         setup_complete=settings.setup_complete,
         mode=config.current_mode(),
