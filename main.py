@@ -12,6 +12,7 @@ from app.interaction import ensure_interaction_tables
 from config import run_startup_checks
 from routes.interaction import router as interaction_router
 from routes.settings import router as settings_router
+from routes.setup import router as setup_router
 from routes.upload import router as upload_router
 from routes.workflow import router as workflow_router
 
@@ -40,6 +41,7 @@ app.include_router(upload_router)
 app.include_router(interaction_router)
 app.include_router(workflow_router)
 app.include_router(settings_router)
+app.include_router(setup_router)
 
 
 @app.get("/health")

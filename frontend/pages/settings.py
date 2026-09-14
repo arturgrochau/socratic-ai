@@ -254,4 +254,6 @@ async def render_settings_page() -> None:
 
     page(current)
 
-    ui.link("← Back to app", "/").classes("mt-3")
+    with ui.row().classes("mt-3 gap-4"):
+        ui.link("← Back to app", "/")
+        ui.link("Run first-time setup again", "/welcome")

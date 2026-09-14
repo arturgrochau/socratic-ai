@@ -274,6 +274,9 @@ def _migrate_legacy_stored(stored: dict) -> dict:
         if value and new_key not in stored:
             migrated[new_key] = value
     migrated.pop("aux_llm_provider", None)
+    # A settings file written before the first-run wizard existed means the
+    # user already chose their setup; never send them through it unasked.
+    migrated.setdefault("setup_complete", True)
     return migrated
 
 

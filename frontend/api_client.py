@@ -191,3 +191,42 @@ async def generate_status() -> dict[str, Any]:
         response = await client.get(f"{base_url()}/generate-status", headers=_headers())
     _raise_for_payload(response, "GET /generate-status")
     return response.json()
+
+
+async def get_setup_status() -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{base_url()}/setup/status", headers=_headers())
+    _raise_for_payload(response, "GET /setup/status")
+    return response.json()
+
+
+async def start_ollama() -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(f"{base_url()}/setup/ollama-start", headers=_headers())
+    _raise_for_payload(response, "POST /setup/ollama-start")
+    return response.json()
+
+
+async def start_ollama_pull(models: list[str]) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{base_url()}/setup/ollama-pull", json={"models": models}, headers=_headers()
+        )
+    _raise_for_payload(response, "POST /setup/ollama-pull")
+    return response.json()
+
+
+async def get_ollama_pull(job_id: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{base_url()}/setup/ollama-pull/{job_id}", headers=_headers())
+    _raise_for_payload(response, "GET /setup/ollama-pull")
+    return response.json()
+
+
+async def complete_setup(mode: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{base_url()}/setup/complete", json={"mode": mode}, headers=_headers()
+        )
+    _raise_for_payload(response, "POST /setup/complete")
+    return response.json()

@@ -80,3 +80,68 @@ async def test_settings_page_renders(user) -> None:
     await user.open("/settings")
     await user.should_see("Settings")
     await user.should_see("Local mode")
+
+
+def _report(**overrides) -> dict:
+    base = {
+        "platform": "darwin", "arch": "arm64", "ram_gb": 16.0,
+        "ffmpeg": {"found": False, "path": None, "version": None},
+        "ollama": {"installed": False, "running": False, "host": "http://localhost:11434", "models": [], "detail": "refused"},
+        "mlx_available": True,
+        "recommended": {"name": "standard", "generation_model": "qwen3:8b", "embedding_model": "nomic-embed-text",
+                        "download_gb": 5.5, "num_ctx": 8192, "note": ""},
+        "missing_models": ["qwen3:8b", "nomic-embed-text"],
+        "setup_complete": False, "mode": "local",
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_index_redirects_to_welcome_until_setup_is_complete(user, monkeypatch) -> None:
+    from frontend import api_client
+
+    async def _status() -> dict:
+        return _report()
+
+    monkeypatch.setattr(api_client, "get_setup_status", _status)
+    await user.open("/")
+    await user.should_see("Welcome to Socratic AI")
+    await user.should_see("qwen3:8b")           # the RAM-tiered recommendation is shown
+    await user.should_see("5.5 GB")
+
+
+async def test_welcome_local_checklist_shows_fixes(user, monkeypatch) -> None:
+    from frontend import api_client
+
+    async def _status() -> dict:
+        return _report()
+
+    monkeypatch.setattr(api_client, "get_setup_status", _status)
+    await user.open("/welcome")
+    await user.should_see("Continue")
+    user.find("Continue").click()
+    await user.should_see("Ollama not running")
+    await user.should_see("Download Ollama for macOS")   # not installed -> install link
+    await user.should_see("2 model(s) to download")
+    await user.should_see("ffmpeg missing")
+    await user.should_see("brew install ffmpeg")
+
+
+async def test_welcome_ready_machine_offers_download_button(user, monkeypatch) -> None:
+    from frontend import api_client
+
+    async def _status() -> dict:
+        return _report(
+            ffmpeg={"found": True, "path": "/opt/homebrew/bin/ffmpeg", "version": "7.1"},
+            ollama={"installed": True, "running": True, "host": "http://localhost:11434",
+                    "models": ["nomic-embed-text:latest"], "detail": ""},
+            missing_models=["qwen3:8b"],
+        )
+
+    monkeypatch.setattr(api_client, "get_setup_status", _status)
+    await user.open("/welcome")
+    await user.should_see("Continue")
+    user.find("Continue").click()
+    await user.should_see("Ollama running")
+    await user.should_see("Download 5.5 GB")
+    await user.should_see("ffmpeg found")
