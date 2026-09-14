@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextvars
 import json
-import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -63,10 +62,10 @@ from prompts.sections import (
 GENERATION_SCHEMA_VERSION = 17
 LEDGER_SCHEMA_VERSION = 2  # v2: parallel context-free window extraction (map-reduce)
 GENERATION_MAX_STAGE_ATTEMPTS = 3
-# Global cap on concurrent LLM calls (sources × windows can nest pools, so the
-# cap is enforced with a semaphore at the call site, not per pool).
+# Thread-pool width for fan-out. Actual in-flight LLM calls are capped by the
+# per-provider semaphores in config.llm_call_slots (hosted APIs absorb wide
+# fan-out; a local Ollama daemon queues excess requests against its timeout).
 MAX_PARALLEL_LLM_CALLS = 8
-_llm_call_slots = threading.BoundedSemaphore(MAX_PARALLEL_LLM_CALLS)
 
 _T = TypeVar("_T")
 
@@ -112,6 +111,16 @@ class GenerationStageError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _is_non_retryable(exc: Exception) -> bool:
+    """Deterministic failures (bad model name, bad key) should surface on the
+    first attempt instead of burning the full retry budget re-sending the
+    entire prompt."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    return status in (401, 403, 404)
+
+
 def _run_structured_generation_step(
     *,
     run_id: str,
@@ -123,6 +132,8 @@ def _run_structured_generation_step(
     required_keys: list[str] | None = None,
     model_name: str | None = None,
     use_aux: bool = False,
+    temperature: float = 0.0,
+    large_context: bool = False,
 ) -> dict[str, Any]:
     last_error_detail = "Retry budget exhausted."
     client = get_aux_client() if use_aux else get_llm_client()
@@ -136,18 +147,15 @@ def _run_structured_generation_step(
             attempt_number=attempt_number, status="started",
         )
         try:
-            with _llm_call_slots:  # global concurrency cap across nested pools
+            with config.llm_call_slots(client.name):  # per-provider concurrency cap
                 result = client.chat_json(
                     model=model_name,
                     system=system_prompt,
                     user=user_prompt,
                     json_schema=response_schema,
-                    temperature=0.0,
+                    temperature=temperature,
+                    large_context=large_context,
                 )
-            log_api_usage(
-                response=result.raw, user_id=user_id,
-                call_stage="generation", model_name=model_name,
-            )
             payload = parse_json_object(
                 result.content, stage_name=f"{stage_name} attempt {attempt_number}",
             )
@@ -155,21 +163,6 @@ def _run_structured_generation_step(
                 missing = [k for k in required_keys if k not in payload]
                 if missing:
                     raise ValueError(f"Missing required keys: {', '.join(missing)}")
-
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            log_generation_stage_event(
-                run_id=run_id, user_id=user_id, stage_name=stage_name,
-                attempt_number=attempt_number, status="succeeded",
-                duration_ms=duration_ms,
-            )
-            get_active_logger().record("stage_call", {
-                "stage_name": stage_name, "attempt": attempt_number,
-                "duration_ms": duration_ms, "model": model_name,
-                "prompt_tokens": result.usage.prompt_tokens,
-                "completion_tokens": result.usage.completion_tokens,
-                "total_tokens": result.usage.total_tokens,
-            })
-            return payload
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
             last_error_detail = str(exc)[:700]
@@ -178,6 +171,32 @@ def _run_structured_generation_step(
                 attempt_number=attempt_number, status="failed",
                 duration_ms=duration_ms, error_message=last_error_detail,
             )
+            if _is_non_retryable(exc):
+                break
+            if attempt_number < GENERATION_MAX_STAGE_ATTEMPTS:
+                time.sleep(0.5 * attempt_number)
+            continue
+
+        # Telemetry sits outside the try: a transient logging hiccup (e.g. a
+        # SQLite lock) must never burn a retry attempt for a successful call.
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        log_api_usage(
+            response=result, user_id=user_id,
+            call_stage="generation", model_name=model_name,
+        )
+        log_generation_stage_event(
+            run_id=run_id, user_id=user_id, stage_name=stage_name,
+            attempt_number=attempt_number, status="succeeded",
+            duration_ms=duration_ms,
+        )
+        get_active_logger().record("stage_call", {
+            "stage_name": stage_name, "attempt": attempt_number,
+            "duration_ms": duration_ms, "model": model_name,
+            "prompt_tokens": result.usage.prompt_tokens,
+            "completion_tokens": result.usage.completion_tokens,
+            "total_tokens": result.usage.total_tokens,
+        })
+        return payload
 
     raise GenerationStageError(
         run_id=run_id, stage_name=stage_name,
@@ -190,7 +209,14 @@ def _run_structured_generation_step(
 # ---------------------------------------------------------------------------
 
 
+_ensured_engines: set[int] = set()
+
+
 def ensure_generation_tables() -> None:
+    # Idempotent DDL, but PRAGMA-based migrations on every generate request are
+    # pure overhead — run once per engine (startup calls this; requests skip).
+    if id(db_engine) in _ensured_engines:
+        return
     with db_engine.begin() as connection:
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS source_learning_sections (
@@ -274,6 +300,7 @@ def ensure_generation_tables() -> None:
         """))
 
     ensure_ledger_table()
+    _ensured_engines.add(id(db_engine))
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +435,7 @@ def _consolidate_ledger(
         user_prompt=user_prompt,
         response_schema=CONSOLIDATION_JSON_SCHEMA,
         required_keys=["summary", "deep_dive", "key_terms", "under_surface", "reflection_points"],
+        large_context=True,
     )
 
 
@@ -576,6 +604,8 @@ def _generate_quiz_payload(
             "The ledger covers a SINGLE source; test its mechanisms, tradeoffs, "
             "and boundaries.\n\n"
         )
+    # temperature 0.7: the quiz needs sampling entropy (varied correct-answer
+    # positions, distinct distractors); greedy decoding biases the answer index.
     return _run_structured_generation_step(
         run_id=run_id,
         stage_name="quiz",
@@ -586,6 +616,8 @@ def _generate_quiz_payload(
         ),
         response_schema=QUIZ_JSON_SCHEMA,
         required_keys=["questions"],
+        temperature=0.7,
+        large_context=True,
     )
 
 
@@ -650,12 +682,18 @@ def _generate_synthesis(
             required_keys=[
                 "key_takeaways", "synthesis_text", "intersections", "application_scenarios",
             ],
+            large_context=True,
         )
 
-    # Insights and quiz are independent given the same ledger — run them in parallel.
+    # Insights and quiz are independent given the same ledger — run them in
+    # parallel. The quiz gets the claims without evidence quotes: its prompt
+    # forbids citing evidence, so those tokens were pure prompt waste.
+    rendered_no_evidence = render_units(merged, include_evidence=False)
     insights_payload, quiz_payload = _run_parallel([
         _insights_call,
-        lambda: _generate_quiz_payload(rendered, run_id=run_id, user_id=user_id, legend=legend),
+        lambda: _generate_quiz_payload(
+            rendered_no_evidence, run_id=run_id, user_id=user_id, legend=legend,
+        ),
     ])
 
     violations = validate_arc(CROSS_SOURCE_SECTIONS, insights_payload)
@@ -719,11 +757,15 @@ def _generate_single_source_deepening(
             user_prompt=user_prompt,
             response_schema=INSIGHTS_JSON_SCHEMA,
             required_keys=["key_takeaways", "synthesis_text", "application_scenarios"],
+            large_context=True,
         )
 
+    rendered_no_evidence = render_units(units, include_evidence=False)
     insights_payload, quiz_payload = _run_parallel([
         _insights_call,
-        lambda: _generate_quiz_payload(rendered, run_id=run_id, user_id=user_id, legend=None),
+        lambda: _generate_quiz_payload(
+            rendered_no_evidence, run_id=run_id, user_id=user_id, legend=None,
+        ),
     ])
 
     key_takeaways = [

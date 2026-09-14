@@ -184,7 +184,7 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
                 _source_row(doc["name"], "description", _remove)
 
             has_docs = bool(st["document_sources"])
-            can_generate = has_docs or has_video
+            can_generate = (has_docs or has_video) and not st.get("generating")
 
             with ui.row().classes("w-full items-center gap-2 mt-2"):
                 ui.button("← Back", on_click=lambda: (st.update(step=1), body.refresh())).props("flat")
@@ -194,26 +194,65 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
                 if not can_generate:
                     gen.disable()
 
-            if not can_generate:
+            if st.get("generating"):
+                ui.label("Generation in progress…").classes("text-xs text-gray-500")
+            elif not (has_docs or has_video):
                 ui.label("Upload a document above to enable Generate.").classes("text-xs text-gray-500")
             elif has_video and not has_docs:
                 ui.label(
                     "Documents are optional — generate with just the video, or add some."
                 ).classes("text-xs text-gray-400")
             else:
-                ui.label("Estimated time: about 2 to 5 minutes.").classes("text-xs text-gray-400")
+                ui.label(
+                    "Estimated time: a few minutes (a local model's first run also loads it into memory)."
+                ).classes("text-xs text-gray-400")
 
         stage_label = ui.label("").classes("text-primary")
         spinner = ui.spinner(size="lg")
         spinner.visible = False
 
+        def _friendly_stage(stage: str, status: str) -> str:
+            if not stage or status == "cache_hit":
+                return ""
+            if stage == "pipeline_start":
+                return "Starting the pipeline…"
+            if stage.startswith("ledger:"):
+                parts = stage.split(":")
+                name = parts[1] if len(parts) >= 3 else ""
+                part = parts[2] if len(parts) >= 3 else ""
+                suffix = f" — {name}, part {part}" if name and part else ""
+                return f"Extracting knowledge{suffix}…"
+            if stage.startswith("consolidation:"):
+                return f"Building the deep dive — {stage.split(':', 1)[1]}…"
+            if stage in ("synthesis:insights", "deepening:insights"):
+                return "Synthesizing insights…"
+            if stage == "quiz":
+                return "Writing the quiz…"
+            return ""
+
+        async def _poll_progress() -> None:
+            try:
+                payload = await api_client.generate_status()
+            except Exception:  # noqa: BLE001 — progress is best-effort
+                return
+            text = _friendly_stage(
+                str(payload.get("stage_name") or ""), str(payload.get("status") or "")
+            )
+            if text:
+                stage_label.text = text
+
         async def run_generation() -> None:
+            if st.get("generating"):
+                return
+            st["generating"] = True
             spinner.visible = True
+            panel.refresh()
+            progress_timer = ui.timer(2.0, _poll_progress)
             try:
                 video_source_id = st["video_source"]["source_id"] if st["video_source"] else None
                 document_source_ids = [int(d["source_id"]) for d in st["document_sources"]]
 
-                stage_label.text = "Generating tailored learning… (about 2 to 5 minutes)"
+                stage_label.text = "Generating tailored learning…"
                 generation_payload = await api_client.generate(
                     video_source_id=video_source_id, document_source_ids=document_source_ids,
                 )
@@ -233,6 +272,10 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
                 stage_label.text = ""
                 ui.notify(str(exc), type="negative", multi_line=True, close_button="OK")
             finally:
+                progress_timer.cancel()
                 spinner.visible = False
+                st["generating"] = False
+                if not st["pipeline_ready"]:  # panel is gone once the dashboard rendered
+                    panel.refresh()
 
         panel()

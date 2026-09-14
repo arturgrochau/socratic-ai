@@ -4,10 +4,12 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,12 +32,12 @@ from app.models import (
     UploadRequestMeta,
     VideoIngestionRecord,
 )
+import config
 from config import (
     INGESTION_VIDEO_STEP_TIMEOUT_SECONDS,
     WHISPER_TRANSCRIPTION_MAX_RETRIES,
     WHISPER_TRANSCRIPTION_TIMEOUT_SECONDS,
     db_engine,
-    openai_client,
 )
 
 
@@ -56,6 +58,12 @@ RAW_CHUNK_TARGET_CHARS = 2400
 RAW_CHUNK_OVERLAP_CHARS = 320
 WHISPER_MAX_REQUEST_BYTES = 24 * 1024 * 1024
 WHISPER_CHUNK_SECONDS = 540
+
+# Local (on-device) transcription backends, tried in order. Parakeet is faster
+# and more accurate on English; mlx-whisper covers more languages. Both are
+# Apple-Silicon (MLX) packages from the optional "local" dependency group.
+PARAKEET_MODEL_ID = os.getenv("SOCRATIC_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
+MLX_WHISPER_MODEL_ID = os.getenv("SOCRATIC_MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 
 
 logger = logging.getLogger(__name__)
@@ -254,7 +262,7 @@ def _download_youtube_video_with_cli(video_url: str, destination_dir: Path) -> t
     yt_dlp_binary = shutil.which("yt-dlp")
     if not yt_dlp_binary:
         raise RuntimeError(
-            "yt-dlp is required for YouTube ingestion. Install it with '.venv/bin/pip install -r requirements.txt'."
+            "yt-dlp is required for YouTube ingestion. Install it with 'uv sync'."
         )
 
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -361,6 +369,12 @@ def save_upload_file(upload: UploadFile, destination_dir: Path) -> Path:
 
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination_path = destination_dir / Path(upload.filename).name
+    # Two same-named uploads in one bundle must not clobber each other before
+    # parsing — suffix the collision.
+    counter = 1
+    while destination_path.exists():
+        destination_path = destination_dir / f"{Path(upload.filename).stem}-{counter}{Path(upload.filename).suffix}"
+        counter += 1
 
     upload.file.seek(0)
     with destination_path.open("wb") as destination:
@@ -459,12 +473,21 @@ def _transcribe_whisper_file(
     user_id: str,
     segment_offset_seconds: float,
 ) -> TranscriptPayload:
+    # Resolve the client at call time: a key added via the Settings panel must
+    # reach transcription without a restart (a frozen module-level import kept
+    # this broken in keyless-started processes).
+    client = config.openai_client
+    if client is None:
+        raise RuntimeError(
+            "OpenAI transcription is selected but no API key is configured. "
+            "Add a key in Settings, or switch transcription to 'local'."
+        )
     last_error: Exception | None = None
     transcription: object | None = None
     for attempt in range(1, WHISPER_TRANSCRIPTION_MAX_RETRIES + 1):
         try:
             with audio_path.open("rb") as audio_file:
-                transcription = openai_client.audio.transcriptions.create(
+                transcription = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     response_format="verbose_json",
@@ -503,9 +526,76 @@ def _transcribe_whisper_file(
     )
 
 
+# Lazy singletons: local models load once per process, guarded for the
+# threadpool contexts ingestion runs in.
+_local_transcriber_lock = threading.Lock()
+_parakeet_model: object | None = None
+
+
+def _transcribe_with_parakeet(audio_path: Path) -> dict:
+    global _parakeet_model
+    from parakeet_mlx import from_pretrained
+
+    with _local_transcriber_lock:
+        if _parakeet_model is None:
+            logger.info("Loading parakeet model %s (first use)…", PARAKEET_MODEL_ID)
+            _parakeet_model = from_pretrained(PARAKEET_MODEL_ID)
+        # Built-in long-audio chunking with overlap; sentence-level timestamps.
+        result = _parakeet_model.transcribe(
+            str(audio_path), chunk_duration=120.0, overlap_duration=15.0,
+        )
+    return {
+        "text": result.text,
+        "segments": [
+            {"start": s.start, "end": s.end, "text": s.text} for s in result.sentences
+        ],
+    }
+
+
+def _transcribe_with_mlx_whisper(audio_path: Path) -> dict:
+    import mlx_whisper
+
+    with _local_transcriber_lock:
+        return mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=MLX_WHISPER_MODEL_ID)
+
+
+def _transcribe_locally(audio_path: Path, user_id: str) -> TranscriptPayload:
+    """On-device transcription; no request-size cap, so no chunking machinery."""
+    last_import_error: Exception | None = None
+    for backend_name, backend in (
+        ("parakeet-mlx", _transcribe_with_parakeet),
+        ("mlx-whisper", _transcribe_with_mlx_whisper),
+    ):
+        try:
+            payload = backend(audio_path)
+        except ImportError as exc:
+            last_import_error = exc
+            continue
+        log_api_usage(
+            response=payload, user_id=user_id,
+            call_stage="ingestion", model_name=backend_name,
+        )
+        return _parse_whisper_transcription(payload, segment_offset_seconds=0.0)
+    raise RuntimeError(
+        "Local transcription needs the optional 'local' dependencies "
+        "(uv sync --extra local, or pip install 'socratic-ai[local]'; Apple Silicon only). "
+        "Alternatively switch transcription to 'openai' in Settings. "
+        f"Import error: {last_import_error}"
+    )
+
+
 def transcribe_audio_with_whisper(audio_path: Path, user_id: str) -> TranscriptPayload:
     if not audio_path.exists() or audio_path.stat().st_size == 0:
         raise RuntimeError("Audio file is missing or empty.")
+
+    provider = config.get_settings().whisper_provider
+    if provider == "none":
+        raise RuntimeError(
+            "Video ingestion is disabled (transcription provider is 'none'). "
+            "Pick 'local' or 'openai' in Settings."
+        )
+    if provider != "openai":
+        return _transcribe_locally(audio_path, user_id)
 
     audio_size = audio_path.stat().st_size
     if audio_size <= WHISPER_MAX_REQUEST_BYTES:
@@ -909,19 +999,22 @@ async def ingest_upload_bundle(
     video_display_name: str | None = None
     video_mime_type: str | None = None
 
+    # File copies and yt-dlp downloads are blocking — keep them off the event
+    # loop or the UI websocket freezes for the duration.
     if video_file is not None:
-        video_path = save_upload_file(video_file, video_dir)
+        video_path = await asyncio.to_thread(save_upload_file, video_file, video_dir)
         video_display_name = Path(video_file.filename or video_path.name).name
         video_mime_type = video_file.content_type
     elif normalized_video_url is not None:
-        video_path, video_display_name, video_mime_type = download_youtube_video(
+        video_path, video_display_name, video_mime_type = await asyncio.to_thread(
+            download_youtube_video,
             normalized_video_url,
             video_dir,
         )
 
     saved_documents: list[tuple[UploadFile, Path]] = []
     for document_file in normalized_documents:
-        document_path = save_upload_file(document_file, documents_dir)
+        document_path = await asyncio.to_thread(save_upload_file, document_file, documents_dir)
         saved_documents.append((document_file, document_path))
 
     # 2) Audio extraction + 3) Transcription

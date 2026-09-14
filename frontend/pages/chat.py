@@ -33,6 +33,11 @@ def build_chat_panel():
                     sent=(message["role"] == "user"),
                     name="You" if message["role"] == "user" else "Socratic AI",
                 ).classes("w-full")
+            if st.get("ask_pending"):
+                with ui.chat_message(name="Socratic AI").classes("w-full"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.spinner(size="sm")
+                        ui.label("Thinking…").classes("text-gray-500")
 
         async def submit(query: str, *, display: str | None = None) -> None:
             query_text = (query or "").strip()
@@ -40,6 +45,7 @@ def build_chat_panel():
                 return
             display_text = (display or query_text).strip() or query_text
             messages.append({"role": "user", "content": display_text})
+            st["ask_pending"] = True
             panel.refresh()
             try:
                 result = await api_client.ask(
@@ -59,6 +65,7 @@ def build_chat_panel():
                         "Please try asking again with a more specific wording."
                     ),
                 })
+            st["ask_pending"] = False
             panel.refresh()
 
         # Quiz handoff: if another tab seeded a prompt, auto-ask it once.

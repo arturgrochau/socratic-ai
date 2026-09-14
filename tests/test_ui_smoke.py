@@ -79,4 +79,4 @@ async def test_settings_page_renders(user) -> None:
     # paints its header/intro (the endpoint itself is covered in test_settings_api).
     await user.open("/settings")
     await user.should_see("Settings")
-    await user.should_see("local Ollama model")
+    await user.should_see("Local mode")

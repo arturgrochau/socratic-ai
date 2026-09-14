@@ -1,7 +1,7 @@
 [project]
 name = "socratic-ai"
-version = "2.2.0"
-description = "Turn videos, PDFs, and lectures into a Socratic thinking workout — a structured learning generator with an in-app local/API model switch."
+version = "2.3.0"
+description = "Turn videos, PDFs, and lectures into a Socratic thinking workout — private by default: local models, local transcription, one-click API switch."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -24,6 +24,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+# On-device transcription (Apple Silicon / MLX). Local LLM+embedding roles only
+# need a running Ollama daemon — no extra Python deps.
+local = [
+    "parakeet-mlx; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-whisper; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [project.scripts]
 socratic-ai = "run:main"

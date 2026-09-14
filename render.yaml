@@ -8,6 +8,13 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false
+      # The code default is local (Ollama); cloud hosts have no daemon, so pin API mode.
+      - key: LLM_PROVIDER
+        value: openai
+      - key: EMBEDDING_PROVIDER
+        value: openai
+      - key: WHISPER_PROVIDER
+        value: openai
       - key: DATABASE_URL
         value: sqlite:///./app.db
       - key: CHROMA_PERSIST_DIR

@@ -1,19 +1,26 @@
-"""Settings page: switch OpenAI API <-> local Ollama at runtime (no restart)."""
+"""Settings page: one-click Local ↔ API mode toggle, per-mode model choices.
+
+Local mode runs everything on this machine (Ollama + on-device transcription);
+API mode uses OpenAI. Each mode keeps its own model bundle, so toggling never
+loses choices. Changes apply immediately — no restart, no .env editing.
+"""
 from __future__ import annotations
+
+from typing import Any
 
 from nicegui import ui
 
 from frontend import api_client
 
 
-PROVIDERS = ["openai", "ollama"]
+WHISPER_PROVIDERS = ["local", "openai", "none"]
 
 
 async def render_settings_page() -> None:
     ui.label("Settings").classes("text-2xl font-bold")
     ui.label(
-        "Switch between the OpenAI API and a local Ollama model. Changes apply "
-        "immediately — no restart, no .env editing."
+        "Local mode keeps everything on this machine — lectures, notes, and models. "
+        "API mode sends text to OpenAI for higher-end hosted models."
     ).classes("text-sm text-gray-500 mb-2")
 
     try:
@@ -22,73 +29,168 @@ async def render_settings_page() -> None:
         ui.label(f"Could not load settings: {exc}").classes("text-red-700")
         return
 
-    with ui.card().classes("w-full max-w-2xl gap-2"):
-        ui.label("Providers").classes("text-lg font-semibold")
-        llm = ui.select(PROVIDERS, value=current["llm_provider"], label="LLM provider (generation + chat)")
-        embedding = ui.select(PROVIDERS, value=current["embedding_provider"], label="Embedding provider (retrieval)")
-        whisper = ui.select(PROVIDERS, value=current["whisper_provider"], label="Whisper provider (transcription)")
+    try:
+        ollama_models = (await api_client.get_ollama_models()).get("models") or []
+    except Exception:  # noqa: BLE001 — daemon may be down; free-text entry still works
+        ollama_models = []
 
-        ui.label("OpenAI").classes("text-lg font-semibold mt-2")
-        key_placeholder = (
-            f"Stored: {current['openai_api_key_masked']} — leave blank to keep"
-            if current["openai_api_key_set"]
-            else "sk-..."
-        )
-        api_key = ui.input("OpenAI API key", password=True, placeholder=key_placeholder).classes("w-full")
+    @ui.refreshable
+    def page(current: dict[str, Any]) -> None:
+        is_local = current["mode"] == "local"
 
-        ui.label("Ollama (local)").classes("text-lg font-semibold mt-2")
-        ollama_host = ui.input("Ollama host", value=current["ollama_host"]).classes("w-full")
-
-        ui.label("Models").classes("text-lg font-semibold mt-2")
-        generation_model = ui.input("Generation model", value=current["generation_model"]).classes("w-full")
-        chat_model = ui.input("Chat model", value=current["chat_model"]).classes("w-full")
-        retrieval_model = ui.input("Retrieval/embedding model", value=current["retrieval_model"]).classes("w-full")
-
-        with ui.expansion("Auxiliary model (cheap high-volume passes)").classes("w-full"):
-            aux_use_local = ui.switch("Route aux passes to local Ollama", value=current["aux_use_local"])
-            aux_llm_provider = ui.select(PROVIDERS, value=current["aux_llm_provider"], label="Aux provider")
-            aux_model = ui.input("Aux model (hosted)", value=current["aux_model"]).classes("w-full")
-            aux_local_model = ui.input("Aux model (local Ollama)", value=current["aux_local_model"]).classes("w-full")
-
-        async def test(provider: str) -> None:
+        async def switch_mode(mode: str) -> None:
+            if mode == current["mode"]:
+                return
             try:
-                result = await api_client.test_connection(provider)
+                updated = await api_client.put_mode(mode)
             except Exception as exc:  # noqa: BLE001
-                ui.notify(f"{provider}: {exc}", type="negative")
+                ui.notify(str(exc), type="negative", multi_line=True, close_button="OK")
+                page.refresh(current)  # snap the toggle back
                 return
             ui.notify(
-                f"{provider}: {result.get('detail', '')}",
-                type="positive" if result.get("ok") else "negative",
+                "Local mode: everything runs on this machine."
+                if mode == "local"
+                else "API mode: generation now uses OpenAI.",
+                type="positive",
             )
+            page.refresh(updated)
 
-        async def apply() -> None:
-            payload = {
-                "llm_provider": llm.value,
-                "embedding_provider": embedding.value,
-                "whisper_provider": whisper.value,
-                "ollama_host": ollama_host.value,
-                "generation_model": generation_model.value,
-                "chat_model": chat_model.value,
-                "retrieval_model": retrieval_model.value,
-                "aux_use_local": aux_use_local.value,
-                "aux_llm_provider": aux_llm_provider.value,
-                "aux_model": aux_model.value,
-                "aux_local_model": aux_local_model.value,
-            }
-            key_value = (api_key.value or "").strip()
-            if key_value:
-                payload["openai_api_key"] = key_value
-            try:
-                await api_client.put_settings(payload)
-            except Exception as exc:  # noqa: BLE001
-                ui.notify(f"Failed to apply settings: {exc}", type="negative")
-                return
-            api_key.value = ""
-            ui.notify("Settings applied.", type="positive")
+        with ui.card().classes("w-full max-w-2xl gap-2"):
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Mode").classes("text-lg font-semibold")
+                ui.toggle(
+                    {"local": "Local (private)", "api": "OpenAI API"},
+                    value=current["mode"],
+                    on_change=lambda e: switch_mode(str(e.value)),
+                ).props("color=primary")
+            ui.label(
+                "Local: Ollama models + on-device transcription. Nothing leaves this machine."
+                if is_local
+                else "API: OpenAI models + Whisper. Requires an API key."
+            ).classes("text-xs text-gray-500")
 
-        with ui.row().classes("mt-3"):
-            ui.button("Test OpenAI", on_click=lambda: test("openai")).props("outline")
-            ui.button("Test Ollama", on_click=lambda: test("ollama")).props("outline")
-            ui.button("Apply", on_click=apply).props("unelevated color=primary")
+        with ui.card().classes("w-full max-w-2xl gap-2 mt-3"):
+            if is_local:
+                ui.label("Local models (Ollama)").classes("text-lg font-semibold")
+                ollama_host = ui.input("Ollama host", value=current["ollama_host"]).classes("w-full")
+
+                def model_field(label: str, key: str) -> Any:
+                    if ollama_models:
+                        return ui.select(
+                            sorted(set(ollama_models + [current[key]])),
+                            value=current[key],
+                            label=label,
+                            with_input=True,
+                        ).classes("w-full")
+                    return ui.input(label, value=current[key]).classes("w-full")
+
+                generation_model = model_field("Generation model", "local_generation_model")
+                chat_model = model_field("Chat model", "local_chat_model")
+                retrieval_model = model_field("Embedding model", "local_retrieval_model")
+                with ui.expansion("Advanced").classes("w-full"):
+                    aux_model = model_field(
+                        "Aux model (high-volume extraction passes)", "local_aux_model"
+                    )
+                    whisper = ui.select(
+                        WHISPER_PROVIDERS,
+                        value=current["whisper_provider"],
+                        label="Transcription (local = on-device, none = disable video)",
+                    )
+                    # The key stays enterable from local mode: switching to API
+                    # mode requires one, so hiding this field would make the
+                    # toggle a dead end on a keyless install.
+                    key_placeholder = (
+                        f"Stored: {current['openai_api_key_masked']} — leave blank to keep"
+                        if current["openai_api_key_set"]
+                        else "sk-... (needed to switch to API mode)"
+                    )
+                    api_key = ui.input(
+                        "OpenAI API key", password=True, placeholder=key_placeholder
+                    ).classes("w-full")
+                payload_keys = {
+                    "local_generation_model": generation_model,
+                    "local_chat_model": chat_model,
+                    "local_retrieval_model": retrieval_model,
+                    "local_aux_model": aux_model,
+                }
+                aux_use_local = None
+            else:
+                ui.label("OpenAI").classes("text-lg font-semibold")
+                key_placeholder = (
+                    f"Stored: {current['openai_api_key_masked']} — leave blank to keep"
+                    if current["openai_api_key_set"]
+                    else "sk-..."
+                )
+                api_key = ui.input(
+                    "OpenAI API key", password=True, placeholder=key_placeholder
+                ).classes("w-full")
+                generation_model = ui.input(
+                    "Generation model", value=current["openai_generation_model"]
+                ).classes("w-full")
+                chat_model = ui.input("Chat model", value=current["openai_chat_model"]).classes("w-full")
+                retrieval_model = ui.input(
+                    "Embedding model", value=current["openai_retrieval_model"]
+                ).classes("w-full")
+                with ui.expansion("Advanced").classes("w-full"):
+                    aux_model = ui.input(
+                        "Aux model (high-volume extraction passes)",
+                        value=current["openai_aux_model"],
+                    ).classes("w-full")
+                    aux_use_local = ui.switch(
+                        "Route aux passes to local Ollama when available",
+                        value=current["aux_use_local"],
+                    )
+                    whisper = ui.select(
+                        WHISPER_PROVIDERS,
+                        value=current["whisper_provider"],
+                        label="Transcription (local = on-device, none = disable video)",
+                    )
+                    ollama_host = ui.input("Ollama host", value=current["ollama_host"]).classes("w-full")
+                payload_keys = {
+                    "openai_generation_model": generation_model,
+                    "openai_chat_model": chat_model,
+                    "openai_retrieval_model": retrieval_model,
+                    "openai_aux_model": aux_model,
+                }
+
+            async def test(provider: str) -> None:
+                try:
+                    result = await api_client.test_connection(provider)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"{provider}: {exc}", type="negative")
+                    return
+                ui.notify(
+                    f"{provider}: {result.get('detail', '')}",
+                    type="positive" if result.get("ok") else "negative",
+                )
+
+            async def apply() -> None:
+                payload: dict[str, Any] = {
+                    key: field.value for key, field in payload_keys.items()
+                }
+                payload["whisper_provider"] = whisper.value
+                payload["ollama_host"] = ollama_host.value
+                if aux_use_local is not None:
+                    payload["aux_use_local"] = aux_use_local.value
+                if api_key is not None:
+                    key_value = (api_key.value or "").strip()
+                    if key_value:
+                        payload["openai_api_key"] = key_value
+                try:
+                    updated = await api_client.put_settings(payload)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"Failed to apply settings: {exc}", type="negative", multi_line=True)
+                    return
+                ui.notify("Settings applied.", type="positive")
+                page.refresh(updated)
+
+            with ui.row().classes("mt-3"):
+                if is_local:
+                    ui.button("Test Ollama", on_click=lambda: test("ollama")).props("outline")
+                else:
+                    ui.button("Test OpenAI", on_click=lambda: test("openai")).props("outline")
+                ui.button("Apply", on_click=apply).props("unelevated color=primary")
+
+    page(current)
 
     ui.link("← Back to app", "/").classes("mt-3")

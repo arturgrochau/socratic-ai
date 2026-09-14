@@ -146,3 +146,26 @@ async def test_connection(provider: str) -> dict[str, Any]:
         )
     _raise_for_payload(response, "GET /settings/test")
     return response.json()
+
+
+async def put_mode(mode: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.put(
+            f"{base_url()}/settings/mode", json={"mode": mode}, headers=_headers()
+        )
+    _raise_for_payload(response, "PUT /settings/mode")
+    return response.json()
+
+
+async def get_ollama_models() -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(f"{base_url()}/settings/ollama-models", headers=_headers())
+    _raise_for_payload(response, "GET /settings/ollama-models")
+    return response.json()
+
+
+async def generate_status() -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(f"{base_url()}/generate-status", headers=_headers())
+    _raise_for_payload(response, "GET /generate-status")
+    return response.json()

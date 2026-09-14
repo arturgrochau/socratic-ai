@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import threading
 from typing import Any
 
 from sqlalchemy import text
@@ -9,13 +11,48 @@ import config
 from config import chroma_client, db_engine, get_llm_client
 
 
-COLLECTION_NAME = "interaction_retrieval_concepts"
+# Collections are keyed by embedding provider+model: vectors from different
+# models share neither dimensionality nor geometry, so a provider switch must
+# land in its own collection instead of colliding with (or silently querying)
+# stale vectors from the previous model. Chunks re-embed lazily per collection.
+COLLECTION_PREFIX = "interaction_retrieval"
 EMBEDDING_BATCH_SIZE = 64
 QUERY_MULTIPLIER = 2
 MAX_CONTEXT_CHARS = 4500
 MAX_HIT_TEXT_CHARS = 280
-MIN_RAW_HIT_SCORE = 0.53
+# Collections use cosine distance (d = 1 - cos), so score = 1/(1+d). This floor
+# keeps roughly the cosine cutoff (~0.55) the old l2 threshold encoded, loosened
+# a little for local embedders whose similarity distributions run wider.
+MIN_RAW_HIT_SCORE = 0.66
 RAW_FIELD_TYPE = "raw_chunk"
+
+# (user_id, source_id, collection_name) triples whose chunks are known embedded
+# — skips the per-chat-turn Chroma existence sweep over every chunk id.
+_fully_embedded: set[tuple[str, int, str]] = set()
+_fully_embedded_lock = threading.Lock()
+
+
+def _collection_name() -> str:
+    slug = re.sub(
+        r"[^a-zA-Z0-9._-]", "-", f"{config.embedding_provider()}-{config.retrieval_model()}"
+    ).strip("-_.")
+    return f"{COLLECTION_PREFIX}__{slug}"[:120]
+
+
+def _prefixed_for_embedding(texts: list[str], *, kind: str) -> list[str]:
+    """Apply the task prefixes local embedding models are trained with.
+
+    nomic-embed-text and embeddinggemma measurably degrade without their
+    document/query prefixes; OpenAI models take raw text."""
+    model = config.retrieval_model()
+    if "nomic-embed" in model:
+        prefix = "search_document: " if kind == "document" else "search_query: "
+        return [prefix + text_value for text_value in texts]
+    if "embeddinggemma" in model:
+        if kind == "document":
+            return [f"title: none | text: {text_value}" for text_value in texts]
+        return [f"task: search result | query: {text_value}" for text_value in texts]
+    return texts
 
 
 def _build_in_clause(values: list[int | str], prefix: str) -> tuple[str, dict[str, int | str]]:
@@ -29,15 +66,24 @@ def _build_in_clause(values: list[int | str], prefix: str) -> tuple[str, dict[st
 
 
 def _get_collection() -> Any:
-    return chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    return chroma_client.get_or_create_collection(
+        name=_collection_name(),
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_provider": config.embedding_provider(),
+            "embedding_model": config.retrieval_model(),
+        },
+    )
 
 
-def _embed_texts(texts: list[str], user_id: str) -> list[list[float]]:
+def _embed_texts(texts: list[str], *, kind: str = "document") -> list[list[float]]:
     if not texts:
         return []
     client = get_llm_client(config.embedding_provider())
-    embeddings = client.embed(model=config.retrieval_model(), inputs=texts)
-    return embeddings
+    return client.embed(
+        model=config.retrieval_model(),
+        inputs=_prefixed_for_embedding(texts, kind=kind),
+    )
 
 
 def load_raw_chunks_for_sources(source_ids: list[int], user_id: str) -> list[dict[str, Any]]:
@@ -127,6 +173,12 @@ def upsert_retrieval_embeddings(
     *,
     preloaded_raw_chunks: list[dict[str, Any]] | None = None,
 ) -> int:
+    collection_name = _collection_name()
+    normalized = sorted({sid for sid in source_ids if sid > 0})
+    with _fully_embedded_lock:
+        if all((user_id, sid, collection_name) in _fully_embedded for sid in normalized):
+            return 0
+
     raw_chunks = preloaded_raw_chunks or load_raw_chunks_for_sources(source_ids, user_id)
     embedding_docs = build_raw_embedding_documents(raw_chunks, user_id)
     if not embedding_docs:
@@ -138,13 +190,10 @@ def upsert_retrieval_embeddings(
     existing_ids = set(existing.get("ids", []))
 
     missing_docs = [entry for entry in embedding_docs if entry["id"] not in existing_ids]
-    if not missing_docs:
-        return 0
-
     for start in range(0, len(missing_docs), EMBEDDING_BATCH_SIZE):
         batch = missing_docs[start : start + EMBEDDING_BATCH_SIZE]
         texts = [entry["text"] for entry in batch]
-        embeddings = _embed_texts(texts, user_id)
+        embeddings = _embed_texts(texts, kind="document")
         collection.upsert(
             ids=[entry["id"] for entry in batch],
             documents=texts,
@@ -152,6 +201,9 @@ def upsert_retrieval_embeddings(
             embeddings=embeddings,
         )
 
+    with _fully_embedded_lock:
+        for sid in normalized:
+            _fully_embedded.add((user_id, sid, collection_name))
     return len(missing_docs)
 
 
@@ -195,15 +247,21 @@ def retrieve_context(
     if not normalized_source_ids:
         raise ValueError("At least one valid source_id is required for retrieval.")
 
-    raw_chunks = load_raw_chunks_for_sources(normalized_source_ids, user_id)
-    if not raw_chunks:
-        raise ValueError("No retrieval context found for the provided query and sources.")
+    collection_name = _collection_name()
+    with _fully_embedded_lock:
+        all_embedded = all(
+            (user_id, sid, collection_name) in _fully_embedded
+            for sid in normalized_source_ids
+        )
+    if not all_embedded:
+        raw_chunks = load_raw_chunks_for_sources(normalized_source_ids, user_id)
+        if not raw_chunks:
+            raise ValueError("No retrieval context found for the provided query and sources.")
+        upsert_retrieval_embeddings(
+            normalized_source_ids, user_id, preloaded_raw_chunks=raw_chunks,
+        )
 
-    upsert_retrieval_embeddings(
-        normalized_source_ids, user_id, preloaded_raw_chunks=raw_chunks,
-    )
-
-    query_embedding = _embed_texts([normalized_query], user_id)[0]
+    query_embedding = _embed_texts([normalized_query], kind="query")[0]
     collection = _get_collection()
     raw_result = collection.query(
         query_embeddings=[query_embedding],

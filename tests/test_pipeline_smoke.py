@@ -253,6 +253,7 @@ class _FakeClient:
         json_schema: dict | None = None,
         temperature: float = 0.0,
         stream: bool = False,
+        large_context: bool = False,
     ) -> _FakeResult:
         schema_name = json_schema.get("name", "") if json_schema else ""
         if schema_name == "ledger_extraction":

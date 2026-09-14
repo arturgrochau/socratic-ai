@@ -4,9 +4,16 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import app.ingestion as ingestion
+
+
+def _patch_openai_client() -> tuple[object, MagicMock]:
+    """Transcription resolves config.openai_client at call time (so runtime key
+    changes take effect); patch there, key-independent."""
+    fake_client = MagicMock()
+    return patch("config.openai_client", fake_client), fake_client.audio.transcriptions.create
 
 
 class WhisperTranscriptionRetryTests(unittest.TestCase):
@@ -19,8 +26,8 @@ class WhisperTranscriptionRetryTests(unittest.TestCase):
         return Path(path)
 
     @patch("app.ingestion.log_api_usage")
-    @patch("app.ingestion.openai_client.audio.transcriptions.create")
-    def test_whisper_retries_then_succeeds(self, mock_create, _mock_log_usage) -> None:
+    def test_whisper_retries_then_succeeds(self, _mock_log_usage) -> None:
+        client_patch, mock_create = _patch_openai_client()
         audio_path = self._make_temp_audio_file()
         try:
             mock_create.side_effect = [
@@ -37,7 +44,7 @@ class WhisperTranscriptionRetryTests(unittest.TestCase):
                 },
             ]
 
-            with patch.object(ingestion, "WHISPER_TRANSCRIPTION_MAX_RETRIES", 2):
+            with client_patch, patch.object(ingestion, "WHISPER_TRANSCRIPTION_MAX_RETRIES", 2):
                 payload = ingestion._transcribe_whisper_file(
                     audio_path=audio_path,
                     user_id="retry-user",
@@ -53,13 +60,13 @@ class WhisperTranscriptionRetryTests(unittest.TestCase):
             audio_path.unlink(missing_ok=True)
 
     @patch("app.ingestion.log_api_usage")
-    @patch("app.ingestion.openai_client.audio.transcriptions.create")
-    def test_whisper_raises_after_retry_budget(self, mock_create, _mock_log_usage) -> None:
+    def test_whisper_raises_after_retry_budget(self, _mock_log_usage) -> None:
+        client_patch, mock_create = _patch_openai_client()
         audio_path = self._make_temp_audio_file()
         try:
             mock_create.side_effect = Exception("persistent timeout")
 
-            with patch.object(ingestion, "WHISPER_TRANSCRIPTION_MAX_RETRIES", 2):
+            with client_patch, patch.object(ingestion, "WHISPER_TRANSCRIPTION_MAX_RETRIES", 2):
                 with self.assertRaises(RuntimeError) as exc_ctx:
                     ingestion._transcribe_whisper_file(
                         audio_path=audio_path,

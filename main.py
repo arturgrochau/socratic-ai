@@ -13,7 +13,7 @@ from routes.upload import router as upload_router
 from routes.workflow import router as workflow_router
 
 
-app = FastAPI(title="Study Assistant API")
+app = FastAPI(title="Socratic AI")
 app.include_router(upload_router)
 app.include_router(interaction_router)
 app.include_router(workflow_router)

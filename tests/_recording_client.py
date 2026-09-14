@@ -234,6 +234,24 @@ def install_cassette(monkeypatch: Any, cassette_name: str) -> CassetteClient:
     monkeypatch.setattr(config, "get_llm_client", lambda provider=None: wrapped)
     monkeypatch.setattr(config, "get_aux_client", lambda: wrapped)
 
+    # Pin the model names the cassette was recorded with: request hashes include
+    # the model, so runtime defaults (local by default) must not leak in here.
+    from dataclasses import replace
+    config.apply_settings(
+        replace(
+            config.get_settings(),
+            llm_provider="openai",
+            embedding_provider="openai",
+            whisper_provider="openai",
+            openai_generation_model="gpt-4o-mini",
+            openai_chat_model="gpt-4o-mini",
+            openai_retrieval_model="text-embedding-3-small",
+            openai_aux_model="gpt-4o-mini",
+            openai_api_key=config.get_settings().openai_api_key or "cassette-replay",
+        ),
+        persist=False,
+    )
+
     # Modules that did `from config import openai_client / get_llm_client /
     # get_aux_client` captured those symbols at import time; rebind each one.
     for mod_name in (

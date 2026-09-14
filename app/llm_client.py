@@ -1,16 +1,15 @@
 """
-LLMClient abstraction: thin shim over OpenAI today, Ollama tomorrow.
+LLMClient abstraction over the hosted OpenAI API and a local Ollama daemon.
 
-Two implementations:
-  * OpenAIClient — wraps the existing openai SDK.
-  * OllamaClient — talks to a local Ollama daemon over HTTP.
+Two implementations behind one protocol:
+  * OpenAIClient — wraps the openai SDK; JSON enforced via response_format.
+  * OllamaClient — talks to the local daemon over HTTP; JSON enforced via
+    Ollama structured outputs (the JSON schema is compiled to a decoding
+    grammar server-side, so malformed JSON is mechanically impossible).
 
-Provider selection happens in config.get_llm_client() via app.models_registry.
-Existing call sites can keep using openai_client directly; new code should go
-through this module. To migrate a call site, replace
-    openai_client.chat.completions.create(model=M, ...)
-with
-    get_chat_client_for("interaction").chat_json(...)
+Provider selection happens in config.get_llm_client(). All pipeline call
+sites go through chat_json/embed; transcription has its own provider switch
+in app/ingestion.py (local Whisper does not involve Ollama).
 """
 from __future__ import annotations
 
@@ -38,13 +37,6 @@ class ChatResult:
     raw: Any
     usage: ChatUsage
 
-    # Make the result quack like the OpenAI completion object so log_api_usage
-    # keeps working without changes.
-    def __getattr__(self, name: str) -> Any:
-        if name == "usage":
-            return self.usage
-        raise AttributeError(name)
-
 
 class LLMClient(Protocol):
     name: str
@@ -58,6 +50,7 @@ class LLMClient(Protocol):
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
         stream: bool = False,
+        large_context: bool = False,
     ) -> ChatResult: ...
 
     def embed(self, *, model: str, inputs: list[str]) -> list[list[float]]: ...
@@ -86,6 +79,7 @@ class OpenAIClient:
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
         stream: bool = False,
+        large_context: bool = False,
     ) -> ChatResult:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -128,11 +122,20 @@ class OpenAIClient:
             )
 
 
-class OllamaClient:
-    """Minimal Ollama adapter. Works for chat + embeddings.
+# Bound completion length under grammar-constrained decoding: a grammar can
+# steer a model into states it would never sample freely (e.g. an endless
+# array); an explicit cap turns that into an invalid-JSON retry instead of a
+# multi-minute stall. Far above any legitimate pipeline output (~2k tokens).
+OLLAMA_NUM_PREDICT = 4096
 
-    Transcription is not supported and raises NotImplementedError — keep
-    WHISPER_PROVIDER=openai when using Ollama for everything else.
+
+class OllamaClient:
+    """Ollama adapter for chat + embeddings.
+
+    chat_json uses structured outputs (schema passed as `format`), sets an
+    explicit context window (the daemon default of 4096 silently truncates
+    long prompts head-first), and keeps the model warm between pipeline
+    stages. Transcription is not Ollama's job — see app/ingestion.py.
     """
     name = "ollama"
 
@@ -141,7 +144,14 @@ class OllamaClient:
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         import requests
-        response = requests.post(f"{self.host}{path}", json=payload, timeout=300)
+
+        import config
+
+        response = requests.post(
+            f"{self.host}{path}",
+            json=payload,
+            timeout=(10, config.OLLAMA_TIMEOUT_SECONDS),
+        )
         response.raise_for_status()
         return response.json()
 
@@ -154,69 +164,89 @@ class OllamaClient:
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
         stream: bool = False,
+        large_context: bool = False,
     ) -> ChatResult:
         if stream:
             raise NotImplementedError("Streaming via OllamaClient not wired yet.")
 
+        import config
+
+        options: dict[str, Any] = {
+            "temperature": temperature,
+            "num_ctx": config.OLLAMA_NUM_CTX_LARGE if large_context else config.OLLAMA_NUM_CTX,
+        }
+        if temperature > 0:
+            options["top_p"] = 0.8  # qwen3-instruct guidance for sampled decoding
         payload: dict[str, Any] = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "options": {"temperature": temperature},
+            "options": options,
+            "keep_alive": config.OLLAMA_KEEP_ALIVE,
             "stream": False,
         }
         if json_schema is not None:
-            payload["format"] = "json"
+            # Unwrap the OpenAI response_format envelope ({name, strict, schema})
+            # to the bare JSON schema Ollama compiles into a decoding grammar.
+            payload["format"] = json_schema.get("schema", json_schema)
+            payload["options"]["num_predict"] = OLLAMA_NUM_PREDICT
 
         last_error: Exception | None = None
         for attempt in range(2):
             data = self._post("/api/chat", payload)
             content = (data.get("message", {}) or {}).get("content", "")
+            prompt_tokens = data.get("prompt_eval_count")
+            completion_tokens = data.get("eval_count")
+            usage = ChatUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=((prompt_tokens or 0) + (completion_tokens or 0)) or None,
+            )
             if json_schema is None:
-                return ChatResult(
-                    content=content,
-                    raw=data,
-                    usage=ChatUsage(
-                        prompt_tokens=data.get("prompt_eval_count"),
-                        completion_tokens=data.get("eval_count"),
-                        total_tokens=(
-                            (data.get("prompt_eval_count") or 0)
-                            + (data.get("eval_count") or 0)
-                        ) or None,
-                    ),
-                )
+                return ChatResult(content=content, raw=data, usage=usage)
             try:
                 parse_json_object(content, stage_name="ollama")
-                return ChatResult(
-                    content=content,
-                    raw=data,
-                    usage=ChatUsage(
-                        prompt_tokens=data.get("prompt_eval_count"),
-                        completion_tokens=data.get("eval_count"),
-                    ),
-                )
+                return ChatResult(content=content, raw=data, usage=usage)
             except ValueError as exc:
                 last_error = exc
                 if attempt == 0:
-                    payload["messages"].append({
-                        "role": "user",
-                        "content": "Previous response was not valid JSON. Reply only with valid JSON.",
-                    })
+                    # Show the model its own invalid output; nudge sampling off
+                    # the deterministic path so the retry isn't a re-roll of the
+                    # exact same failure.
+                    payload["messages"] = payload["messages"] + [
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": "That response was not valid JSON for the required schema. "
+                            "Reply again with only the corrected JSON object.",
+                        },
+                    ]
+                    payload["options"] = {**payload["options"], "temperature": max(temperature, 0.3)}
                     continue
         raise RuntimeError(f"Ollama returned invalid JSON twice: {last_error}")
 
     def embed(self, *, model: str, inputs: list[str]) -> list[list[float]]:
-        embeddings: list[list[float]] = []
-        for text in inputs:
-            data = self._post("/api/embeddings", {"model": model, "prompt": text})
-            embeddings.append(data.get("embedding", []))
+        if not inputs:
+            return []
+        import config
+
+        data = self._post(
+            "/api/embed",
+            {"model": model, "input": inputs, "keep_alive": config.OLLAMA_KEEP_ALIVE},
+        )
+        embeddings = data.get("embeddings")
+        if not isinstance(embeddings, list) or len(embeddings) != len(inputs):
+            raise RuntimeError(
+                f"Ollama /api/embed returned {len(embeddings) if isinstance(embeddings, list) else 'no'} "
+                f"embeddings for {len(inputs)} inputs (model {model})."
+            )
         return embeddings
 
     def transcribe(self, *, model: str, audio_path: str, **kwargs: Any) -> Any:
         raise NotImplementedError(
-            "Ollama does not provide transcription. Set WHISPER_PROVIDER=openai."
+            "Ollama does not provide transcription. Use whisper_provider='local' or 'openai'."
         )
 
 

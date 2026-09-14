@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from sqlalchemy import text
@@ -23,12 +24,19 @@ from prompts import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 MAX_STORED_TURNS = 20
 MAX_PROMPT_TURNS = 4
 MAX_GENERATED_CONTEXT_CHARS = 2200
 
 
+_ensured_engines: set[int] = set()
+
+
 def ensure_interaction_tables() -> None:
+    if id(db_engine) in _ensured_engines:
+        return
     with db_engine.begin() as connection:
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS interaction_sessions (
@@ -54,6 +62,7 @@ def ensure_interaction_tables() -> None:
             CREATE INDEX IF NOT EXISTS idx_interaction_sessions_user_id
             ON interaction_sessions (user_id)
         """))
+    _ensured_engines.add(id(db_engine))
 
 
 # ---------------------------------------------------------------------------
@@ -192,22 +201,35 @@ def _load_generated_learning_context(
             f"Key terms: {key_terms_text or 'n/a'}"
         )
 
+    # Only the synthesis generated for THIS session's exact source set may be
+    # injected — the newest row for the user can belong to a different pack,
+    # which used to leak unrelated cross-source context into every prompt.
+    session_set = set(source_ids)
     combined_row = None
     with db_engine.connect() as connection:
         combined_candidates = connection.execute(
             text("""
-                SELECT synthesis_text, intersections_json
+                SELECT video_source_id, document_source_ids_json,
+                       synthesis_text, intersections_json
                 FROM combined_learning_sections
                 WHERE user_id = :user_id
                 ORDER BY updated_at DESC, id DESC
-                LIMIT 5
+                LIMIT 25
             """),
             {"user_id": user_id},
         ).mappings().all()
 
     for candidate in combined_candidates:
-        combined_row = candidate
-        break
+        row_ids = {
+            int(v) for v in safe_json_loads(candidate.get("document_source_ids_json"), default=[])
+            if isinstance(v, (int, float)) and int(v) > 0
+        }
+        video_id = int(candidate.get("video_source_id") or 0)
+        if video_id > 0:
+            row_ids.add(video_id)
+        if row_ids == session_set:
+            combined_row = candidate
+            break
 
     combined_block = ""
     if combined_row is not None:
@@ -293,8 +315,10 @@ def _run_chat_completion(
         json_schema=CHAT_JSON_SCHEMA,
         temperature=0.3,
     )
+    # Pass the ChatResult (which always carries usage), not the raw provider
+    # payload — Ollama's raw dict has no `usage` key, which nulled telemetry.
     log_api_usage(
-        response=result.raw,
+        response=result,
         user_id=user_id,
         call_stage="interaction",
         model_name=config.chat_model(),
@@ -358,8 +382,9 @@ def handle_user_query(
             user_id=user_id,
             top_k=scaled_top_k,
         )
-    except ValueError:
-        pass
+    except Exception as exc:  # noqa: BLE001 — degrade to no-retrieval, never 500 the turn
+        if not isinstance(exc, ValueError):
+            logger.warning("Retrieval failed for session %s: %s", session_id, exc)
 
     if retrieved_context is not None:
         context_text = build_context_text(retrieved_context)
