@@ -33,7 +33,7 @@ async def lifespan(_: FastAPI):
     if os.getenv("SOCRATIC_NATIVE") == "1" and config.current_mode() == "local":
         from app.ollama_probe import unload_models
 
-        unload_models(config.get_settings().ollama_host, config.local_models_in_use())
+        unload_models(config.get_settings().ollama_host, config.local_models_in_use(), timeout=1.5)
 
 
 app = FastAPI(title="Socratic AI", lifespan=lifespan)

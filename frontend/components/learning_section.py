@@ -28,7 +28,7 @@ def render_source_learning_section(section: dict[str, Any]) -> None:
         # Summary
         summary = _clean(str(section.get("summary_text", "")))
         if summary:
-            ui.markdown(fmt.format_long_prose_markdown(summary, max_sentences_per_paragraph=4))
+            ui.markdown(fmt.md_safe(fmt.format_long_prose_markdown(summary, max_sentences_per_paragraph=4)))
 
         # Deep dive (merge deep_dive + under-surface, matching the old UI)
         deep_parts: list[str] = []
@@ -40,7 +40,7 @@ def render_source_learning_section(section: dict[str, Any]) -> None:
             deep_parts.append(under_surface)
         if deep_parts:
             ui.label("Deep Dive").classes("text-lg font-semibold mt-2")
-            ui.markdown(fmt.format_long_prose_markdown("\n\n".join(deep_parts), max_sentences_per_paragraph=4))
+            ui.markdown(fmt.md_safe(fmt.format_long_prose_markdown("\n\n".join(deep_parts), max_sentences_per_paragraph=4)))
 
         # Key concepts (layman + technical collapsibles)
         key_terms = [str(t) for t in (section.get("key_terms", []) or [])]
@@ -58,13 +58,13 @@ def render_source_learning_section(section: dict[str, Any]) -> None:
                         layman = str(entry.get("layman", "")).strip()
                         technical = str(entry.get("technical", "")).strip()
                         if layman:
-                            ui.markdown(f"**In plain terms:** {layman}")
+                            ui.markdown(fmt.md_safe(f"**In plain terms:** {layman}"))
                         if technical:
-                            ui.markdown(f"**Technical:** {technical}")
+                            ui.markdown(fmt.md_safe(f"**Technical:** {technical}"))
                         if not layman and not technical:
                             ui.label("No definition available.").classes("text-sm text-gray-500")
             else:
-                ui.markdown(" ".join(f"• **{t.strip()}**" for t in key_terms if t.strip()))
+                ui.markdown(fmt.md_safe(" ".join(f"• **{t.strip()}**" for t in key_terms if t.strip())))
 
         # Reflection
         reflection_points = section.get("reflection_points", []) or []
@@ -76,14 +76,14 @@ def render_source_learning_section(section: dict[str, Any]) -> None:
 def _render_reflection_points(reflection_points: list[Any]) -> None:
     for index, point in enumerate(reflection_points, start=1):
         if isinstance(point, str):
-            ui.markdown(f"{index}. {point}")
+            ui.markdown(fmt.md_safe(f"{index}. {point}"))
             continue
         question = str(point.get("question", "")).strip()
         explanation = str(point.get("explanation", "")).strip()
 
-        ui.markdown(f"**Q{index}. {question}**")
+        ui.markdown(fmt.md_safe(f"**Q{index}. {question}**"))
         if explanation:
-            ui.markdown(fmt.format_long_prose_markdown(explanation))
+            ui.markdown(fmt.md_safe(fmt.format_long_prose_markdown(explanation)))
 
 
 def render_cross_source(
@@ -117,7 +117,7 @@ def render_cross_source(
         with ui.card().classes("w-full bg-blue-1 text-dark"):
             ui.label("Key takeaways").classes("text-sm font-semibold text-primary")
             for i, t in enumerate(takeaways[:3], start=1):
-                ui.markdown(f"**{i}.** {fmt.strip_source_artifacts(t)}")
+                ui.markdown(fmt.md_safe(f"**{i}.** {fmt.strip_source_artifacts(t)}"))
 
     synthesis_text = fmt.normalize_continuous_text_for_display(
         fmt.strip_source_artifacts(str(insights.get("synthesis_text", "")))
@@ -125,7 +125,7 @@ def render_cross_source(
     if synthesis_text:
         if synthesis_caption:
             ui.label(synthesis_caption).classes("text-xs text-gray-400")
-        ui.markdown(fmt.format_long_prose_markdown(synthesis_text, max_sentences_per_paragraph=4))
+        ui.markdown(fmt.md_safe(fmt.format_long_prose_markdown(synthesis_text, max_sentences_per_paragraph=4)))
 
     _render_application_scenarios(insights.get("application_scenarios") or [])
 
@@ -150,8 +150,8 @@ def _render_application_scenarios(scenarios: list[Any]) -> None:
             if title:
                 ui.label(title).classes("font-semibold")
             if prompt:
-                ui.markdown(prompt)
+                ui.markdown(fmt.md_safe(prompt))
             if steps:
-                ui.markdown("\n".join(f"{i}. {s}" for i, s in enumerate(steps, start=1)))
+                ui.markdown(fmt.md_safe("\n".join(f"{i}. {s}" for i, s in enumerate(steps, start=1))))
             if pitfall:
-                ui.markdown(f"**Watch out:** {pitfall}")
+                ui.markdown(fmt.md_safe(f"**Watch out:** {pitfall}"))

@@ -91,7 +91,10 @@ class OpenAIClient:
         from openai import OpenAI  # local import keeps non-OpenAI runs lighter
 
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL") or "").strip() or None
-        self._client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"), base_url=self.base_url)
+        key = api_key or os.getenv("OPENAI_API_KEY")
+        if not key and self.base_url:
+            key = "not-needed"  # local OpenAI-compatible servers ignore it; the SDK insists on one
+        self._client = OpenAI(api_key=key, base_url=self.base_url)
         # Some OpenAI-compatible servers only know the older json_object mode;
         # remembered per client so the fallback costs one failed call, not one per stage.
         self._schema_unsupported = False

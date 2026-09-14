@@ -134,7 +134,9 @@ def _validate(settings: config.Settings) -> None:
         or settings.embedding_provider == "openai"
         or settings.whisper_provider == "openai"
     )
-    if needs_key and not settings.openai_api_key:
+    # A custom base URL may be a local server (LM Studio, llama.cpp) that
+    # ignores the key entirely; only api.openai.com strictly needs one.
+    if needs_key and not settings.openai_api_key and not settings.openai_base_url:
         raise HTTPException(
             status_code=422,
             detail="An OpenAI API key is required for the selected providers. "
@@ -234,7 +236,7 @@ def test_connection(provider: str) -> dict[str, object]:
                 }
             return {"ok": True, "provider": provider, "detail": f"{len(models)} model(s) available"}
         if provider == "openai":
-            if not settings.openai_api_key:
+            if not settings.openai_api_key and not settings.openai_base_url:
                 return {"ok": False, "provider": provider, "detail": "No API key configured."}
             client = config.get_llm_client("openai")
             where = settings.openai_base_url or "api.openai.com"

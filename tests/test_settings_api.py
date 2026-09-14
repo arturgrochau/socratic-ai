@@ -195,3 +195,19 @@ def test_base_url_env_bootstrap(client, monkeypatch):
     monkeypatch.setenv("SOCRATIC_CONFIG_DIR", str(config._config_path().parent / "fresh"))
     importlib.reload(config)
     assert config.get_settings().openai_base_url == "http://localhost:1234/v1"
+
+
+def test_custom_base_url_allows_keyless_local_servers(client, monkeypatch):
+    http, config = client
+    from dataclasses import replace
+
+    # Simulate an install that never had a key but points at LM Studio.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config.apply_settings(replace(config.get_settings(), openai_api_key=None), persist=False)
+    resp = http.put("/api/settings", json={"openai_base_url": "http://localhost:1234/v1"})
+    assert resp.status_code == 200
+    resp = http.put("/api/settings/mode", json={"mode": "api"})
+    assert resp.status_code == 200, resp.text
+    llm = config.get_llm_client("openai")
+    assert llm.raw.api_key == "not-needed"
+    assert str(llm.raw.base_url).rstrip("/") == "http://localhost:1234/v1"

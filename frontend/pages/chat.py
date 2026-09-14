@@ -67,7 +67,7 @@ def build_chat_panel():
                             live["thinking"].set_visibility(False)
                         buffer += str(event["delta"])
                         if live["md"] is not None:
-                            live["md"].set_content(buffer)
+                            live["md"].set_content(fmt.md_safe(buffer))
                     elif event.get("error"):
                         raise RuntimeError(str(event["error"]))
                     elif event.get("done"):

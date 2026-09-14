@@ -240,7 +240,9 @@ _jobs_lock = threading.Lock()
 
 def _run_pull(job: PullJob, host: str, client: httpx.Client | None = None) -> None:
     base = host.rstrip("/")
-    http = client or httpx.Client(timeout=httpx.Timeout(None, connect=10))
+    # Ollama streams a progress line every few hundred ms; a quiet minute means
+    # the daemon is stuck, and the wizard should say so instead of spinning.
+    http = client or httpx.Client(timeout=httpx.Timeout(120, connect=10))
     try:
         for name in job.models:
             job.current, job.status, job.percent, job.completed, job.total = name, "pulling", 0.0, 0, 0
@@ -265,6 +267,9 @@ def _run_pull(job: PullJob, host: str, client: httpx.Client | None = None) -> No
         job.status = "failed"
         job.error = str(exc)[:300]
         logger.warning("model pull failed: %s", exc)
+    finally:
+        if client is None:
+            http.close()
 
 
 def start_pull(models: list[str], host: str | None = None) -> PullJob:

@@ -389,8 +389,8 @@ if _settings.llm_provider == "openai" and not _settings.openai_api_key:
 # Kept for backwards compatibility — the OpenAI transcription path and the test
 # cassette still reference openai_client directly. Recomputed by apply_settings.
 openai_client = (
-    OpenAI(api_key=_settings.openai_api_key, base_url=_settings.openai_base_url)
-    if _settings.openai_api_key
+    OpenAI(api_key=_settings.openai_api_key or "not-needed", base_url=_settings.openai_base_url)
+    if _settings.openai_api_key or _settings.openai_base_url
     else None
 )  # type: ignore[assignment]
 
@@ -484,7 +484,9 @@ def apply_settings(new: Settings, *, persist: bool = True) -> Settings:
         _llm_client_cache.clear()
         _aux_probe = None
         openai_client = (
-            OpenAI(api_key=new.openai_api_key, base_url=new.openai_base_url) if new.openai_api_key else None
+            OpenAI(api_key=new.openai_api_key or "not-needed", base_url=new.openai_base_url)
+            if new.openai_api_key or new.openai_base_url
+            else None
         )  # type: ignore[assignment]
         # Keep the backwards-compat module constants coherent with the new state.
         OPENAI_API_KEY = new.openai_api_key

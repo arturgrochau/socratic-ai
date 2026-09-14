@@ -41,5 +41,6 @@ export/
 a2/
 
 # Per-machine Claude Code session settings
-.claude/build/
+.claude/
+build/
 dist/

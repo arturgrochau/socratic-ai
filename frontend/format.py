@@ -5,6 +5,7 @@ Streamlit). Shared by the NiceGUI pages, components, and export buttons.
 """
 from __future__ import annotations
 
+import html
 import json
 import re
 from datetime import UTC, datetime
@@ -58,6 +59,16 @@ def strip_source_artifacts(text_value: str) -> str:
     t = re.sub(r"\s+([.,;:])", r"\1", t)   # tidy space before punctuation
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
+
+
+def md_safe(text_value: str) -> str:
+    """Neutralise raw HTML in model output before it reaches ui.markdown.
+
+    NiceGUI renders markdown without a sanitiser, and the page runs at the
+    app's own origin, so an `<img onerror=...>` echoed from a prompt-injected
+    PDF could call the settings API. Escaping `<`, `>` and `&` keeps every
+    markdown construct we use (emphasis, lists, headings) intact."""
+    return html.escape(str(text_value or ""), quote=False)
 
 
 def clean_quiz_option(option: str) -> str:

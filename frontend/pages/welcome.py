@@ -169,6 +169,11 @@ async def render_welcome_page() -> None:
                         ).classes("text-xs text-gray-500")
 
             async def refresh_report() -> None:
+                # The progress bar and its poll timer live inside the checklist;
+                # refreshing mid-download would delete them. The pull poller
+                # refreshes once itself when the job finishes.
+                if pull_state.get("job_id"):
+                    return
                 try:
                     fresh = await api_client.get_setup_status()
                 except Exception:  # noqa: BLE001
@@ -197,7 +202,9 @@ async def render_welcome_page() -> None:
         # ── Step 2b: API key ──────────────────────────────────────────────────
         with ui.step("Connect an API") as api_step:
             api_step.set_visibility(False)
-            ui.label("Paste a key. Leave the URL empty for OpenAI itself.").classes("text-sm text-gray-500")
+            ui.label(
+                "Paste a key. Leave the URL empty for OpenAI itself. A local server such as LM Studio needs no key."
+            ).classes("text-sm text-gray-500")
             key = ui.input("API key", password=True, placeholder="sk-...").classes("w-full max-w-xl")
             base_url = ui.input(
                 "Base URL (optional)", placeholder="https://openrouter.ai/api/v1"
@@ -206,19 +213,24 @@ async def render_welcome_page() -> None:
 
             async def finish_api() -> None:
                 value = (key.value or "").strip()
-                if not value:
-                    ui.notify("An API key is required for the Cloud API.", type="warning")
+                if not value and not (base_url.value or "").strip():
+                    ui.notify("An API key is required for OpenAI.", type="warning")
                     return
                 try:
                     payload: dict[str, Any] = {"openai_api_key": value, "openai_base_url": (base_url.value or "").strip()}
                     await api_client.put_settings(payload)
-                    await api_client.complete_setup("api")
                     result = await api_client.test_connection("openai")
                 except Exception as exc:  # noqa: BLE001
                     ui.notify(f"Could not save: {exc}", type="negative", multi_line=True)
                     return
                 if not result.get("ok"):
-                    ui.notify(f"Saved, but the connection test failed: {result.get('detail')}", type="warning", multi_line=True)
+                    # Stay here so the message is readable and the key can be corrected.
+                    ui.notify(
+                        f"The key was saved but the connection test failed: {result.get('detail')}",
+                        type="warning", multi_line=True, close_button="OK",
+                    )
+                    return
+                await api_client.complete_setup("api")
                 ui.navigate.to("/")
 
             with ui.stepper_navigation():

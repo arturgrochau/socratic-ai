@@ -98,15 +98,15 @@ def render_quiz(quiz: dict[str, Any], *, on_discuss: Callable[[str], None]) -> N
                     if chosen == answer_index:
                         ui.label("Correct.").classes("text-positive font-medium")
                     elif chosen is not None and 0 <= chosen < len(rationales):
-                        ui.markdown(f"**{fmt.strip_source_artifacts(rationales[chosen])}**").classes("text-negative")
+                        ui.markdown(fmt.md_safe(f"**{fmt.strip_source_artifacts(rationales[chosen])}**")).classes("text-negative")
                     if chosen != answer_index and 0 <= answer_index < len(rationales):
                         ui.markdown(
-                            f"Correct answer ({_LABELS[answer_index]}): "
-                            f"{fmt.strip_source_artifacts(rationales[answer_index])}"
+                            fmt.md_safe(f"Correct answer ({_LABELS[answer_index]}): "
+                            f"{fmt.strip_source_artifacts(rationales[answer_index])}")
                         ).classes("text-positive")
                     explanation = fmt.strip_source_artifacts(str(q.get("explanation", "")))
                     if explanation:
-                        ui.markdown(explanation).classes("text-sm text-gray-500")
+                        ui.markdown(fmt.md_safe(explanation)).classes("text-sm text-gray-500")
 
         total = len(questions)
         answered = sum(1 for qi in range(total) if str(qi) in selected)

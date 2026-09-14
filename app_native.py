@@ -131,7 +131,7 @@ def main() -> None:
         # the window is gone and the server has stopped.
         pass
     finally:
-        _hard_exit_after(5.0)
+        _hard_exit_after(10.0)
 
 
 if __name__ == "__main__":
