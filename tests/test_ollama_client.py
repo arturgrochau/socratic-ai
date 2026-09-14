@@ -10,7 +10,6 @@ import pytest
 import config
 from app.llm_client import OllamaClient
 
-
 SCHEMA = {
     "name": "test_schema",
     "strict": True,

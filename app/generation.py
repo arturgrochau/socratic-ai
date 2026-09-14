@@ -4,15 +4,15 @@ import contextvars
 import json
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from sqlalchemy import text
 
+import config
 from app.cost_logging import log_api_usage, log_generation_stage_event
 from app.json_reliability import parse_json_object, safe_json_loads
-from app.section_validator import validate_arc
-from app.session_logger import get_active_logger, session_log
 from app.ledger import (
     KnowledgeUnit,
     append_units,
@@ -34,7 +34,8 @@ from app.models import (
     ReflectionPoint,
     SourceLearningSection,
 )
-import config
+from app.section_validator import validate_arc
+from app.session_logger import get_active_logger, session_log
 from config import (
     CACHE_PROCESSED_SOURCES,
     db_engine,
@@ -57,7 +58,6 @@ from prompts.sections import (
     CROSS_SOURCE_SECTIONS,
     PER_SOURCE_SECTIONS,
 )
-
 
 GENERATION_SCHEMA_VERSION = 17
 LEDGER_SCHEMA_VERSION = 2  # v2: parallel context-free window extraction (map-reduce)
@@ -1106,7 +1106,7 @@ def generate_tailored_learning(
             (lambda sid=sid: _build_source_learning_section(sid, user_id, run_id))
             for sid in ordered_ids
         ])
-        by_id = dict(zip(ordered_ids, built_sections))
+        by_id = dict(zip(ordered_ids, built_sections, strict=True))
 
         video_section = by_id.get(normalized_video_id) if normalized_video_id is not None else None
         document_sections = [by_id[sid] for sid in normalized_document_ids]

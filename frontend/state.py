@@ -11,7 +11,6 @@ from typing import Any
 
 from nicegui import app
 
-
 # Single-user local app: a fixed id satisfies the backend X-User-ID requirement
 # and scopes the local DB. No user-facing account concept.
 LOCAL_USER_ID = "local"

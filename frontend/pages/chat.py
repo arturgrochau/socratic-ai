@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from frontend import api_client, format as fmt, state
+from frontend import api_client, state
+from frontend import format as fmt
 
 
 def build_chat_panel():

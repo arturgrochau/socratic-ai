@@ -7,7 +7,6 @@ from app.auth import get_user_id
 from app.interaction import handle_user_query
 from app.models import AskRequest, AskResponse
 
-
 router = APIRouter(tags=["interaction"])
 
 

@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 # Generation issues LLM calls from parallel worker threads; cassette reads of a
 # plain dict are fine, but record-mode mutation + file rewrite must be serialized.
 _cassette_lock = threading.Lock()

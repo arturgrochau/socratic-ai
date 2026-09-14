@@ -6,7 +6,6 @@ from app.auth import get_user_id
 from app.ingestion import ingest_upload_bundle
 from app.models import IngestionResponse
 
-
 router = APIRouter(tags=["upload"])
 
 

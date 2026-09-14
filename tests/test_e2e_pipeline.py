@@ -21,7 +21,6 @@ import pytest
 
 from tests._recording_client import CASSETTE_DIR, RECORD_MODE, install_cassette
 
-
 CASSETTE_NAME = "test_e2e_pipeline"
 FIXTURE_PDF = Path(__file__).resolve().parent.parent / "test_assets" / "sample_notes.pdf"
 
@@ -66,9 +65,9 @@ def _isolated_env(monkeypatch, tmp_path):
 
     # Bootstrap every table the pipeline writes into.
     from app.cost_logging import ensure_cost_logging_tables
+    from app.generation import ensure_generation_tables
     from app.ingestion import ensure_ingestion_tables
     from app.interaction import ensure_interaction_tables
-    from app.generation import ensure_generation_tables
     ensure_cost_logging_tables()
     ensure_ingestion_tables()
     ensure_interaction_tables()
@@ -98,6 +97,7 @@ def test_e2e_single_pdf_generation(monkeypatch, _isolated_env):
 
     # Re-import the pipeline so it picks up rebuilt config + cassette client.
     import importlib
+
     import app.ingestion as ingestion
     importlib.reload(ingestion)
     import app.generation as generation

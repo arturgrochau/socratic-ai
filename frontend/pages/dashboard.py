@@ -5,7 +5,8 @@ from typing import Any
 
 from nicegui import ui
 
-from frontend import format as fmt, state
+from frontend import format as fmt
+from frontend import state
 from frontend.components import export
 from frontend.components.learning_section import (
     render_cross_source,

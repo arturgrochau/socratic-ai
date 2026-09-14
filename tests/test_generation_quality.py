@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.generation import _ground_intersections, _group_chunks_into_windows, _derive_title
+from app.generation import _derive_title, _ground_intersections, _group_chunks_into_windows
 from app.interaction import _truncate_text
 
 

@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
-
 
 _LEDGER_ID_RE = re.compile(r"\[u\d+[^\]]*\]")              # "[u4 | mechanism | source 2]"
 _EVIDENCE_RE = re.compile(r"\(evidence:[^)]*\)", re.IGNORECASE)
@@ -406,7 +405,7 @@ def _build_source_export_markdown(section_payload: dict, *, fallback_title: str)
 
 
 def build_generation_export_markdown(generation_result: dict, *, user_id: str) -> str:
-    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    exported_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines: list[str] = [
         "# Socratic Study Snapshot",
         "",
@@ -547,7 +546,7 @@ def build_generation_export_markdown(generation_result: dict, *, user_id: str) -
 
 def build_generation_export_json(generation_result: dict, *, user_id: str) -> str:
     export_payload = {
-        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_at": datetime.now(UTC).isoformat(),
         "user_id": str(user_id or "").strip() or None,
         "generation_result": generation_result,
     }

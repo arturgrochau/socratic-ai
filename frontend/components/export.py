@@ -1,7 +1,7 @@
 """Download buttons for the generated study snapshot (.md and .json)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from nicegui import ui
@@ -10,7 +10,7 @@ from frontend import format as fmt
 
 
 def render_export_buttons(generation_result: dict[str, Any], *, user_id: str) -> None:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     user_token = fmt.slugify_token(user_id, fallback="user")
     prefix = f"socratic_snapshot_{timestamp}_{user_token}"
 

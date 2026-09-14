@@ -36,7 +36,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.checks import CheckResult, run_checks, suggest_tunes  # noqa: E402
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DIAGNOSTIC_DIR = REPO_ROOT / "logs" / "diagnostic"
 SESSION_LOG_DIR = REPO_ROOT / "logs" / "sessions"
@@ -422,7 +421,7 @@ def _render_report(
         lines.append("")
         lines.append("| Probe | Query | Answer length | Route | Top retrieval |")
         lines.append("|---|---|---|---|---|")
-        for r, chat_row in zip(chat_results, chat_rows):
+        for r, chat_row in zip(chat_results, chat_rows, strict=False):
             lines.append(
                 f"| `{r.get('label','?')}` "
                 f"| {r.get('query','?')[:60]} "
@@ -558,8 +557,9 @@ def main(argv: list[str] | None = None) -> int:
             # so the check can count strictly-newer rows. SQLite's CURRENT_TIMESTAMP
             # only resolves to seconds; using row id avoids the boundary problem
             # where the last chat probe and the rerun start land in the same second.
-            from config import db_engine as _db_pre
             from sqlalchemy import text as _text_pre
+
+            from config import db_engine as _db_pre
             with _db_pre.connect() as _conn:
                 pre_max_id = _conn.execute(
                     _text_pre("SELECT COALESCE(MAX(id), 0) FROM api_call_usage WHERE user_id = :u"),

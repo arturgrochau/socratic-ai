@@ -18,7 +18,6 @@ from typing import Any
 from app.ledger import _overlap_ratio
 from prompts.sections import SectionSpec
 
-
 # Whole-section token overlap above this against any earlier section in the arc
 # counts as restatement. Higher than the ledger's 0.72 claim-level threshold
 # because full sections legitimately share topic vocabulary.

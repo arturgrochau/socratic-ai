@@ -7,12 +7,12 @@ answered, a button hands off into Socratic chat seeded with the quiz context.
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from nicegui import ui
 
 from frontend import state
-
 
 _LABELS = ["A", "B", "C", "D", "E", "F"]
 

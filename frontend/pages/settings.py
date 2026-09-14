@@ -12,7 +12,6 @@ from nicegui import ui
 
 from frontend import api_client
 
-
 WHISPER_PROVIDERS = ["local", "openai", "none"]
 
 

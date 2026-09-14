@@ -12,7 +12,6 @@ from nicegui import ui
 from frontend import state
 from frontend.components.quiz import render_quiz
 
-
 QUIZ = {
     "questions": [
         {

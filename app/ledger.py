@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Iterable, Literal
+from collections.abc import Iterable
+from typing import Literal
 
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.json_reliability import safe_json_loads
 from config import db_engine
-
 
 UnitType = Literal[
     "foundational",

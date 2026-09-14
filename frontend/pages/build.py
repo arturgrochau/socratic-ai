@@ -19,7 +19,8 @@ from typing import Any
 
 from nicegui import ui
 
-from frontend import api_client, format as fmt, state
+from frontend import api_client, state
+from frontend import format as fmt
 from frontend.pages.dashboard import render_dashboard
 
 

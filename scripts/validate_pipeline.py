@@ -7,14 +7,13 @@ import re
 import sqlite3
 import sys
 import uuid
-from dataclasses import dataclass
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
 from requests.exceptions import ReadTimeout
-
 
 REQUEST_TIMEOUT = 600
 INSUFFICIENT_CONTEXT_ANSWER = "I don't have enough information in the provided materials to answer that."

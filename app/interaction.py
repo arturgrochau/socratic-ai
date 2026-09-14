@@ -6,6 +6,7 @@ import re
 
 from sqlalchemy import text
 
+import config
 from app.cost_logging import log_api_usage
 from app.json_reliability import safe_json_loads
 from app.models import (
@@ -15,14 +16,12 @@ from app.models import (
     InteractionTurnRecord,
 )
 from app.retrieval import build_context_text, retrieve_context
-import config
 from config import db_engine, get_llm_client
 from prompts import (
     CHAT_JSON_SCHEMA,
     build_chat_system_prompt,
     chat_context_scale,
 )
-
 
 logger = logging.getLogger(__name__)
 

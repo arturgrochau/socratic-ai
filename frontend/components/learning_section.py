@@ -1,7 +1,8 @@
 """Renders a single source's learning section and the cross-source synthesis."""
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from nicegui import ui
 

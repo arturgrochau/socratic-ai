@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_DIAGNOSTIC = REPO_ROOT / "scripts" / "run_diagnostic.py"
@@ -127,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     total_duration = time.time() - total_t0
 
     print("\n\n=== AGGREGATE ===")
-    print(f"\n| Fixture | Pass | Warn | Fail | Wall (s) | Report |")
+    print("\n| Fixture | Pass | Warn | Fail | Wall (s) | Report |")
     print("|---|---|---|---|---|---|")
     total_pass = total_warn = total_fail = 0
     bad_codes = 0

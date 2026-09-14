@@ -13,7 +13,6 @@ from prompts.sections import (
     render_contracts,
 )
 
-
 _PER_SOURCE_CONTRACTS = render_contracts(PER_SOURCE_SECTIONS)
 _CROSS_SOURCE_CONTRACTS = render_contracts(CROSS_SOURCE_SECTIONS)
 

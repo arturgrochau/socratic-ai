@@ -21,7 +21,6 @@ from typing import Any, Literal
 
 from sqlalchemy import text
 
-
 Status = Literal["pass", "warn", "fail"]
 
 # Soft warning ceiling on total tokens per diagnostic run. (Used to be imported

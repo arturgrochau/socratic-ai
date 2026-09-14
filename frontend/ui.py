@@ -7,7 +7,6 @@ from frontend import state
 from frontend.pages.build import render_main_body
 from frontend.pages.settings import render_settings_page
 
-
 # Light-blue accent applied app-wide. One place to retune the whole theme.
 PRIMARY = "#4F9DDE"
 SECONDARY = "#6BA8E5"
