@@ -10,21 +10,27 @@ here*. For *how the system works* see [`ARCHITECTURE.md`](ARCHITECTURE.md), the 
 
 Socratic AI turns videos and documents into a structured learning pack + a source-grounded Socratic
 chat. It's a **single uvicorn process**: FastAPI backend with a NiceGUI UI mounted on the same app;
-SQLite + ChromaDB for storage; OpenAI by default, Ollama optional. Python ≥ 3.11.
+SQLite + ChromaDB for storage; **local by default** (Ollama + on-device MLX transcription), OpenAI
+via a one-click mode toggle. Python ≥ 3.11.
 
 ## Run / develop
 
 ```bash
 uv run socratic-ai            # supported path; resolves Python + deps, opens http://localhost:8000
+uv sync --extra local         # once, for on-device video transcription (Apple Silicon/MLX)
 # or:
 python run.py                 # after `pip install .` in a venv
 uvicorn main:app --reload     # dev with auto-reload
 ```
 
-- A `.env` with `OPENAI_API_KEY=sk-...` is the simplest start (see `.env.example`). Or run keyless
-  against Ollama: set `LLM_PROVIDER=ollama` / `EMBEDDING_PROVIDER=ollama` (Whisper still needs OpenAI).
-- Provider/model/key are also switchable at **runtime** via the in-app ⚙ Settings page (persists to the
+- Default = Local mode: needs a running [Ollama](https://ollama.com) daemon with the default models
+  pulled (`qwen3:30b-a3b-instruct-2507-q4_K_M`, `nomic-embed-text`). **No API key required.**
+- API mode: `OPENAI_API_KEY` in `.env` (see `.env.example`) or pasted in Settings, then flip the
+  mode toggle. The Local ↔ API toggle flips every role at once; each mode keeps its own model bundle.
+- Provider/model/key are switchable at **runtime** via the in-app ⚙ Settings page (persists to the
   user config dir, no restart). Env vars are only the bootstrap default.
+- Transcription is provider-routed (`whisper_provider`: `local` | `openai` | `none`): local =
+  parakeet-mlx with mlx-whisper fallback; `none` disables video ingestion cleanly.
 - `ffmpeg` must be on `PATH` for video ingestion; `yt-dlp` (a dependency) handles YouTube URLs.
 
 ## Test
@@ -58,8 +64,11 @@ pytest tests/ -m e2e          # end-to-end; replays recorded calls from tests/_c
 - **Loopback boundary.** The UI calls the backend over HTTP (`frontend/api_client.py`), never importing
   `app.*` directly. Keep it that way so validation/auth/error-mapping stay in the routes.
 - **LLM access** goes through `app/llm_client.py` via `config.get_llm_client()` / `get_aux_client()` and
-  the `config.*_model()` getters — so runtime settings changes take effect. (Transcription still uses the
-  bare `config.openai_client`; `apply_settings` keeps it coherent.)
+  the `config.*_model()` getters — so runtime settings changes take effect. OpenAI transcription
+  resolves `config.openai_client` **at call time** (never `from config import openai_client` — a
+  frozen import misses runtime key changes).
+- **Concurrency** is provider-aware: `config.llm_call_slots(provider)` (8-wide hosted, 2-wide local).
+  Don't reintroduce a global 8-wide gate — a local daemon queues requests, it doesn't parallelize.
 - **Prompts** live in `prompts/`. Section roles/budgets/non-overlap rules are data in
   `prompts/sections.py`, not scattered prose — edit there, not inline.
 - **Caching / regeneration.** Generated artifacts are cached in SQLite keyed by a schema version. To

@@ -3,6 +3,8 @@
 > *Sapere aude* — Dare to know. — Immanuel Kant
 
 Turn your videos, PDFs, and lectures into a structured thinking workout — not a summary to scroll past.
+**Private by default:** everything — models, transcription, embeddings, your material — runs on your
+machine. One click in Settings switches to the OpenAI API when you want hosted models instead.
 
 ---
 
@@ -15,21 +17,27 @@ Socratic AI runs as a single local app (one process, one port). Install once wit
 # 1. Get uv (macOS/Linux). On Windows see https://docs.astral.sh/uv/getting-started/
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Clone and configure
+# 2. Get Ollama and the default local models (skip if you'll use the OpenAI API)
+brew install ollama                       # or https://ollama.com/download
+ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M
+ollama pull nomic-embed-text
+
+# 3. Clone and run — no API key needed
 git clone https://github.com/arturgrochau/socratic_ai.git
 cd socratic_ai
-echo "OPENAI_API_KEY=sk-..." > .env      # or run fully local with Ollama — see below
+uv run socratic-ai                        # add --extra local for on-device video transcription
 
-# 3. Run
-uv run socratic-ai
+# on-device transcription (Apple Silicon): install once, then videos work offline
+uv sync --extra local
 ```
 
 The app opens at **http://localhost:8000** and your browser launches automatically.
 You also need `ffmpeg` on your `PATH` if you ingest videos (`brew install ffmpeg`,
 `apt install ffmpeg`, or `choco install ffmpeg`).
 
-> No API key? Open the **⚙ Settings** page in the app and point it at a local
-> [Ollama](https://ollama.com) model instead — see [Switching the brain](#switching-the-brain).
+> Prefer hosted models? Put `OPENAI_API_KEY=sk-...` in `.env` (or paste it in
+> **⚙ Settings**) and flip the mode toggle to **OpenAI API** — see
+> [Switching the brain](#switching-the-brain).
 
 ---
 
@@ -49,9 +57,34 @@ It is built to do the opposite of what most AI study tools do. It does not summa
                   + 1 cross-source
 ```
 
-A 2-source session is ~12 LLM calls (all on `gpt-4o-mini`) that run in ~4 parallel waves and cost
-roughly **~$0.01** per run; chat is exactly one call per question. Results are cached, so reopening a
-session is free.
+A 2-source session is ~12 LLM calls that run in ~4 parallel waves; chat is exactly one call per
+question. Local mode costs nothing per run; API mode (`gpt-4o-mini`) is roughly **~$0.01** per run.
+Results are cached, so reopening a session is free.
+
+### What's new in v2.3
+
+- **Local by default, one-click API switch** — generation, chat, embeddings, and transcription all
+  run on-device out of the box (Ollama + MLX). A single **Local ↔ API** toggle in Settings flips
+  every role at once; each mode keeps its own model bundle, so switching never loses choices. No
+  API key required to boot, ever.
+- **Real structured outputs on Ollama** — the JSON schemas are now compiled into decoding grammars
+  server-side (`format: <schema>`), so local models mechanically cannot emit malformed JSON. Context
+  windows are sized explicitly per stage (the daemon's 4096 default silently truncated long
+  consolidation prompts head-first), models stay resident between stages (`keep_alive`), and
+  embeddings batch through `/api/embed` instead of one HTTP call per chunk.
+- **On-device transcription** — `parakeet-mlx` (≈1 min for a 1-hour lecture, lower WER than
+  whisper-large-v3) with `mlx-whisper` fallback. The OpenAI 24 MB chunking machinery is bypassed
+  entirely in local mode.
+- **Provider-safe retrieval** — vector collections are keyed by embedding model (switching modes
+  can no longer query stale vectors from the other model's geometry), with the task prefixes
+  `nomic-embed-text`/`embeddinggemma` are trained on, cosine space, and an embedded-state cache
+  that removes a per-chat-turn Chroma sweep.
+- **Fixes that matter locally** — chat no longer injects the newest cross-source synthesis from a
+  *different* source set; Ollama token telemetry is recorded (was all-NULL); concurrency is
+  provider-aware (8-wide hosted, 2-wide local — a single daemon queues, it doesn't parallelize);
+  deterministic failures (bad model name/key) fail fast instead of burning full retry budgets;
+  SQLite runs in WAL mode so telemetry writers can't steal an LLM retry attempt; generation shows
+  live per-stage progress in the UI and the Generate button guards against double-submit.
 
 ### What's new in v2.2
 
@@ -146,7 +179,7 @@ FastAPI + NiceGUI  (one uvicorn process, port 8000)
         ├── REST API         (/upload, /generate-tailored-learning, /ask, /settings)
         ├── SQLite           (sessions, sources, generated sections — cached)
         ├── ChromaDB         (vector embeddings for retrieval)
-        └── LLMClient        (OpenAI by default; Ollama optional, switchable in Settings)
+        └── LLMClient        (Ollama by default; OpenAI API via the Settings toggle)
 ```
 
 ### Documentation
@@ -160,24 +193,30 @@ FastAPI + NiceGUI  (one uvicorn process, port 8000)
 
 ## Switching the brain
 
-The default backend is OpenAI's `gpt-4o-mini`. The easiest way to switch is the
-**⚙ Settings** page in the app: pick `ollama` as the provider, set the model names
-and Ollama host, hit **Test Ollama**, then **Apply**. Changes take effect immediately
-(the cached LLM clients are rebuilt) and persist to your user config dir — no restart.
+The default is **Local mode**: `qwen3:30b-a3b-instruct-2507` for generation and chat,
+`nomic-embed-text` for retrieval, and on-device transcription. The **⚙ Settings** page has a
+one-click **Local ↔ API** mode toggle; each mode remembers its own model choices, applies
+immediately (cached clients are rebuilt), and persists to your user config dir — no restart.
+In local mode the model dropdowns list whatever your Ollama daemon has pulled.
 
-```bash
-# install ollama and pull a model first
-ollama pull llama3.2
-```
+The same choices work as `.env` bootstrap defaults (`LLM_PROVIDER`, `EMBEDDING_PROVIDER`,
+`WHISPER_PROVIDER=local|openai|none`, `GENERATION_MODEL`, … — see `.env.example`). Providers are
+per-role, so hybrids work — e.g. API mode with the high-volume extraction passes routed to a local
+daemon ("aux" switch under Advanced).
 
-You can also set the same choices via environment variables in `.env` as a bootstrap
-default (`LLM_PROVIDER`, `EMBEDDING_PROVIDER`, `WHISPER_PROVIDER`, `OLLAMA_HOST`,
-`GENERATION_MODEL`, `CHAT_MODEL`, `RETRIEVAL_MODEL` — see `.env.example`). Provider
-selection is per-role, so you can mix — e.g. OpenAI for transcription and embeddings,
-Llama locally for the rest. Whisper transcription still requires OpenAI. See
-[`app/llm_client.py`](app/llm_client.py) for the available roles and how to add a provider.
+Why these local defaults: the 30b-a3b MoE decodes as fast as a dense 4B on Apple Silicon
+(~65 tok/s on an M-class Pro) while giving 30B-class quality, and one resident model for every role
+avoids load thrash. Tips for the daemon (set in its environment): `OLLAMA_NUM_PARALLEL=2`,
+`OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`.
 
-Quality on a 7B local model will be visibly worse than `gpt-4o-mini` for the generation stages. It works; it just produces less crisp output. Use it for offline runs or privacy-sensitive material.
+> **If another app pins its own large model** (keep-alive forever) on the same machine, two ~19GB
+> models can evict each other mid-run and stall the Ollama scheduler with no error. Unload the other
+> model for long generations (`curl localhost:11434/api/generate -d '{"model":"<name>","keep_alive":0}'`)
+> or use a smaller generation model.
+
+The 30B-class local models are close to `gpt-4o-mini` on the generation stages; smaller local
+models (7B and under) work but produce visibly less crisp output. Use API mode when you want
+frontier-hosted quality and don't mind the material leaving your machine.
 
 ---
 

@@ -10,10 +10,11 @@ Format: lightweight [MADR](https://adr.github.io/madr/). Status is one of `accep
 |---|---|---|
 | [0001](0001-single-process-nicegui-fastapi.md) | Single process: NiceGUI mounted on FastAPI | accepted |
 | [0002](0002-iterative-accumulation-ledger.md) | Iterative-accumulation knowledge ledger | accepted |
-| [0003](0003-dual-model-aux-routing.md) | Dual-model (generation + aux) routing | accepted |
+| [0003](0003-dual-model-aux-routing.md) | Dual-model (generation + aux) routing | superseded by 0010 (aux = same local model in Local mode) |
 | [0004](0004-cache-via-schema-version.md) | Caching via schema-version constants | accepted |
 | [0005](0005-cross-source-grounding.md) | Cross-source intersection grounding | accepted |
 | [0006](0006-pluggable-llm-providers.md) | Pluggable LLM providers (OpenAI/Ollama) | accepted |
 | [0007](0007-single-source-enrichment.md) | Single-source enrichment (quiz/apply-it for one doc) | accepted |
 | [0008](0008-map-reduce-ledger.md) | Map-reduce ledger extraction (parallel windows) | accepted |
 | [0009](0009-code-validator-and-heuristic-tier.md) | Code validator + heuristic chat tier + focused quiz call | accepted |
+| [0010](0010-local-by-default.md) | Local by default: Ollama + MLX, one-click API toggle | accepted |

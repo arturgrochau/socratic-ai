@@ -4,12 +4,17 @@ This is the call-by-call walk through every stage, with `file:function` referenc
 the high-level map in [`/ARCHITECTURE.md`](../ARCHITECTURE.md). Line numbers drift — trust the
 function names.
 
-Models per stage (defaults): ledger extraction → **aux** model (`config.get_aux_model()`, default
-`gpt-4o-mini`, optionally local Ollama); consolidation + insights + quiz → **generation** model
-(`config.generation_model()`); chat → `config.chat_model()`; embeddings → `config.retrieval_model()`
-(`text-embedding-3-small`); transcription → Whisper (`whisper-1`, OpenAI). Section audit and chat
-depth-tier are **pure code** (no model): `app/section_validator.py` and
-`interaction._heuristic_depth`.
+Models per stage: every role resolves through `config` accessors against the active mode's bundle
+([ADR-0010](adr/0010-local-by-default.md)). **Local mode (default):** all chat-model roles →
+`qwen3:30b-a3b-instruct-2507-q4_K_M` (one resident model; the aux split is a no-op locally by
+design), embeddings → `nomic-embed-text`, transcription → parakeet-mlx/mlx-whisper on-device.
+**API mode:** ledger extraction → `config.get_aux_model()` (`gpt-4o-mini`); consolidation +
+insights + quiz → `config.generation_model()`; chat → `config.chat_model()`; embeddings →
+`text-embedding-3-small`; transcription → `whisper-1`. Section audit and chat depth-tier are
+**pure code** (no model): `app/section_validator.py` and `interaction._heuristic_depth`.
+In-flight calls are capped per provider by `config.llm_call_slots` (8 hosted / 2 local); Ollama
+calls request structured outputs (`format` = bare schema), `num_ctx` 16k (32k for
+consolidation/insights/quiz via `large_context=True`), and `keep_alive=30m`.
 
 ---
 
@@ -27,7 +32,7 @@ depth-tier are **pure code** (no model): `app/section_validator.py` and
    pages, then `ui.run_with(app, …)` mounts the UI on the same app.
 
 `config.py` import-time side effects: load `.env`, resolve `Settings` (env overlaid with the persisted
-user config), raise if OpenAI is selected but no key is set, create the SQLite engine + Chroma client.
+user config), warn if OpenAI is selected but no key is set, create the SQLite engine + Chroma client.
 
 ---
 
