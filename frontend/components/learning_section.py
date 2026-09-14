@@ -114,7 +114,7 @@ def render_cross_source(
     # Hierarchy: the 1-3 headline takeaways first.
     takeaways = [str(t).strip() for t in (insights.get("key_takeaways") or []) if str(t).strip()]
     if takeaways:
-        with ui.card().classes("w-full bg-blue-1"):
+        with ui.card().classes("w-full bg-blue-1 text-dark"):
             ui.label("Key takeaways").classes("text-sm font-semibold text-primary")
             for i, t in enumerate(takeaways[:3], start=1):
                 ui.markdown(f"**{i}.** {fmt.strip_source_artifacts(t)}")

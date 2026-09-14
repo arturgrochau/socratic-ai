@@ -145,3 +145,18 @@ async def test_welcome_ready_machine_offers_download_button(user, monkeypatch) -
     await user.should_see("Ollama running")
     await user.should_see("Download 5.5 GB")
     await user.should_see("ffmpeg found")
+
+
+def test_source_refs_become_titles_when_known() -> None:
+    from frontend import format as fmt
+
+    fmt.set_source_names({
+        "video": {"source_id": 1, "generated_title": "Lecture on Memory"},
+        "documents": [{"source_id": 6, "source_name": "long_notes_memory.txt"}],
+    })
+    try:
+        out = fmt.strip_source_artifacts("source 1 says X while source 6 says Y (source 6). Source 9 vanished.")
+        assert out == "Lecture on Memory says X while long_notes_memory.txt says Y (long_notes_memory.txt). vanished."
+    finally:
+        fmt.set_source_names({})
+    assert fmt.strip_source_artifacts("source 1 says X") == "says X"

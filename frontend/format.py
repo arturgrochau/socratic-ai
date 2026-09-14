@@ -8,21 +8,50 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 _LEDGER_ID_RE = re.compile(r"\[u\d+[^\]]*\]")              # "[u4 | mechanism | source 2]"
 _EVIDENCE_RE = re.compile(r"\(evidence:[^)]*\)", re.IGNORECASE)
-_SOURCE_NUM_RE = re.compile(r"\(?\b[Ss]ource\s*#?\s*\d+\)?")  # "source 8", "(source 2)", "source #3"
+_SOURCE_NUM_RE = re.compile(r"\(?\b[Ss]ource\s*#?\s*(\d+)\)?")  # "source 8", "(source 2)", "source #3"
+
+# source_id -> display title for the pack currently on screen. The prompts ask
+# the model to name sources, but small local models still write "source 6";
+# with the map we can say "Long Notes Memory" instead of deleting the reference.
+_source_names: dict[int, str] = {}
+
+
+def set_source_names(generation_result: dict[str, Any]) -> None:
+    names: dict[int, str] = {}
+    payloads = [generation_result.get("video") or {}] + list(generation_result.get("documents") or [])
+    for payload in payloads:
+        try:
+            source_id = int(payload.get("source_id"))
+        except (TypeError, ValueError):
+            continue
+        title = str(payload.get("generated_title") or payload.get("source_name") or "").strip()
+        if title:
+            names[source_id] = title
+    _source_names.clear()
+    _source_names.update(names)
+
+
+def _source_ref(match: re.Match[str]) -> str:
+    name = _source_names.get(int(match.group(1)))
+    if not name:
+        return ""
+    return f"({name})" if match.group(0).startswith("(") else name
 
 
 def strip_source_artifacts(text_value: str) -> str:
     """Remove leaked ledger scaffolding from display prose: unit-id brackets,
-    "(evidence: ...)" notes, and raw "source <n>" tokens. Safety net over the
-    prompt rule that forbids the model from emitting them."""
+    "(evidence: ...)" notes, and raw "source <n>" tokens (replaced by the
+    source's title when the dashboard has registered one). Safety net over
+    the prompt rule that forbids the model from emitting them."""
     t = str(text_value or "")
     t = _LEDGER_ID_RE.sub("", t)
     t = _EVIDENCE_RE.sub("", t)
-    t = _SOURCE_NUM_RE.sub("", t)
+    t = _SOURCE_NUM_RE.sub(_source_ref, t)
     t = re.sub(r"\s+([.,;:])", r"\1", t)   # tidy space before punctuation
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()

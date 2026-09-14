@@ -245,6 +245,11 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
         async def run_generation() -> None:
             if st.get("generating"):
                 return
+            # The click arrives inside panel's slot, and panel.refresh() below
+            # deletes that slot. Everything after it must run in the client's
+            # own context or ui.notify()/body.refresh() raise "parent element
+            # has been deleted" and the page never flips to the dashboard.
+            client = ui.context.client
             st["generating"] = True
             spinner.visible = True
             panel.refresh()
@@ -267,16 +272,19 @@ def _step_documents(st: dict[str, Any], body: Any) -> None:
                 st["pipeline_ready"] = True
                 st["ask_messages"] = []
                 st["quiz_selected"] = {}
-                ui.notify("Tailored Socratic learning generated.", type="positive")
-                body.refresh()
+                with client:
+                    ui.notify("Tailored Socratic learning generated.", type="positive")
+                    body.refresh()
             except Exception as exc:  # noqa: BLE001 — surface the failure to the user
                 stage_label.text = ""
-                ui.notify(str(exc), type="negative", multi_line=True, close_button="OK")
+                with client:
+                    ui.notify(str(exc), type="negative", multi_line=True, close_button="OK")
             finally:
                 progress_timer.cancel()
                 spinner.visible = False
                 st["generating"] = False
                 if not st["pipeline_ready"]:  # panel is gone once the dashboard rendered
-                    panel.refresh()
+                    with client:
+                        panel.refresh()
 
         panel()

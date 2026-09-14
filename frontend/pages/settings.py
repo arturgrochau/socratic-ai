@@ -52,7 +52,7 @@ async def render_settings_page() -> None:
     try:
         current = await api_client.get_settings()
     except Exception as exc:  # noqa: BLE001
-        ui.label(f"Could not load settings: {exc}").classes("text-red-700")
+        ui.label(f"Could not load settings: {exc}").classes("text-negative")
         return
 
     try:

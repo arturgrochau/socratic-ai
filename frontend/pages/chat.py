@@ -97,12 +97,12 @@ def build_chat_panel():
             if st["quiz_awaiting_answer"]:
                 ui.label(
                     "Quiz mode is active. Answer the current quiz question below to receive grading."
-                ).classes("text-blue-700")
+                ).classes("text-primary")
             else:
                 ui.label(
                     f"Quiz feedback complete for {int(st['quiz_turn_count'])} question(s). "
                     "Continue for another question or exit quiz mode."
-                ).classes("text-green-700")
+                ).classes("text-positive")
 
                 async def continue_quiz() -> None:
                     st["quiz_awaiting_answer"] = True

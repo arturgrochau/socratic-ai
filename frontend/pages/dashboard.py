@@ -22,6 +22,7 @@ def render_dashboard() -> None:
         ui.label("Generate tailored content to populate the dashboard.").classes("text-gray-500")
         return
 
+    fmt.set_source_names(generation_result)
     ui.label("Learning Dashboard").classes("text-2xl font-bold mt-4")
     export.render_export_buttons(generation_result, user_id=state.user_id())
 
