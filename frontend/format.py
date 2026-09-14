@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlparse
 _LEDGER_ID_RE = re.compile(r"\[u\d+[^\]]*\]")              # "[u4 | mechanism | source 2]"
 _EVIDENCE_RE = re.compile(r"\(evidence:[^)]*\)", re.IGNORECASE)
 _SOURCE_NUM_RE = re.compile(r"\(?\b[Ss]ource\s*#?\s*(\d+)\)?")  # "source 8", "(source 2)", "source #3"
+_UNIT_REF_RE = re.compile(r"\s*\(\s*u\d+(?:\s*,\s*u\d+)*\s*\)")   # "(u7)", "(u14, u18)"
+_OPTION_PREFIX_RE = re.compile(r"^\s*(?:[A-Da-d]|[1-4])\s*[).:\-]\s+")   # "A) ", "b. ", "3) "
 
 # source_id -> display title for the pack currently on screen. The prompts ask
 # the model to name sources, but small local models still write "source 6";
@@ -50,11 +52,18 @@ def strip_source_artifacts(text_value: str) -> str:
     the prompt rule that forbids the model from emitting them."""
     t = str(text_value or "")
     t = _LEDGER_ID_RE.sub("", t)
+    t = _UNIT_REF_RE.sub("", t)
     t = _EVIDENCE_RE.sub("", t)
     t = _SOURCE_NUM_RE.sub(_source_ref, t)
     t = re.sub(r"\s+([.,;:])", r"\1", t)   # tidy space before punctuation
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
+
+
+def clean_quiz_option(option: str) -> str:
+    """Quiz options come back as "A) text" often enough that the UI's own
+    letter would double it ("A. A) text"). Drop the model's prefix."""
+    return strip_source_artifacts(_OPTION_PREFIX_RE.sub("", str(option or ""), count=1))
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}

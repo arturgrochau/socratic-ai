@@ -66,6 +66,7 @@ def test_chat_json_sends_bare_schema_and_options() -> None:
     assert payload["options"]["num_predict"] > 0
     assert payload["keep_alive"] == config.OLLAMA_KEEP_ALIVE
     assert "top_p" not in payload["options"]  # greedy decoding: no sampling knobs
+    assert payload["think"] is False  # no hidden reasoning tokens on thinking models
     assert result.usage.prompt_tokens == 100
     assert result.usage.total_tokens == 120  # total present on the schema path too
 
@@ -125,6 +126,7 @@ def test_chat_stream_yields_deltas_and_records_usage() -> None:
     payload = daemon.payload()
     assert payload["stream"] is True
     assert "format" not in payload  # plain prose: no grammar constraint
+    assert payload["think"] is False
     assert state.usage.prompt_tokens == 50 and state.usage.completion_tokens == 7
     assert state.usage.total_tokens == 57
     assert state.model == "qwen3:test"

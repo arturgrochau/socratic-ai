@@ -160,3 +160,14 @@ def test_source_refs_become_titles_when_known() -> None:
     finally:
         fmt.set_source_names({})
     assert fmt.strip_source_artifacts("source 1 says X") == "says X"
+
+
+def test_unit_refs_and_option_prefixes_are_cleaned() -> None:
+    from frontend import format as fmt
+
+    assert fmt.strip_source_artifacts("erases memory (u7). Engram cells update (u14, u18).") == (
+        "erases memory. Engram cells update."
+    )
+    assert fmt.clean_quiz_option("A) Both involve transfer (source 3)") == "Both involve transfer"
+    assert fmt.clean_quiz_option("Plain option") == "Plain option"
+    assert fmt.clean_quiz_option("2. Second style") == "Second style"

@@ -39,7 +39,8 @@ def build_chat_panel():
                     name="You" if message["role"] == "user" else "Socratic AI",
                 ).classes("w-full")
             if st.get("ask_pending"):
-                with ui.chat_message(name="Socratic AI").classes("w-full"):
+                # One child => one bubble (chat_message makes a bubble per child).
+                with ui.chat_message(name="Socratic AI").classes("w-full"), ui.column().classes("gap-1"):
                     with ui.row().classes("items-center gap-2") as thinking:
                         ui.spinner(size="sm")
                         ui.label("Thinking…").classes("text-gray-500")

@@ -209,6 +209,7 @@ def _usage_from(completion: Any) -> ChatUsage:
 # array); an explicit cap turns that into an invalid-JSON retry instead of a
 # multi-minute stall. Far above any legitimate pipeline output (~2k tokens).
 OLLAMA_NUM_PREDICT = 4096
+OLLAMA_EMBED_TIMEOUT_SECONDS = 120
 
 
 class OllamaClient:
@@ -231,8 +232,8 @@ class OllamaClient:
 
         return httpx.Timeout(config.OLLAMA_TIMEOUT_SECONDS, connect=10)
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self._http.post(f"{self.host}{path}", json=payload, timeout=self._timeout())
+    def _post(self, path: str, payload: dict[str, Any], *, timeout: httpx.Timeout | None = None) -> dict[str, Any]:
+        response = self._http.post(f"{self.host}{path}", json=payload, timeout=timeout or self._timeout())
         response.raise_for_status()
         return response.json()
 
@@ -277,6 +278,9 @@ class OllamaClient:
             "options": self._options(temperature, large_context),
             "keep_alive": config.OLLAMA_KEEP_ALIVE,
             "stream": False,
+            # Thinking models (qwen3) otherwise spend ~1k hidden tokens per call;
+            # non-thinking models accept the flag as a no-op.
+            "think": False,
         }
         if json_schema is not None:
             # Unwrap the OpenAI response_format envelope ({name, strict, schema})
@@ -339,6 +343,7 @@ class OllamaClient:
             "options": self._options(temperature, large_context),
             "keep_alive": config.OLLAMA_KEEP_ALIVE,
             "stream": True,
+            "think": False,
         }
         for event in self._stream_post("/api/chat", payload):
             text = (event.get("message") or {}).get("content", "")
@@ -361,9 +366,13 @@ class OllamaClient:
             return []
         import config
 
+        # Embeddings take seconds, not minutes. A short cap turns a wedged
+        # scheduler (seen when a second model must be evicted mid-run) into a
+        # retryable error instead of a ten-minute hang that blocks chat.
         data = self._post(
             "/api/embed",
             {"model": model, "input": inputs, "keep_alive": config.OLLAMA_KEEP_ALIVE},
+            timeout=httpx.Timeout(min(config.OLLAMA_TIMEOUT_SECONDS, OLLAMA_EMBED_TIMEOUT_SECONDS), connect=10),
         )
         embeddings = data.get("embeddings")
         if not isinstance(embeddings, list) or len(embeddings) != len(inputs):

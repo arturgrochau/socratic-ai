@@ -6,6 +6,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.auth import get_user_id
 from app.generation import GenerationStageError, generate_tailored_learning
+from app.ingestion import wait_for_background_embeddings
 from app.models import (
     GenerateTailoredLearningRequest,
     GenerateTailoredLearningResponse,
@@ -22,6 +23,7 @@ async def generate_tailored_learning_endpoint(
 ) -> GenerateTailoredLearningResponse:
     try:
         user_id = get_user_id(http_request)
+        await wait_for_background_embeddings()
         # Generation is synchronous and slow (many LLM calls). Run it in a worker
         # thread so it never blocks the shared event loop that also serves the
         # NiceGUI websocket — otherwise the UI shows "not connected" mid-run.

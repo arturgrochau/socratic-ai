@@ -90,6 +90,21 @@ def _schedule_background_embedding(source_ids: list[int], user_id: str) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
+async def wait_for_background_embeddings(timeout: float = 180.0) -> None:
+    """Block until the fire-and-forget embedding tasks are done (or the timeout
+    passes). Generation calls this first so a local daemon never has to load
+    the embedding model while the generation model is mid-request: on
+    memory-tight machines that eviction dance can wedge Ollama's scheduler."""
+    pending = [t for t in _background_tasks if not t.done()]
+    if not pending:
+        return
+    logger.info("Waiting for %s background embedding task(s) before generation", len(pending))
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+    except TimeoutError:
+        logger.warning("Background embeddings still running after %ss; continuing", timeout)
+
+
 def ensure_ingestion_tables() -> None:
     with db_engine.begin() as connection:
         connection.execute(

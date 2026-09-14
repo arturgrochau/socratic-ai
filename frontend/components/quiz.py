@@ -12,6 +12,7 @@ from typing import Any
 
 from nicegui import ui
 
+from frontend import format as fmt
 from frontend import state
 
 _LABELS = ["A", "B", "C", "D", "E", "F"]
@@ -59,11 +60,13 @@ def render_quiz(quiz: dict[str, Any], *, on_discuss: Callable[[str], None]) -> N
             chosen = selected.get(key)
 
             with ui.card().classes("w-full"):
-                ui.label(f"Q{qi + 1}. {q.get('question', '')}").classes("font-semibold")
+                ui.label(f"Q{qi + 1}. {fmt.strip_source_artifacts(str(q.get('question', '')))}").classes(
+                    "font-semibold"
+                )
 
                 for oi, opt in enumerate(options):
                     prefix = _LABELS[oi] if oi < len(_LABELS) else str(oi + 1)
-                    text = f"{prefix}.  {opt}"
+                    text = f"{prefix}.  {fmt.clean_quiz_option(str(opt))}"
 
                     if not locked:
                         def _pick(_qi: int = qi, _oi: int = oi) -> None:
@@ -93,16 +96,17 @@ def render_quiz(quiz: dict[str, Any], *, on_discuss: Callable[[str], None]) -> N
 
                 if locked:
                     if chosen == answer_index:
-                        ui.label("Correct.").classes("text-green-9 font-medium")
+                        ui.label("Correct.").classes("text-positive font-medium")
                     elif chosen is not None and 0 <= chosen < len(rationales):
-                        ui.markdown(f"**{rationales[chosen]}**").classes("text-red-9")
+                        ui.markdown(f"**{fmt.strip_source_artifacts(rationales[chosen])}**").classes("text-negative")
                     if chosen != answer_index and 0 <= answer_index < len(rationales):
                         ui.markdown(
-                            f"Correct answer ({_LABELS[answer_index]}): {rationales[answer_index]}"
-                        ).classes("text-green-9")
-                    explanation = str(q.get("explanation", "")).strip()
+                            f"Correct answer ({_LABELS[answer_index]}): "
+                            f"{fmt.strip_source_artifacts(rationales[answer_index])}"
+                        ).classes("text-positive")
+                    explanation = fmt.strip_source_artifacts(str(q.get("explanation", "")))
                     if explanation:
-                        ui.markdown(explanation).classes("text-sm text-gray-600")
+                        ui.markdown(explanation).classes("text-sm text-gray-500")
 
         total = len(questions)
         answered = sum(1 for qi in range(total) if str(qi) in selected)
