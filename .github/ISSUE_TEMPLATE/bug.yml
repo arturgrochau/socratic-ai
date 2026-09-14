@@ -1,0 +1,31 @@
+name: Bug report
+description: Something is broken
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you do, and what did the app do instead of what you expected?
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options: [Local (Ollama), Cloud API (OpenAI), Cloud API (other base URL)]
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "macOS 15.1, M2 16 GB, Socratic AI 3.0.0 (.app / uv run), Ollama 0.6.x"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: For the .app, open Console.app and filter for "Socratic". For the terminal path, paste the output.
+      render: text
